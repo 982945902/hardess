@@ -1,0 +1,16 @@
+{
+  "name": "hardess",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/runtime/server.ts",
+    "demo:upstream": "bun run src/demo/upstream.ts",
+    "demo:client": "bun run src/demo/client.ts",
+    "demo:http": "bun run src/demo/http-smoke.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
