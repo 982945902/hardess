@@ -1,17 +1,27 @@
 export interface WebSocketLike {
   addEventListener(
     type: "open" | "close" | "message" | "error",
-    listener: (event?: { data?: unknown }) => void
+    listener: (event?: { data?: unknown; code?: number; reason?: string; wasClean?: boolean; message?: string }) => void
   ): void;
   send(message: string): void;
   close(): void;
 }
 
+export interface TransportCloseInfo {
+  code?: number;
+  reason?: string;
+  wasClean?: boolean;
+}
+
+export interface TransportErrorInfo {
+  message?: string;
+}
+
 export interface TransportHooks {
   onOpen?: () => void;
-  onClose?: () => void;
+  onClose?: (info: TransportCloseInfo) => void;
   onMessage?: (message: string) => void;
-  onError?: () => void;
+  onError?: (info: TransportErrorInfo) => void;
 }
 
 export interface TransportOptions {
@@ -23,6 +33,7 @@ export interface TransportOptions {
   webSocketFactory?: (url: string) => WebSocketLike;
   setTimeoutFn?: typeof setTimeout;
   clearTimeoutFn?: typeof clearTimeout;
+  shouldReconnectOnClose?: (info: TransportCloseInfo) => boolean;
 }
 
 export class WebSocketTransport {
@@ -39,6 +50,7 @@ export class WebSocketTransport {
   private readonly webSocketFactory: (url: string) => WebSocketLike;
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
+  private readonly shouldReconnectOnClose: (info: TransportCloseInfo) => boolean;
 
   constructor(options: TransportOptions = {}) {
     this.reconnectEnabled = options.reconnect?.enabled ?? true;
@@ -48,6 +60,7 @@ export class WebSocketTransport {
     this.webSocketFactory = options.webSocketFactory ?? ((url) => new WebSocket(url));
     this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
+    this.shouldReconnectOnClose = options.shouldReconnectOnClose ?? defaultShouldReconnectOnClose;
   }
 
   connect(url: string, hooks: TransportHooks = {}): void {
@@ -78,17 +91,24 @@ export class WebSocketTransport {
       this.reconnectDelayMs = this.initialDelayMs;
       this.hooks.onOpen?.();
     });
-    this.socket.addEventListener("close", () => {
-      this.hooks.onClose?.();
-      if (!this.manuallyClosed && this.reconnectEnabled) {
+    this.socket.addEventListener("close", (event) => {
+      const info = {
+        code: event?.code,
+        reason: event?.reason,
+        wasClean: event?.wasClean
+      };
+      this.hooks.onClose?.(info);
+      if (!this.manuallyClosed && this.reconnectEnabled && this.shouldReconnectOnClose(info)) {
         this.scheduleReconnect();
       }
     });
     this.socket.addEventListener("message", (event) => {
       this.hooks.onMessage?.(typeof event?.data === "string" ? event.data : String(event?.data ?? ""));
     });
-    this.socket.addEventListener("error", () => {
-      this.hooks.onError?.();
+    this.socket.addEventListener("error", (event) => {
+      this.hooks.onError?.({
+        message: event?.message
+      });
     });
   }
 
@@ -105,5 +125,18 @@ export class WebSocketTransport {
       this.clearTimeoutFn(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+  }
+}
+
+function defaultShouldReconnectOnClose(info: TransportCloseInfo): boolean {
+  switch (info.code) {
+    case 4400:
+    case 4401:
+    case 4403:
+    case 4429:
+    case 4508:
+      return false;
+    default:
+      return true;
   }
 }

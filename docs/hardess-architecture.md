@@ -53,17 +53,18 @@ Implemented in repository:
 1. HTTP gateway main path is running: auth -> worker -> proxy.
 2. WebSocket runtime is running on Bun upgrade path with `sys.auth`, `ping/pong`, `route`, `recvAck`, and `handleAck`.
 3. Shared auth abstraction, in-memory `PeerLocator`, dispatcher, worker loader, and config store are implemented.
-4. Config reload and worker reload work through shadow-copy module loading, and runtime resources expose explicit disposal points.
+4. Config reload and worker reload work through shadow-copy module loading, directory-level watch with debounce, serialized reload execution, and explicit disposal points.
 5. SDK transport, reconnect, heartbeat, protocol registry, conflict detection, and explicit `replace` semantics are implemented.
 6. Demo business protocols exist for `demo` and `chat`, including server-side dispatch transformation (`send -> message`).
-7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, and cleaner connection rebinding behavior.
-8. Basic runtime metrics abstraction is wired in with noop default and WebSocket-side counters for open/close/error/quota/rate-limit/backpressure paths.
-9. Tests cover HTTP ingress, WebSocket runtime, worker reload, config reload, SDK transport/client behavior, protocol registries, and routing.
+7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
+8. Basic runtime metrics are implemented with noop and in-memory sinks, plus HTTP/worker/proxy/WebSocket-side counters and timing hooks for the main request/message paths.
+9. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
+10. Tests cover HTTP ingress, WebSocket runtime, worker reload, config reload, SDK transport/client behavior, protocol registries, and routing.
 
 TODO / still open:
 1. Add stronger runtime controls beyond the current baseline: real socket backpressure integration, queue/write-buffer governance refinement, and egress flow control tuning.
-2. Add observability hardening beyond the current metrics abstraction and console logs: real metrics sinks, dashboards, and alert thresholds.
-3. Improve runtime operational polish: config-watch behavior, richer close/error handling, and better local smoke/integration scripts.
+2. Add observability hardening beyond the current in-memory/noop metrics baseline and console logs: real metrics sinks, dashboards, and alert thresholds.
+3. Improve runtime operational polish beyond the current baseline: better local smoke/integration scripts.
 4. Keep future distributed `PeerLocator` implementation abstract until scale-out starts.
 5. External `AuthProvider` integration is intentionally deferred; the abstraction already exists, but concrete integration should follow the external auth-service contract rather than lead MVP scope.
 
@@ -364,6 +365,11 @@ Default WebSocket close mapping (current baseline):
 4. `4408` -> heartbeat timeout
 5. `4429` -> connection quota exceeded / message rate-limit exceeded
 6. `4508` -> outbound backpressure / queue overflow
+
+Client handling notes:
+1. Terminal server close codes such as `4400`, `4401`, `4403`, `4429`, and `4508` should not trigger automatic reconnect by default.
+2. Non-terminal closes such as heartbeat timeout may still use reconnect policy.
+3. Clients should surface `code` and `reason` to application handlers even when a preceding `sys.err` was already observed.
 
 ### 7.2.3 Shared Error Response Shape
 HTTP and WebSocket share one platform error body shape even though the transport framing differs.

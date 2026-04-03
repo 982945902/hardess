@@ -159,4 +159,56 @@ describe("HardessClient", () => {
     expect(pongEnvelope?.action).toBe("pong");
     expect((pongEnvelope?.payload as { nonce?: string } | undefined)?.nonce).toBe("n-1");
   });
+
+  it("forwards close and transport error details to client handlers", () => {
+    let socket: FakeSocket | undefined;
+    let closeInfo:
+      | { code?: number; reason?: string; wasClean?: boolean }
+      | undefined;
+    let transportError:
+      | { message?: string }
+      | undefined;
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      systemHandlers: {
+        onClose(info) {
+          closeInfo = info;
+        },
+        onTransportError(info) {
+          transportError = info;
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    socket?.emit("open");
+    socket?.emit("error", { message: "socket failure" });
+    socket?.emit("close", {
+      code: 4508,
+      reason: "BACKPRESSURE_OVERFLOW",
+      wasClean: false
+    });
+
+    expect(transportError).toEqual({
+      message: "socket failure"
+    });
+    expect(closeInfo).toEqual({
+      code: 4508,
+      reason: "BACKPRESSURE_OVERFLOW",
+      wasClean: false
+    });
+  });
 });

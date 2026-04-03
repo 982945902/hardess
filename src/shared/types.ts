@@ -90,6 +90,16 @@ export interface PlatformErrorBody {
   };
 }
 
+export interface ClientCloseInfo {
+  code?: number;
+  reason?: string;
+  wasClean?: boolean;
+}
+
+export interface ClientTransportErrorInfo {
+  message?: string;
+}
+
 export interface ClientSystemHandlers {
   onAuthOk?: (payload: SysAuthOkPayload) => void;
   onPong?: (payload: SysPongPayload) => void;
@@ -97,6 +107,8 @@ export interface ClientSystemHandlers {
   onHandleAck?: (payload: SysHandleAckPayload) => void;
   onRoute?: (payload: SysRoutePayload) => void;
   onError?: (payload: SysErrPayload) => void;
+  onClose?: (info: ClientCloseInfo) => void;
+  onTransportError?: (info: ClientTransportErrorInfo) => void;
 }
 
 export interface OutboundContext<Payload = unknown> {

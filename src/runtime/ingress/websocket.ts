@@ -478,15 +478,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
       const envelope = parseEnvelope(messageToString(raw));
       if (!envelope) {
+        const error = new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Invalid websocket envelope");
         metrics.increment("ws.invalid_envelope");
         socket.send(
           serializeEnvelope(
-            createSysErrEnvelope(
-              new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Invalid websocket envelope"),
-              socket.data.connId
-            )
+            createSysErrEnvelope(error, socket.data.connId)
           )
         );
+        closeConnection(connection, closeCodeForError(error), error.code);
         return;
       }
 

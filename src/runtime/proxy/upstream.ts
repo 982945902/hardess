@@ -1,4 +1,5 @@
 import { ERROR_CODES, HardessError, type AuthContext, type PipelineConfig } from "../../shared/index.ts";
+import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -15,8 +16,10 @@ export async function proxyUpstream(
   request: Request,
   pipeline: PipelineConfig,
   auth: AuthContext,
-  traceId?: string
+  traceId?: string,
+  metrics: Metrics = new NoopMetrics()
 ): Promise<Response> {
+  const startedAt = Date.now();
   const requestUrl = new URL(request.url);
   const upstreamUrl = new URL(
     `${requestUrl.pathname}${requestUrl.search}`,
@@ -46,7 +49,7 @@ export async function proxyUpstream(
   const timeout = setTimeout(() => controller.abort(), pipeline.downstream.responseTimeoutMs);
 
   try {
-    return await fetch(
+    const response = await fetch(
       new Request(upstreamUrl, {
         method: request.method,
         headers,
@@ -55,13 +58,20 @@ export async function proxyUpstream(
         redirect: "manual"
       })
     );
+    metrics.increment("http.upstream_ok");
+    metrics.timing("http.upstream_ms", Date.now() - startedAt);
+    return response;
   } catch (error) {
     if (controller.signal.aborted) {
+      metrics.increment("http.upstream_timeout");
+      metrics.timing("http.upstream_ms", Date.now() - startedAt);
       throw new HardessError(ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT, "Upstream request timed out", {
         retryable: true
       });
     }
 
+    metrics.increment("http.upstream_unavailable");
+    metrics.timing("http.upstream_ms", Date.now() - startedAt);
     throw new HardessError(
       ERROR_CODES.GATEWAY_UPSTREAM_UNAVAILABLE,
       "Upstream service is unavailable",

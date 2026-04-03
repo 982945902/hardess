@@ -70,8 +70,9 @@ export class HardessClient {
         this.sendAuth(token);
         this.startHeartbeat();
       },
-      onClose: () => {
+      onClose: (info) => {
         this.stopHeartbeat();
+        this.systemHandlers.onClose?.(info);
       },
       onMessage: (raw) => {
         const envelope = parseEnvelope(raw);
@@ -85,6 +86,9 @@ export class HardessClient {
         }
 
         void this.handleInbound(envelope);
+      },
+      onError: (info) => {
+        this.systemHandlers.onTransportError?.(info);
       }
     });
   }

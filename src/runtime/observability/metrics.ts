@@ -3,8 +3,50 @@ export interface Metrics {
   timing(name: string, valueMs: number): void;
 }
 
+export interface MetricsSnapshot {
+  counters: Record<string, number>;
+  timings: Record<string, number[]>;
+}
+
 export class NoopMetrics implements Metrics {
   increment(_name: string, _value = 1): void {}
 
   timing(_name: string, _valueMs: number): void {}
+}
+
+export class InMemoryMetrics implements Metrics {
+  private readonly counters = new Map<string, number>();
+  private readonly timingsByName = new Map<string, number[]>();
+
+  increment(name: string, value = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + value);
+  }
+
+  timing(name: string, valueMs: number): void {
+    const values = this.timingsByName.get(name) ?? [];
+    values.push(valueMs);
+    this.timingsByName.set(name, values);
+  }
+
+  counter(name: string): number {
+    return this.counters.get(name) ?? 0;
+  }
+
+  timings(name: string): number[] {
+    return [...(this.timingsByName.get(name) ?? [])];
+  }
+
+  snapshot(): MetricsSnapshot {
+    return {
+      counters: Object.fromEntries(this.counters),
+      timings: Object.fromEntries(
+        Array.from(this.timingsByName.entries()).map(([name, values]) => [name, [...values]])
+      )
+    };
+  }
+
+  reset(): void {
+    this.counters.clear();
+    this.timingsByName.clear();
+  }
 }

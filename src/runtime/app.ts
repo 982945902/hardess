@@ -53,11 +53,19 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   registry.register(demoServerModule);
   registry.register(chatServerModule);
   await configStore.reload();
-  configStore.subscribe((config) => {
-    const workerEntries = config.pipelines
+  let workerEntries = new Set(
+    configStore.getConfig().pipelines
       .map((pipeline) => pipeline.worker?.entry)
-      .filter((entry): entry is string => Boolean(entry));
-    invalidateWorkers(workerEntries);
+      .filter((entry): entry is string => Boolean(entry))
+  );
+  const unsubscribeConfig = configStore.subscribe((config) => {
+    const nextWorkerEntries = new Set(
+      config.pipelines
+        .map((pipeline) => pipeline.worker?.entry)
+        .filter((entry): entry is string => Boolean(entry))
+    );
+    invalidateWorkers(Array.from(new Set([...workerEntries, ...nextWorkerEntries])));
+    workerEntries = nextWorkerEntries;
   });
   configStore.watch();
 
@@ -87,6 +95,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     configStore,
     websocket,
     dispose() {
+      unsubscribeConfig();
       configStore.dispose();
       websocket.dispose();
     },
@@ -110,7 +119,8 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       return handleHttpRequest(request, {
         configStore,
         authService,
-        logger
+        logger,
+        metrics
       });
     }
   };

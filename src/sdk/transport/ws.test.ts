@@ -68,4 +68,37 @@ describe("WebSocketTransport", () => {
     sockets[1]?.emit("open");
     expect(opened).toBe(2);
   });
+
+  it("does not reconnect on terminal server close codes", () => {
+    const sockets: FakeSocket[] = [];
+    const timers: Array<() => void> = [];
+    const transport = new WebSocketTransport({
+      reconnect: {
+        enabled: true,
+        initialDelayMs: 10,
+        maxDelayMs: 20
+      },
+      webSocketFactory() {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      setTimeoutFn(handler) {
+        timers.push(handler as () => void);
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn() {}
+    });
+
+    transport.connect("ws://localhost/ws");
+    sockets[0]?.emit("open");
+    sockets[0]?.emit("close", {
+      code: 4401,
+      reason: "AUTH_INVALID_TOKEN",
+      wasClean: true
+    });
+
+    expect(timers).toHaveLength(0);
+    expect(sockets).toHaveLength(1);
+  });
 });

@@ -351,6 +351,32 @@ describe("createWebSocketHandlers", () => {
     handlers.dispose();
   });
 
+  it("closes the socket on invalid websocket envelope", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+
+    await handlers.message(alice, "{not-json");
+
+    expect(lastEnvelope(alice)?.action).toBe("err");
+    expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("PROTO_INVALID_PAYLOAD");
+    expect(alice.closed?.code).toBe(4400);
+    handlers.dispose();
+  });
+
   it("enforces per-peer connection quotas during auth", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
     const peerLocator = new InMemoryPeerLocator();

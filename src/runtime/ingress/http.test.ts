@@ -4,6 +4,7 @@ import { handleHttpRequest } from "./http.ts";
 import { DemoBearerAuthProvider } from "../auth/provider.ts";
 import { RuntimeAuthService } from "../auth/service.ts";
 import { ConsoleLogger } from "../observability/logger.ts";
+import { InMemoryMetrics } from "../observability/metrics.ts";
 
 const config: HardessConfig = {
   pipelines: [
@@ -43,6 +44,7 @@ afterEach(() => {
 
 describe("handleHttpRequest", () => {
   it("proxies authenticated requests", async () => {
+    const metrics = new InMemoryMetrics();
     const response = await handleHttpRequest(
       new Request("http://localhost/demo/orders", {
         headers: {
@@ -56,7 +58,8 @@ describe("handleHttpRequest", () => {
           watch: () => {}
         },
         authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger()
+        logger: new ConsoleLogger(),
+        metrics
       }
     );
 
@@ -65,9 +68,18 @@ describe("handleHttpRequest", () => {
       ok: true,
       url: "http://upstream.internal/demo/orders"
     });
+    expect(metrics.counter("http.request_in")).toBe(1);
+    expect(metrics.counter("http.auth_ok")).toBe(1);
+    expect(metrics.counter("worker.run_ok")).toBe(1);
+    expect(metrics.counter("http.upstream_ok")).toBe(1);
+    expect(metrics.counter("http.proxy_ok")).toBe(1);
+    expect(metrics.timings("http.request_ms").length).toBe(1);
+    expect(metrics.timings("http.upstream_ms").length).toBe(1);
+    expect(metrics.timings("worker.run_ms").length).toBe(1);
   });
 
   it("rejects unknown routes", async () => {
+    const metrics = new InMemoryMetrics();
     const response = await handleHttpRequest(
       new Request("http://localhost/unknown", {
         headers: {
@@ -81,10 +93,14 @@ describe("handleHttpRequest", () => {
           watch: () => {}
         },
         authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger()
+        logger: new ConsoleLogger(),
+        metrics
       }
     );
 
     expect(response.status).toBe(404);
+    expect(metrics.counter("http.request_in")).toBe(1);
+    expect(metrics.counter("http.route_missing")).toBe(1);
+    expect(metrics.counter("http.error")).toBe(1);
   });
 });

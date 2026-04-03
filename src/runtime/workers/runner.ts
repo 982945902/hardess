@@ -1,5 +1,6 @@
 import type { AuthContext, HardessWorkerResult, PipelineConfig } from "../../shared/types.ts";
 import type { Logger } from "../observability/logger.ts";
+import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { loadWorker } from "./loader.ts";
 
 function normalizeWorkerResult(result: Response | HardessWorkerResult | void): HardessWorkerResult {
@@ -19,12 +20,14 @@ export async function runWorker(
   auth: AuthContext,
   pipeline: PipelineConfig,
   traceId: string,
-  logger: Logger
+  logger: Logger,
+  metrics: Metrics = new NoopMetrics()
 ): Promise<HardessWorkerResult> {
   if (!pipeline.worker) {
     return {};
   }
 
+  const startedAt = Date.now();
   const worker = await loadWorker(pipeline.worker.entry);
   const pending = new Set<Promise<unknown>>();
   const ctx = {
@@ -59,8 +62,13 @@ export async function runWorker(
   });
 
   try {
-    return normalizeWorkerResult(await Promise.race([workerPromise, timeoutPromise]));
+    const result = normalizeWorkerResult(await Promise.race([workerPromise, timeoutPromise]));
+    metrics.increment("worker.run_ok");
+    metrics.timing("worker.run_ms", Date.now() - startedAt);
+    return result;
   } catch (error) {
+    metrics.increment("worker.run_error");
+    metrics.timing("worker.run_ms", Date.now() - startedAt);
     logger.error("worker execution failed", {
       traceId,
       pipelineId: pipeline.id,
