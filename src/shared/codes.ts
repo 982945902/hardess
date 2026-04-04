@@ -18,3 +18,12 @@ export const ERROR_CODES = {
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+export const ROUTE_FAILURE_STAGES = {
+  RESOLVE: "resolve",
+  AUTH: "auth",
+  EGRESS: "egress"
+} as const;
+
+export type RouteFailureStage =
+  (typeof ROUTE_FAILURE_STAGES)[keyof typeof ROUTE_FAILURE_STAGES];

@@ -7,10 +7,9 @@ import {
   type Envelope,
   type SysAuthOkPayload,
   type SysErrPayload,
-  type SysHandleAckPayload,
   type SysPingPayload,
   type SysPongPayload,
-  type SysRecvAckPayload
+  type SysResultPayload
 } from "../../shared/index.ts";
 import { createEnvelope } from "./envelope.ts";
 
@@ -75,54 +74,9 @@ export function createPingEnvelope(
   });
 }
 
-export function createRecvAckEnvelope(
+export function createResultEnvelope(
   connId: string,
-  ackFor: string,
-  traceId?: string
-): Envelope<SysRecvAckPayload> {
-  return createEnvelope({
-    kind: "system",
-    src: systemSrc(connId),
-    protocol: "sys",
-    version: "1.0",
-    action: "recvAck",
-    traceId,
-    payload: {
-      ackFor,
-      acceptedAt: Date.now()
-    }
-  });
-}
-
-export function createHandleAckEnvelope(
-  connId: string,
-  ackFor: string,
-  traceId?: string
-): Envelope<SysHandleAckPayload> {
-  return createEnvelope({
-    kind: "system",
-    src: systemSrc(connId),
-    protocol: "sys",
-    version: "1.0",
-    action: "handleAck",
-    traceId,
-    payload: {
-      ackFor,
-      handledAt: Date.now()
-    }
-  });
-}
-
-export function createRouteEnvelope(
-  connId: string,
-  payload: {
-    resolvedPeers: string[];
-    deliveredConns: Array<{
-      nodeId: string;
-      connId: string;
-      peerId: string;
-    }>;
-  },
+  payload: SysResultPayload,
   traceId?: string
 ): Envelope<typeof payload> {
   return createEnvelope({
@@ -130,7 +84,7 @@ export function createRouteEnvelope(
     src: systemSrc(connId),
     protocol: "sys",
     version: "1.0",
-    action: "route",
+    action: "result",
     traceId,
     payload
   });

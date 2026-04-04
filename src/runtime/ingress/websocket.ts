@@ -4,22 +4,22 @@ import {
   type AckMode,
   type AuthContext,
   type Envelope,
+  type SysResultPayload,
   type SysAuthPayload
 } from "../../shared/index.ts";
 import type { AuthService } from "../auth/service.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { Dispatcher } from "../routing/dispatcher.ts";
+import { DispatchFailureCollector } from "../routing/failure-collector.ts";
 import { InMemoryPeerLocator } from "../routing/peer-locator.ts";
 import { parseEnvelope, serializeEnvelope } from "../protocol/envelope.ts";
 import { ServerProtocolRegistry } from "../protocol/registry.ts";
 import {
   createAuthOkEnvelope,
-  createHandleAckEnvelope,
   createPingEnvelope,
   createPongEnvelope,
-  createRecvAckEnvelope,
-  createRouteEnvelope,
+  createResultEnvelope,
   createSysErrEnvelope,
   ensureAuthenticated
 } from "../protocol/system-handlers.ts";
@@ -82,7 +82,6 @@ function messageToString(raw: string | ArrayBuffer | Uint8Array): string {
 
 export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const connections = new Map<string, ConnectionState>();
-  const pendingHandleAckByMsgId = new Map<string, string>();
   const now = deps.now ?? (() => Date.now());
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 25_000;
   const staleAfterMs = deps.staleAfterMs ?? 60_000;
@@ -229,67 +228,89 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     peerIds: string[],
     ack: AckMode = "recv"
   ): Promise<void> {
-    const plan = await deps.dispatcher.buildPlan(peerIds, {
+    const uniquePeerIds = Array.from(new Set(peerIds));
+    const located = await deps.peerLocator.findMany(uniquePeerIds);
+    const plan = await deps.dispatcher.buildPlan(uniquePeerIds, {
       streamId: envelope.streamId,
       ack
     });
+    const collector = new DispatchFailureCollector(uniquePeerIds);
 
-    if (plan.targets.length === 0) {
-      throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "No active target connections");
+    for (const peerId of uniquePeerIds) {
+      const targets = located.get(peerId) ?? [];
+      if (targets.length === 0) {
+        collector.recordResolveFailure(peerId);
+      }
     }
-
-    const deliveredTargets: typeof plan.targets = [];
 
     for (const target of plan.targets) {
       const connection = connections.get(target.connId);
       if (!connection?.auth) {
+        collector.recordResolveFailure(target.peerId);
         continue;
       }
 
       if (!(await deps.authService.isAuthContextValid(connection.auth))) {
+        collector.recordAuthFailure(
+          target,
+          ERROR_CODES.AUTH_REVOKED_TOKEN,
+          "Target authentication is no longer valid"
+        );
         continue;
       }
 
-      deliveredTargets.push(target);
-      enqueueOutbound(
-        connection,
-        serializeEnvelope({
-          ...envelope,
-          src: {
-            peerId: sender.auth?.peerId ?? envelope.src.peerId,
-            connId: sender.socket.data.connId
-          }
-        })
-      );
+      try {
+        enqueueOutbound(
+          connection,
+          serializeEnvelope({
+            ...envelope,
+            src: {
+              peerId: sender.auth?.peerId ?? envelope.src.peerId,
+              connId: sender.socket.data.connId
+            }
+          })
+        );
+        collector.recordDelivered(target);
+      } catch (error) {
+        const normalized = error instanceof HardessError
+          ? error
+          : new HardessError(ERROR_CODES.INTERNAL_ERROR, "Outbound delivery failed", {
+              detail: error instanceof Error ? error.message : String(error),
+              cause: error
+            });
+        collector.recordEgressFailure(
+          target,
+          normalized.code,
+          normalized.message,
+          normalized.retryable
+        );
+      }
     }
 
-    if (deliveredTargets.length === 0) {
-      throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "No valid target connections");
-    }
-
+    const hasDeliveries = collector.hasDeliveries();
+    const resultPayload: SysResultPayload = collector.build(envelope.msgId);
     if (ack !== "none") {
-      pendingHandleAckByMsgId.set(envelope.msgId, sender.socket.data.connId);
-    }
-
-    enqueueOutbound(
-      sender,
-      serializeEnvelope(
-        createRouteEnvelope(
-          sender.socket.data.connId,
-          {
-            resolvedPeers: peerIds,
-            deliveredConns: deliveredTargets
-          },
-          envelope.traceId
-        )
-      )
-    );
-
-    if (ack !== "none" && sender.auth) {
       enqueueOutbound(
         sender,
-        serializeEnvelope(createRecvAckEnvelope(sender.socket.data.connId, envelope.msgId, envelope.traceId))
+        serializeEnvelope(
+          createResultEnvelope(
+            sender.socket.data.connId,
+            resultPayload,
+            envelope.traceId
+          )
+        )
       );
+    }
+
+    if (!hasDeliveries) {
+      if (ack === "none") {
+        return;
+      }
+
+      throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "No valid target connections", {
+        refMsgId: envelope.msgId,
+        detail: resultPayload
+      });
     }
   }
 
@@ -345,36 +366,6 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         connection.lastPingAt = undefined;
         return;
       }
-      case "handleAck": {
-        const auth = ensureAuthenticated(connection.auth);
-        const payload = envelope.payload as { ackFor?: string } | null;
-        if (!payload?.ackFor) {
-          throw new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Missing ackFor in handleAck");
-        }
-
-        const senderConnId = pendingHandleAckByMsgId.get(payload.ackFor);
-        if (!senderConnId) {
-          throw new HardessError(ERROR_CODES.ROUTE_NO_RECIPIENT, "No sender found for handleAck", {
-            refMsgId: payload.ackFor
-          });
-        }
-
-        const senderConnection = connections.get(senderConnId);
-        if (!senderConnection?.auth || !(await deps.authService.isAuthContextValid(senderConnection.auth))) {
-          throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "Sender is offline", {
-            refMsgId: payload.ackFor
-          });
-        }
-
-        pendingHandleAckByMsgId.delete(payload.ackFor);
-        enqueueOutbound(
-          senderConnection,
-          serializeEnvelope(
-            createHandleAckEnvelope(connection.socket.data.connId, payload.ackFor, envelope.traceId)
-          )
-        );
-        return;
-      }
       default:
         throw new HardessError(
           ERROR_CODES.PROTO_UNKNOWN_ACTION,
@@ -414,16 +405,18 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
 
     const dispatch = (await hooks.buildDispatch?.(ctx)) ?? {};
+    const ack = envelope.ack ?? dispatch.ack ?? "recv";
     const outboundEnvelope: Envelope<unknown> = {
       ...envelope,
       protocol: dispatch.protocol ?? envelope.protocol,
       version: dispatch.version ?? envelope.version,
       action: dispatch.action ?? envelope.action,
       streamId: dispatch.streamId ?? envelope.streamId,
+      ack,
       payload: dispatch.payload ?? envelope.payload
     };
 
-    await sendToPeerIds(connection, outboundEnvelope, peerIds, dispatch.ack ?? "recv");
+    await sendToPeerIds(connection, outboundEnvelope, peerIds, ack);
   }
 
   return {
@@ -522,11 +515,6 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       }
       deps.peerLocator.unregister(socket.data.connId);
       connections.delete(socket.data.connId);
-      for (const [msgId, connId] of pendingHandleAckByMsgId.entries()) {
-        if (connId === socket.data.connId) {
-          pendingHandleAckByMsgId.delete(msgId);
-        }
-      }
       metrics.increment("ws.close");
       deps.logger.info("websocket closed", { connId: socket.data.connId });
     },

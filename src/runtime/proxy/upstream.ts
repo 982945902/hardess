@@ -66,7 +66,7 @@ export async function proxyUpstream(
       metrics.increment("http.upstream_timeout");
       metrics.timing("http.upstream_ms", Date.now() - startedAt);
       throw new HardessError(ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT, "Upstream request timed out", {
-        retryable: true
+        retryable: false
       });
     }
 
@@ -76,7 +76,7 @@ export async function proxyUpstream(
       ERROR_CODES.GATEWAY_UPSTREAM_UNAVAILABLE,
       "Upstream service is unavailable",
       {
-        retryable: true,
+        retryable: false,
         detail: error instanceof Error ? error.message : String(error),
         cause: error
       }

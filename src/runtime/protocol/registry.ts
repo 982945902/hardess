@@ -10,9 +10,9 @@ function keyOf(protocol: string, version: string, action: string): string {
 }
 
 export class ServerProtocolRegistry {
-  private readonly actions = new Map<string, ServerActionHooks<unknown>>();
+  private readonly actions = new Map<string, ServerActionHooks<any>>();
 
-  register(module: ServerProtocolModule<unknown>): void {
+  register(module: ServerProtocolModule<any>): void {
     for (const [action, hooks] of Object.entries(module.actions)) {
       const key = keyOf(module.protocol, module.version, action);
       if (this.actions.has(key)) {
@@ -26,7 +26,7 @@ export class ServerProtocolRegistry {
     }
   }
 
-  replace(module: ServerProtocolModule<unknown>): void {
+  replace(module: ServerProtocolModule<any>): void {
     this.unregister(module.protocol, module.version);
     for (const [action, hooks] of Object.entries(module.actions)) {
       this.actions.set(keyOf(module.protocol, module.version, action), hooks);
@@ -42,7 +42,7 @@ export class ServerProtocolRegistry {
     }
   }
 
-  get(protocol: string, version: string, action: string): ServerActionHooks<unknown> {
+  get(protocol: string, version: string, action: string): ServerActionHooks<any> {
     const hooks = this.actions.get(keyOf(protocol, version, action));
     if (!hooks) {
       throw new HardessError(

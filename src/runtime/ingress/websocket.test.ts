@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { ROUTE_FAILURE_STAGES } from "../../shared/codes.ts";
 import type { Envelope } from "../../shared/types.ts";
 import { parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
 import { DemoBearerAuthProvider } from "../auth/provider.ts";
@@ -120,8 +121,7 @@ describe("createWebSocketHandlers", () => {
     );
 
     const bobMessage = lastEnvelope(bob);
-    const aliceAck = lastEnvelope(alice);
-    const aliceRoute = parseEnvelope(alice.sent.at(-2) ?? "");
+    const aliceResult = lastEnvelope(alice);
 
     expect(bobMessage?.kind).toBe("biz");
     expect(bobMessage?.action).toBe("send");
@@ -129,33 +129,13 @@ describe("createWebSocketHandlers", () => {
       toPeerId: "bob",
       content: "hello"
     });
-    expect(aliceRoute?.kind).toBe("system");
-    expect(aliceRoute?.action).toBe("route");
-    expect((aliceRoute?.payload as { resolvedPeers?: string[] } | undefined)?.resolvedPeers).toEqual(["bob"]);
-    expect(aliceAck?.kind).toBe("system");
-    expect(aliceAck?.action).toBe("recvAck");
-    expect((aliceAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("m-biz-1");
+    expect(aliceResult?.kind).toBe("system");
+    expect(aliceResult?.action).toBe("result");
+    expect((aliceResult?.payload as { resolvedPeers?: string[] } | undefined)?.resolvedPeers).toEqual(["bob"]);
+    expect((aliceResult?.payload as { failed?: unknown[] } | undefined)?.failed).toEqual([]);
+    expect((aliceResult?.payload as { partialFailure?: boolean } | undefined)?.partialFailure).toBe(false);
+    expect((aliceResult?.payload as { refMsgId?: string } | undefined)?.refMsgId).toBe("m-biz-1");
 
-    await handlers.message(
-      bob,
-      serializeEnvelope({
-        msgId: "m-handle-1",
-        kind: "system",
-        src: { peerId: "bob", connId: "conn-bob" },
-        protocol: "sys",
-        version: "1.0",
-        action: "handleAck",
-        ts: Date.now(),
-        payload: {
-          ackFor: "m-biz-1"
-        }
-      })
-    );
-
-    const aliceHandleAck = lastEnvelope(alice);
-    expect(aliceHandleAck?.kind).toBe("system");
-    expect(aliceHandleAck?.action).toBe("handleAck");
-    expect((aliceHandleAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("m-biz-1");
     handlers.dispose();
   });
 
@@ -284,29 +264,169 @@ describe("createWebSocketHandlers", () => {
       content: "hi bob"
     });
 
-    const aliceRecvAck = lastEnvelope(alice);
-    expect(aliceRecvAck?.action).toBe("recvAck");
-    expect((aliceRecvAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("chat-send-1");
+    const aliceResult = lastEnvelope(alice);
+    expect(aliceResult?.action).toBe("result");
+    expect((aliceResult?.payload as { refMsgId?: string } | undefined)?.refMsgId).toBe("chat-send-1");
+    handlers.dispose();
+  });
+
+  it("reports partial fanout failures in the sender result payload", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register({
+      protocol: "fanout",
+      version: "1.0",
+      actions: {
+        send: {
+          resolveRecipients() {
+            return ["bob", "charlie"];
+          }
+        }
+      }
+    });
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, token] of [
+      [alice, "demo:alice"],
+      [bob, "demo:bob"]
+    ] as const) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: token
+          }
+        })
+      );
+    }
 
     await handlers.message(
-      bob,
+      alice,
       serializeEnvelope({
-        msgId: "chat-handle-1",
-        kind: "system",
-        src: { peerId: "bob", connId: "conn-bob" },
-        protocol: "sys",
+        msgId: "fanout-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "fanout",
         version: "1.0",
-        action: "handleAck",
+        action: "send",
         ts: Date.now(),
         payload: {
-          ackFor: "chat-send-1"
+          content: "hello everyone"
         }
       })
     );
 
-    const aliceHandleAck = lastEnvelope(alice);
-    expect(aliceHandleAck?.action).toBe("handleAck");
-    expect((aliceHandleAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("chat-send-1");
+    const bobMessage = lastEnvelope(bob);
+    const aliceResult = lastEnvelope(alice);
+    const resultPayload = aliceResult?.payload as {
+      resolvedPeers?: string[];
+      deliveredConns?: Array<{ peerId: string }>;
+      failed?: Array<{ peerId?: string; code?: string; stage?: string }>;
+      partialFailure?: boolean;
+    } | undefined;
+
+    expect(bobMessage?.kind).toBe("biz");
+    expect(aliceResult?.action).toBe("result");
+    expect(resultPayload?.resolvedPeers).toEqual(["bob", "charlie"]);
+    expect(resultPayload?.deliveredConns?.map((item) => item.peerId)).toEqual(["bob"]);
+    expect(resultPayload?.partialFailure).toBe(true);
+    expect(resultPayload?.failed).toHaveLength(1);
+    expect(resultPayload?.failed?.[0]).toMatchObject({
+      peerId: "charlie",
+      code: "ROUTE_PEER_OFFLINE",
+      stage: ROUTE_FAILURE_STAGES.RESOLVE
+    });
+    handlers.dispose();
+  });
+
+  it("supports fire-and-forget websocket dispatch when ack is none", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, token] of [
+      [alice, "demo:alice"],
+      [bob, "demo:bob"]
+    ] as const) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: token
+          }
+        })
+      );
+    }
+
+    const aliceSentBefore = alice.sent.length;
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-biz-no-ack",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ack: "none",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    );
+
+    expect(lastEnvelope(bob)?.kind).toBe("biz");
+    expect(alice.sent.length).toBe(aliceSentBefore);
     handlers.dispose();
   });
 
@@ -507,7 +627,7 @@ describe("createWebSocketHandlers", () => {
     handlers.dispose();
   });
 
-  it("closes the sender when outbound queue overflows", async () => {
+  it("closes the sender when queued results overflow", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
     const peerLocator = new InMemoryPeerLocator();
     const dispatcher = new Dispatcher(peerLocator);
@@ -574,6 +694,23 @@ describe("createWebSocketHandlers", () => {
         payload: {
           toPeerId: "bob",
           content: "hello"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "overflow-2",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello again"
         }
       })
     );

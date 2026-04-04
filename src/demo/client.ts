@@ -1,6 +1,8 @@
 import { HardessClient, type ClientProtocolModule } from "../sdk/index.ts";
 import { chatClientModule } from "./chat-module.ts";
 
+export {};
+
 const env = globalThis as {
   process?: {
     env?: Record<string, string | undefined>;
@@ -45,10 +47,9 @@ const demoModule: ClientProtocolModule<
   }
 };
 
-const modules = new Map<string, ClientProtocolModule<unknown, unknown>>([
-  ["demo", demoModule],
-  ["chat", chatClientModule]
-]);
+const modules = new Map<string, ClientProtocolModule<any, any>>();
+modules.set("demo", demoModule);
+modules.set("chat", chatClientModule);
 
 const client = new HardessClient(wsUrl, {
   systemHandlers: {
@@ -58,14 +59,8 @@ const client = new HardessClient(wsUrl, {
     onPong(payload) {
       console.log(JSON.stringify({ type: "sys.pong", payload }));
     },
-    onRecvAck(payload) {
-      console.log(JSON.stringify({ type: "sys.recvAck", payload }));
-    },
-    onHandleAck(payload) {
-      console.log(JSON.stringify({ type: "sys.handleAck", payload }));
-    },
-    onRoute(payload) {
-      console.log(JSON.stringify({ type: "sys.route", payload }));
+    onResult(payload) {
+      console.log(JSON.stringify({ type: "sys.result", payload }));
     },
     onError(payload) {
       console.log(JSON.stringify({ type: "sys.err", payload }));

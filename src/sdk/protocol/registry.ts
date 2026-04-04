@@ -5,9 +5,9 @@ function keyOf(protocol: string, version: string): string {
 }
 
 export class ClientProtocolRegistry {
-  private readonly modules = new Map<string, ClientProtocolModule<unknown, unknown>>();
+  private readonly modules = new Map<string, ClientProtocolModule<any, any>>();
 
-  register(module: ClientProtocolModule<unknown, unknown>): void {
+  register(module: ClientProtocolModule<any, any>): void {
     const key = keyOf(module.protocol, module.version);
     if (this.modules.has(key)) {
       throw new HardessError(
@@ -19,7 +19,7 @@ export class ClientProtocolRegistry {
     this.modules.set(key, module);
   }
 
-  replace(module: ClientProtocolModule<unknown, unknown>): void {
+  replace(module: ClientProtocolModule<any, any>): void {
     this.modules.set(keyOf(module.protocol, module.version), module);
   }
 
@@ -27,7 +27,7 @@ export class ClientProtocolRegistry {
     this.modules.delete(keyOf(protocol, version));
   }
 
-  get(protocol: string, version: string): ClientProtocolModule<unknown, unknown> | undefined {
+  get(protocol: string, version: string): ClientProtocolModule<any, any> | undefined {
     return this.modules.get(keyOf(protocol, version));
   }
 }

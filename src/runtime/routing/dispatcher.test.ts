@@ -12,11 +12,11 @@ describe("Dispatcher", () => {
     const dispatcher = new Dispatcher(locator);
     const plan = await dispatcher.buildPlan(["alice", "bob", "alice"], {
       streamId: "demo",
-      ack: "handle"
+      ack: "recv"
     });
 
     expect(plan.streamId).toBe("demo");
-    expect(plan.ack).toBe("handle");
+    expect(plan.ack).toBe("recv");
     expect(plan.targets.map((target) => target.connId).sort()).toEqual(["conn-1", "conn-2", "conn-3"]);
   });
 });

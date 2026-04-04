@@ -1,3 +1,5 @@
+export {};
+
 const env = globalThis as {
   process?: {
     env?: Record<string, string | undefined>;

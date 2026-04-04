@@ -34,7 +34,7 @@ export const chatServerModule: ServerProtocolModule<ChatSendPayload> = {
             fromPeerId: ctx.auth.peerId,
             content: ctx.payload.content
           },
-          ack: "handle"
+          ack: "recv"
         };
       }
     }

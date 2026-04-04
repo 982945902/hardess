@@ -7,6 +7,8 @@ import { ConsoleLogger, type Logger } from "./observability/logger.ts";
 import { NoopMetrics, type Metrics } from "./observability/metrics.ts";
 import { chatServerModule } from "./protocol/chat-module.ts";
 import { demoServerModule } from "./protocol/demo-module.ts";
+import { echoServerModule } from "./protocol/echo-module.ts";
+import { fanoutBenchServerModule } from "./protocol/fanout-bench-module.ts";
 import { ServerProtocolRegistry } from "./protocol/registry.ts";
 import { Dispatcher } from "./routing/dispatcher.ts";
 import { InMemoryPeerLocator } from "./routing/peer-locator.ts";
@@ -52,6 +54,8 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
 
   registry.register(demoServerModule);
   registry.register(chatServerModule);
+  registry.register(echoServerModule);
+  registry.register(fanoutBenchServerModule);
   await configStore.reload();
   let workerEntries = new Set(
     configStore.getConfig().pipelines

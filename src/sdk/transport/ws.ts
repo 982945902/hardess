@@ -1,4 +1,5 @@
 export interface WebSocketLike {
+  readyState?: number;
   addEventListener(
     type: "open" | "close" | "message" | "error",
     listener: (event?: { data?: unknown; code?: number; reason?: string; wasClean?: boolean; message?: string }) => void
@@ -53,7 +54,7 @@ export class WebSocketTransport {
   private readonly shouldReconnectOnClose: (info: TransportCloseInfo) => boolean;
 
   constructor(options: TransportOptions = {}) {
-    this.reconnectEnabled = options.reconnect?.enabled ?? true;
+    this.reconnectEnabled = options.reconnect?.enabled ?? false;
     this.initialDelayMs = options.reconnect?.initialDelayMs ?? 500;
     this.maxDelayMs = options.reconnect?.maxDelayMs ?? 10_000;
     this.reconnectDelayMs = this.initialDelayMs;
@@ -72,7 +73,16 @@ export class WebSocketTransport {
   }
 
   send(message: string): void {
-    this.socket?.send(message);
+    const socket = this.socket;
+    if (!socket) {
+      throw new Error("WebSocket is not connected");
+    }
+
+    if (typeof socket.readyState === "number" && socket.readyState !== 1) {
+      throw new Error(`WebSocket is not open (readyState=${socket.readyState})`);
+    }
+
+    socket.send(message);
   }
 
   close(): void {
@@ -86,12 +96,23 @@ export class WebSocketTransport {
       return;
     }
 
-    this.socket = this.webSocketFactory(this.url);
-    this.socket.addEventListener("open", () => {
+    const socket = this.webSocketFactory(this.url);
+    this.socket = socket;
+
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.reconnectDelayMs = this.initialDelayMs;
       this.hooks.onOpen?.();
     });
-    this.socket.addEventListener("close", (event) => {
+
+    socket.addEventListener("close", (event) => {
+      if (this.socket === socket) {
+        this.socket = undefined;
+      }
+
       const info = {
         code: event?.code,
         reason: event?.reason,
@@ -102,10 +123,11 @@ export class WebSocketTransport {
         this.scheduleReconnect();
       }
     });
-    this.socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
       this.hooks.onMessage?.(typeof event?.data === "string" ? event.data : String(event?.data ?? ""));
     });
-    this.socket.addEventListener("error", (event) => {
+
+    socket.addEventListener("error", (event) => {
       this.hooks.onError?.({
         message: event?.message
       });

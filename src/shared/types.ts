@@ -1,4 +1,4 @@
-import type { ErrorCode } from "./codes.ts";
+import type { ErrorCode, RouteFailureStage } from "./codes.ts";
 
 export interface AuthContext {
   peerId: string;
@@ -25,6 +25,7 @@ export interface Envelope<T = unknown> {
   version: string;
   action: string;
   streamId?: string;
+  ack?: AckMode;
   seq?: number;
   ts: number;
   traceId?: string;
@@ -50,16 +51,6 @@ export interface SysPongPayload {
   nonce?: string;
 }
 
-export interface SysRecvAckPayload {
-  ackFor: string;
-  acceptedAt: number;
-}
-
-export interface SysHandleAckPayload {
-  ackFor: string;
-  handledAt: number;
-}
-
 export interface SysErrPayload {
   code: ErrorCode;
   message: string;
@@ -69,9 +60,22 @@ export interface SysErrPayload {
   traceId?: string;
 }
 
-export interface SysRoutePayload {
+export interface SysRouteFailure {
+  peerId: string;
+  nodeId?: string;
+  connId?: string;
+  stage: RouteFailureStage;
+  code: ErrorCode;
+  message: string;
+  retryable: boolean;
+}
+
+export interface SysResultPayload {
+  refMsgId?: string;
   resolvedPeers: string[];
   deliveredConns: ConnRef[];
+  failed: SysRouteFailure[];
+  partialFailure: boolean;
 }
 
 export interface SysPushPayload<T = unknown> {
@@ -103,12 +107,20 @@ export interface ClientTransportErrorInfo {
 export interface ClientSystemHandlers {
   onAuthOk?: (payload: SysAuthOkPayload) => void;
   onPong?: (payload: SysPongPayload) => void;
-  onRecvAck?: (payload: SysRecvAckPayload) => void;
-  onHandleAck?: (payload: SysHandleAckPayload) => void;
-  onRoute?: (payload: SysRoutePayload) => void;
+  onResult?: (payload: SysResultPayload) => void;
   onError?: (payload: SysErrPayload) => void;
   onClose?: (info: ClientCloseInfo) => void;
   onTransportError?: (info: ClientTransportErrorInfo) => void;
+}
+
+export interface ClientDispatchOptions {
+  ack?: AckMode;
+  resultTimeoutMs?: number;
+}
+
+export interface ClientDispatchReceipt {
+  msgId: string;
+  result?: SysResultPayload;
 }
 
 export interface OutboundContext<Payload = unknown> {
@@ -174,7 +186,7 @@ export interface ServerProtocolModule<Payload = unknown> {
   actions: Record<string, ServerActionHooks<Payload>>;
 }
 
-export type AckMode = "none" | "recv" | "handle";
+export type AckMode = "none" | "recv";
 
 export interface ServerDispatch {
   protocol?: string;
