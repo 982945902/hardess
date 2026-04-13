@@ -26,4 +26,26 @@ describe("RuntimeAuthService", () => {
 
     expect(await service.isAuthContextValid(auth)).toBe(false);
   });
+
+  it("validates system auth payloads through the shared schema path", async () => {
+    const service = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const auth = await service.validateSystemAuth({
+      provider: "bearer",
+      payload: "demo:alice"
+    });
+
+    expect(auth.peerId).toBe("alice");
+    expect(auth.tokenId).toBe("demo:alice");
+  });
+
+  it("rejects invalid system auth payloads", async () => {
+    const service = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+
+    await expect(
+      service.validateSystemAuth({
+        provider: "bearer",
+        payload: 123
+      } as never)
+    ).rejects.toBeInstanceOf(HardessError);
+  });
 });

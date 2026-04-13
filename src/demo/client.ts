@@ -1,4 +1,9 @@
-import { HardessClient, type ClientProtocolModule } from "../sdk/index.ts";
+import {
+  HardessClient,
+  parseDemoSendPayload,
+  type ClientProtocolModule,
+  type DemoSendPayload
+} from "../sdk/index.ts";
 import { chatClientModule } from "./chat-module.ts";
 
 const env = globalThis as {
@@ -16,12 +21,15 @@ const sendDelayMs = Number(env.process?.env?.SEND_DELAY_MS ?? 1500);
 const protocol = env.process?.env?.PROTOCOL ?? "chat";
 
 const demoModule: ClientProtocolModule<
-  { toPeerId: string; content: string },
-  { toPeerId: string; content: string }
+  DemoSendPayload,
+  DemoSendPayload
 > = {
   protocol: "demo",
   version: "1.0",
   outbound: {
+    encode(_action, payload) {
+      return parseDemoSendPayload(payload);
+    },
     actions: {
       send(ctx) {
         ctx.setStream(`demo:${ctx.payload.toPeerId}`);
@@ -30,6 +38,12 @@ const demoModule: ClientProtocolModule<
     }
   },
   inbound: {
+    decode(_action, payload) {
+      return parseDemoSendPayload(payload);
+    },
+    validate(_action, payload) {
+      parseDemoSendPayload(payload);
+    },
     actions: {
       async send(ctx) {
         console.log(

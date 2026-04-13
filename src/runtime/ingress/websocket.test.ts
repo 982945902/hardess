@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { ERROR_CODES, HardessError } from "../../shared/index.ts";
 import type { Envelope } from "../../shared/types.ts";
 import { parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
-import { DemoBearerAuthProvider } from "../auth/provider.ts";
+import { DemoBearerAuthProvider, type AuthProvider } from "../auth/provider.ts";
 import { RuntimeAuthService } from "../auth/service.ts";
 import { createWebSocketHandlers } from "./websocket.ts";
 import { ConsoleLogger } from "../observability/logger.ts";
@@ -61,6 +62,33 @@ function createSocket(
 function lastEnvelope(socket: TestSocket): Envelope<unknown> | null {
   const raw = socket.sent.at(-1);
   return raw ? parseEnvelope(raw) : null;
+}
+
+function createBearerAuthProvider(capabilities: string[]): AuthProvider {
+  return {
+    name: "bearer",
+    async validateBearerToken(token: string) {
+      const normalized = token.startsWith("Bearer ") ? token.slice(7) : token;
+      const [scheme, peerId] = normalized.split(":");
+      if (scheme !== "demo" || !peerId) {
+        throw new HardessError(ERROR_CODES.AUTH_INVALID_TOKEN, "Unsupported token format");
+      }
+
+      return {
+        peerId,
+        tokenId: normalized,
+        capabilities,
+        expiresAt: Date.now() + 60 * 60 * 1000
+      };
+    },
+    async validateSystemAuth(payload: unknown) {
+      if (!payload || typeof payload !== "object" || typeof (payload as { payload?: unknown }).payload !== "string") {
+        throw new HardessError(ERROR_CODES.AUTH_INVALID_TOKEN, "Invalid bearer auth payload");
+      }
+
+      return this.validateBearerToken((payload as { payload: string }).payload);
+    }
+  };
 }
 
 describe("createWebSocketHandlers", () => {
@@ -369,6 +397,73 @@ describe("createWebSocketHandlers", () => {
     expect(lastEnvelope(alice)?.action).toBe("err");
     expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("AUTH_INVALID_TOKEN");
     expect(alice.closed?.code).toBe(4401);
+    handlers.dispose();
+  });
+
+  it("rejects protocol actions when required capabilities are missing", async () => {
+    const authService = new RuntimeAuthService([createBearerAuthProvider(["push.system"])]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, token] of [
+      [alice, "demo:alice"],
+      [bob, "demo:bob"]
+    ] as const) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: token
+          }
+        })
+      );
+    }
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "acl-send-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    );
+
+    expect(lastEnvelope(alice)?.action).toBe("err");
+    expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("ACL_DENIED");
+    expect(alice.closed?.code).toBe(4403);
+    expect(bob.sent.filter((raw) => parseEnvelope(raw)?.kind === "biz")).toHaveLength(0);
     handlers.dispose();
   });
 

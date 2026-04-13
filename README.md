@@ -57,5 +57,8 @@ bun run clean
 ## Still Not Done
 
 - production auth provider integration still replaces only the demo auth path
+- the built-in ACL / capability baseline for protocol actions still needs to be finished beyond the current extension hooks
+- the shared runtime-schema layer still needs to absorb the remaining ad hoc validation at extension/control-plane boundaries
+- websocket egress and backpressure thresholds still need broader workload validation and tuning
 - external observability stack rollout is still deployment-specific; the repo now ships Prometheus export, a sample Grafana dashboard, bounded metrics, and threshold-based log alerts
 - dynamic membership, stronger cluster coordination, and non-static multi-node routing remain deferred

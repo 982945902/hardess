@@ -9,7 +9,7 @@ Hardess is a gateway + realtime message hub. It solves two core problems:
    - Then request is forwarded to downstream HTTP service.
 2. Realtime communication between connected peers:
    - Direct peer messaging and business-defined audience fanout (client-client / service-service / mixed).
-   - System push from platform services over WebSocket.
+   - A reserved system-push extension point over WebSocket for future runtime-level control events; business push should use injected business protocols.
 
 A key design principle is **transport unification**:
 - Connected clients and connected platform services use the same SDK.
@@ -28,7 +28,7 @@ A key design principle is **transport unification**:
 ### In scope (MVP)
 1. HTTP gateway with configurable route pipelines.
 2. TS worker execution in pre-processing stage.
-3. WebSocket hub with direct messaging, audience fanout, and system push.
+3. WebSocket hub with direct messaging, audience fanout, plus a reserved system-push extension point that is not part of the current runtime baseline.
 4. Unified TypeScript SDK for all connected peer types.
 5. Dynamic business protocol injection in SDK.
 
@@ -55,7 +55,7 @@ Implemented in repository:
 3. Shared auth abstraction, dispatcher, worker loader, config store, and both local plus static-cluster `PeerLocator` implementations are implemented.
 4. Config reload and worker reload work through shadow-copy module loading, directory-level watch with debounce, serialized reload execution, and explicit disposal points.
 5. SDK transport, reconnect, heartbeat, protocol registry, conflict detection, and explicit `replace` semantics are implemented.
-6. Demo business protocols exist for `demo` and `chat`, including server-side dispatch transformation (`send -> message`).
+6. Demo business protocols exist for `demo` and `chat`, including server-side dispatch transformation (`send -> message`) and a baseline capability check for the built-in direct-notify-style send actions.
 7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
 8. Runtime metrics now include bounded snapshot support for server mode, HTTP/worker/proxy/WebSocket-side counters and timings, cluster-transport counters for internal WS channels, threshold-based structured alert logging over configurable windows, and Prometheus text export for external scraping.
 9. Runtime admin endpoints now exist for `__admin/health`, `__admin/ready`, `__admin/metrics`, `__admin/metrics/prometheus`, and `__admin/cluster/peers`, and the Bun server path supports graceful shutdown signaling with an explicit drain window before stop/dispose.
@@ -63,7 +63,8 @@ Implemented in repository:
 11. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
 12. A shared runtime-schema baseline is now implemented with `zod` for config validation, shared envelope validation, key system payloads, business protocol payloads, and worker result validation.
 13. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
-14. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
+14. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
+15. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
 
 Implementation checklist by module:
 
@@ -87,6 +88,8 @@ Partially completed:
 4. Runtime operational polish is partially implemented: config/worker reload, health/readiness, graceful shutdown with drain window, startup-failure handling, repo-level workflow docs, an operator guide, automated local release-gate execution, SLO-aware release-gate checks, and SLO-aware cluster benchmarking are in place, but broader deployment integration is still environment-specific.
 5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, internal WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
 6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, but not every SDK/runtime extension surface has been migrated yet.
+7. ACL / capability enforcement is partially implemented: the `authorize` hook exists and the built-in `demo.send` / `chat.send` path now requires `notify.conn`, but a broader default capability policy for future injected protocols is still open.
+8. Some SDK ergonomics remain intentionally thin above the current sender-side delivery baseline: `emit`, `emitTracked`, `waitForResult`, and `send` now cover the common cases, but request/reply-style business abstractions are still protocol-level decisions rather than a fixed core contract.
 
 Not started or intentionally deferred:
 1. External `AuthProvider` integration is intentionally deferred until the external auth-service contract is stable.
@@ -96,13 +99,14 @@ Not started or intentionally deferred:
 5. Control plane route/worker version management UI is out of MVP scope and not started.
 
 TODO / still open:
-1. Continue tuning runtime controls beyond the current baseline: Bun socket backpressure integration and buffered-amount governance are now implemented, but egress flow-control tuning still needs validation under broader production traffic mixes.
-2. Define and calibrate cluster latency / degradation SLOs per deployment tier; the benchmark runner can enforce operator-provided thresholds now, but the acceptable envelope is still workload-specific.
-3. Finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline: real external monitoring stack rollout remains deployment work.
-4. Improve runtime operational polish beyond the current baseline: automated local release-gate execution and clearer startup failure behavior now exist, but broader deployment automation still depends on the target environment.
-5. Decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
-6. External `AuthProvider` integration is intentionally deferred; the abstraction already exists, but concrete integration should follow the external auth-service contract rather than lead MVP scope.
-7. Extend the shared runtime-schema layer to the remaining extension surfaces where ad hoc validation still exists, especially SDK-facing protocol boundaries and any future control-plane inputs.
+1. High priority: finish the baseline ACL / capability story for injected protocol actions. The hook exists and built-in direct-notify-style actions now enforce `notify.conn`, but the default policy shape for future injected protocols still needs to be made explicit and consistently covered in tests/docs.
+2. High priority: extend the shared runtime-schema layer to the remaining extension surfaces where ad hoc validation still exists, especially future control-plane inputs and any remaining protocol-extension boundaries outside the now-shared sender-side delivery path.
+3. High priority: continue tuning WebSocket egress and backpressure controls under broader traffic mixes. The baseline safeguards exist, but the thresholds still need production-like calibration.
+4. Medium priority: define and calibrate cluster latency / degradation SLOs per deployment tier. The benchmark runner can enforce operator-provided thresholds now, but the acceptable envelope is still workload-specific.
+5. Medium priority: finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline.
+6. Medium priority: improve deployment automation and runtime operational polish beyond the current local release-gate and graceful-shutdown baseline.
+7. Lower priority: decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
+8. Deferred by dependency: external `AuthProvider` integration should follow the external auth-service contract rather than lead MVP scope.
 
 Single-node release checklist:
 
@@ -118,6 +122,12 @@ Recommended before first release:
 2. Keep the operator guide current as deployment conventions stabilize.
 3. Calibrate threshold-based log monitoring for upstream timeout spikes, worker failures, and WebSocket overflow/rate-limit events against production traffic.
 4. Review worker trust and change-management boundaries so only expected worker modules can be published and activated in the single-node deployment.
+
+Current implementation priority after deferring external auth integration:
+1. Finish the built-in ACL / capability baseline for direct-notify-style protocol actions.
+2. Continue migrating mixed validation paths onto the shared runtime-schema layer.
+3. Validate and tune WebSocket egress / backpressure thresholds under broader traffic mixes.
+4. Keep observability and release-gate wiring production-usable per environment.
 
 Can defer for single-node release:
 1. Dynamic cluster membership, stronger distributed routing state, and other scale-out architecture work beyond the current static cluster baseline.
@@ -333,7 +343,7 @@ Rules:
 4. `sys.handleAck`
 5. `sys.err`
 6. `sys.route`
-7. `sys.push`
+7. `sys.push` (reserved; not implemented in the current runtime baseline)
 
 System semantics:
 1. `sys.recvAck`: the platform accepted the message into the target transport path.
@@ -398,12 +408,15 @@ interface SysPushPayload<T = unknown> {
 }
 ```
 
+`SysPushPayload` is reserved for a future runtime-level control-plane extension. It is not implemented in the current runtime baseline, and it should not be used as a general business-event transport.
+
 Message notes:
 1. `sys.auth` request uses `SysAuthPayload`; success response uses `SysAuthOkPayload`.
 2. `sys.recvAck` and `sys.handleAck` both point back to business `msgId` by `ackFor`.
 3. `sys.err.refMsgId` links an error to the original system or business message.
 4. `sys.route` is runtime-generated metadata and not emitted by business plugins directly.
-5. The exact `sys.auth` handshake is intentionally abstract in this document because it depends on the external platform auth service contract.
+5. `sys.push` is intentionally reserved for future runtime-level control events; current business notifications should use injected business protocols instead.
+6. The exact `sys.auth` handshake is intentionally abstract in this document because it depends on the external platform auth service contract.
 
 ### 7.2.2 System Error Codes
 Minimum MVP error code set:
@@ -441,6 +454,8 @@ Client handling notes:
 1. Terminal server close codes such as `4400`, `4401`, `4403`, `4429`, and `4508` should not trigger automatic reconnect by default.
 2. Non-terminal closes such as heartbeat timeout may still use reconnect policy.
 3. Clients should surface `code` and `reason` to application handlers even when a preceding `sys.err` was already observed.
+4. `onTransportError` is reserved for transport/socket failures; protocol decoding or validation failures should use a distinct protocol-error surface instead of being merged into transport semantics.
+5. Sender-side control-path failures must not be silent: malformed `sys.route`, `sys.recvAck`, `sys.handleAck`, `sys.err`, or other control-plane messages must still be surfaced to the sender SDK as protocol errors even when the connection stays open.
 
 ### 7.2.3 Shared Error Response Shape
 HTTP and WebSocket share one platform error body shape even though the transport framing differs.
@@ -550,6 +565,66 @@ export interface InboundContext<Payload = unknown> {
   traceId?: string;
   ts: number;
 }
+
+export interface ClientProtocolErrorInfo {
+  layer: "envelope" | "system" | "business";
+  message: string;
+  protocol?: string;
+  version?: string;
+  action?: string;
+  msgId?: string;
+  traceId?: string;
+}
+
+export type ClientAwaitableDeliveryStage = "recvAck" | "handleAck";
+
+export interface ClientDeliveryTimeoutInfo {
+  stage: ClientAwaitableDeliveryStage;
+  timeoutMs: number;
+  startedAt: number;
+  timedOutAt: number;
+}
+
+export interface ClientDeliveryEvent {
+  stage:
+    | "route"
+    | "recvAck"
+    | "handleAck"
+    | "recvAckTimeout"
+    | "handleAckTimeout"
+    | "error"
+    | "protocolError";
+  msgId: string;
+  traceId?: string;
+  protocol?: string;
+  version?: string;
+  action?: string;
+  timeout?: ClientDeliveryTimeoutInfo;
+}
+
+export interface ClientSystemHandlers {
+  onAuthOk?: (payload: SysAuthOkPayload) => void;
+  onPong?: (payload: SysPongPayload) => void;
+  onRecvAck?: (payload: SysRecvAckPayload) => void;
+  onHandleAck?: (payload: SysHandleAckPayload) => void;
+  onRoute?: (payload: SysRoutePayload) => void;
+  onError?: (payload: SysErrPayload) => void;
+  onDeliveryEvent?: (event: ClientDeliveryEvent) => void;
+  onProtocolError?: (info: ClientProtocolErrorInfo) => void;
+  onClose?: (info: ClientCloseInfo) => void;
+  onTransportError?: (info: ClientTransportErrorInfo) => void;
+}
+
+export interface ClientSendTracker {
+  msgId: string;
+  traceId: string;
+  onEvent(listener: (event: ClientDeliveryEvent) => void): () => void;
+  waitForRecvAck(): Promise<ClientDeliveryEvent>;
+  waitForHandleAck(): Promise<ClientDeliveryEvent>;
+  waitForResult(options?: {
+    until?: ClientAwaitableDeliveryStage;
+  }): Promise<ClientDeliveryEvent>;
+}
 ```
 
 ### 8.2 Dynamic Injection API
@@ -564,6 +639,26 @@ Constraints:
 2. Plugin action conflict is rejected unless explicit `replace`.
 3. Plugin failure must not break connection loop.
 4. Plugins share a transport connection but must not assume cross-protocol ordering.
+
+Client error-surface rules:
+1. Sender-side failures must be observable by the SDK client and must not be silently dropped.
+2. Transport/socket failures use `onTransportError` and `onClose`.
+3. Envelope / system / business protocol decoding or validation failures use `onProtocolError`.
+4. Receiver-side business payload failures may be handled more loosely than sender-side control-path failures, but they should still have a local protocol-error surface when the SDK detects them.
+5. Sender-side delivery progression should support both a global event stream (`onDeliveryEvent`) and per-message correlation, so application code can choose between centralized observability and request-scoped control flow.
+
+Delivery-correlation notes:
+1. The SDK should preserve both forms:
+   - a global delivery event stream for logging, metrics, and generic lifecycle handling
+   - a per-message tracked send surface for request-scoped business code
+2. `emitTracked(...)` should return a handle keyed by the emitted `msgId`, allowing the caller to await or subscribe to delivery stages such as `recvAck`, `handleAck`, `error`, or sender-visible protocol errors without rebuilding that correlation table in application code.
+3. The SDK may still expose lower-level global system handlers such as `onError`, `onRoute`, `onRecvAck`, and `onHandleAck`, but those should not be the only way to observe sender-side failures.
+4. Delivery timeouts should be surfaced through the same delivery model rather than hidden in application code:
+   - global `onDeliveryEvent` should observe `recvAckTimeout` / `handleAckTimeout`
+   - tracked sends should reject `waitForRecvAck()` / `waitForHandleAck()` on the corresponding timeout
+5. Even fire-and-forget `emit(...)` should still enter the sender-side delivery tracking path for global observability, while `emitTracked(...)` layers request-scoped waiting/subscription on top of that same underlying correlation table.
+6. The SDK should also expose a higher-level await form on top of tracked sends, such as `waitForResult()` or `client.send(...)`, so common business code can say "send and wait until recvAck/handleAck" without manually sequencing multiple low-level waits.
+7. That higher-level await form should fail fast on sender-visible failures, including early `recvAck` timeout, instead of waiting for a later stage timeout just because the target stage was `handleAck`.
 
 ### 8.3 Server Protocol Hook Contract
 Business recipient resolution runs inside Hardess, not inside the client SDK.
@@ -760,7 +855,7 @@ Future hardening:
 1. One shared auth module validates platform-issued token for both HTTP and WebSocket.
 2. Auth handshake required before WebSocket business actions.
 3. HTTP forwarding requires valid token before worker execution and proxy forwarding.
-4. Capability ACL check before route/fanout operations.
+4. Capability ACL hooks run before route/fanout operations; the built-in `demo.send` / `chat.send` path now requires `notify.conn`, while broader policy remains protocol-defined.
 5. Server sets authoritative `src` field.
 6. Revoked or expired token blocks both outbound send and inbound delivery on WebSocket.
 7. Revoked or expired token causes HTTP request rejection before proxy forwarding.
@@ -928,7 +1023,7 @@ Rules:
 
 ### Phase 1 (implemented single-node MVP baseline)
 1. HTTP worker pre-processing + proxy.
-2. WS hub direct messaging + audience fanout + system push baseline.
+2. WS hub direct messaging + audience fanout baseline; `sys.push` remains a reserved extension point rather than a current runtime feature.
 3. Unified SDK core + plugin registry.
 4. Config reload and worker reload baseline.
 5. Demo business protocols and local smoke/demo tooling.

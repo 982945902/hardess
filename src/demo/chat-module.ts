@@ -1,19 +1,18 @@
-import type { ClientProtocolModule } from "../sdk/index.ts";
-
-export interface ChatSendPayload {
-  toPeerId: string;
-  content: string;
-}
-
-export interface ChatMessagePayload {
-  fromPeerId: string;
-  content: string;
-}
+import {
+  parseChatMessagePayload,
+  parseChatSendPayload,
+  type ChatMessagePayload,
+  type ChatSendPayload,
+  type ClientProtocolModule
+} from "../sdk/index.ts";
 
 export const chatClientModule: ClientProtocolModule<ChatSendPayload, ChatMessagePayload> = {
   protocol: "chat",
   version: "1.0",
   outbound: {
+    encode(_action, payload) {
+      return parseChatSendPayload(payload);
+    },
     actions: {
       send(ctx) {
         ctx.setStream(`chat:${[ctx.payload.toPeerId].join(":")}`);
@@ -22,6 +21,12 @@ export const chatClientModule: ClientProtocolModule<ChatSendPayload, ChatMessage
     }
   },
   inbound: {
+    decode(_action, payload) {
+      return parseChatMessagePayload(payload);
+    },
+    validate(_action, payload) {
+      parseChatMessagePayload(payload);
+    },
     actions: {
       async message(ctx) {
         console.log(

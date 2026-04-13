@@ -2,15 +2,24 @@ import { z, type ZodError, type ZodType } from "zod";
 import { ERROR_CODES } from "./codes.ts";
 import { HardessError } from "./errors.ts";
 import type {
+  ConnRef,
   Envelope,
   HardessConfig,
   HardessWorkerResult,
+  SysAuthOkPayload,
   SysAuthPayload,
+  SysErrPayload,
+  SysHandleAckPayload,
   SysPingPayload,
-  SysPongPayload
+  SysPongPayload,
+  SysRecvAckPayload,
+  SysRoutePayload
 } from "./types.ts";
 
 const stringRecordSchema = z.record(z.string(), z.string());
+const errorCodeSchema = z.enum(
+  Object.values(ERROR_CODES) as [typeof ERROR_CODES[keyof typeof ERROR_CODES], ...typeof ERROR_CODES[keyof typeof ERROR_CODES][]]
+);
 
 export const pipelineConfigSchema = z.object({
   id: z.string().min(1, "pipeline id is required"),
@@ -60,6 +69,12 @@ export const sysAuthPayloadSchema = z.object({
   payload: z.unknown()
 });
 
+export const sysAuthOkPayloadSchema = z.object({
+  peerId: z.string().min(1, "peerId is required"),
+  capabilities: z.array(z.string()),
+  expiresAt: z.number().finite()
+});
+
 export const sysPingPayloadSchema = z.object({
   nonce: z.string().optional()
 });
@@ -70,6 +85,36 @@ export const sysPongPayloadSchema = z.object({
 
 export const sysHandleAckPayloadSchema = z.object({
   ackFor: z.string().min(1, "ackFor is required")
+});
+
+export const sysRecvAckPayloadSchema = z.object({
+  ackFor: z.string().min(1, "ackFor is required"),
+  acceptedAt: z.number().finite()
+});
+
+export const sysHandleAckEventPayloadSchema = z.object({
+  ackFor: z.string().min(1, "ackFor is required"),
+  handledAt: z.number().finite()
+});
+
+const connRefSchema = z.object({
+  nodeId: z.string().min(1, "nodeId is required"),
+  connId: z.string().min(1, "connId is required"),
+  peerId: z.string().min(1, "peerId is required")
+});
+
+export const sysRoutePayloadSchema = z.object({
+  resolvedPeers: z.array(z.string().min(1, "resolved peerId is required")),
+  deliveredConns: z.array(connRefSchema)
+});
+
+export const sysErrPayloadSchema = z.object({
+  code: errorCodeSchema,
+  message: z.string().min(1, "message is required"),
+  retryable: z.boolean(),
+  detail: z.unknown().optional(),
+  refMsgId: z.string().min(1).optional(),
+  traceId: z.string().min(1).optional()
 });
 
 export const hardessWorkerResultSchema = z.object({
@@ -119,6 +164,10 @@ export function parseSysAuthPayload(payload: unknown): SysAuthPayload {
   return parseProtocolPayload(sysAuthPayloadSchema, payload, "Invalid sys.auth payload");
 }
 
+export function parseSysAuthOkPayload(payload: unknown): SysAuthOkPayload {
+  return parseProtocolPayload(sysAuthOkPayloadSchema, payload, "Invalid sys.auth.ok payload");
+}
+
 export function parseSysPingPayload(payload: unknown): SysPingPayload {
   return parseProtocolPayload(sysPingPayloadSchema, payload, "Invalid sys.ping payload");
 }
@@ -129,6 +178,26 @@ export function parseSysPongPayload(payload: unknown): SysPongPayload {
 
 export function parseSysHandleAckPayload(payload: unknown): { ackFor: string } {
   return parseProtocolPayload(sysHandleAckPayloadSchema, payload, "Invalid sys.handleAck payload");
+}
+
+export function parseSysRecvAckPayload(payload: unknown): SysRecvAckPayload {
+  return parseProtocolPayload(sysRecvAckPayloadSchema, payload, "Invalid sys.recvAck payload");
+}
+
+export function parseSysHandleAckEventPayload(payload: unknown): SysHandleAckPayload {
+  return parseProtocolPayload(sysHandleAckEventPayloadSchema, payload, "Invalid sys.handleAck event payload");
+}
+
+export function parseConnRef(payload: unknown): ConnRef {
+  return parseProtocolPayload(connRefSchema, payload, "Invalid conn ref");
+}
+
+export function parseSysRoutePayload(payload: unknown): SysRoutePayload {
+  return parseProtocolPayload(sysRoutePayloadSchema, payload, "Invalid sys.route payload");
+}
+
+export function parseSysErrPayload(payload: unknown): SysErrPayload {
+  return parseProtocolPayload(sysErrPayloadSchema, payload, "Invalid sys.err payload");
 }
 
 export function normalizeWorkerResult(result: Response | HardessWorkerResult | void): HardessWorkerResult {

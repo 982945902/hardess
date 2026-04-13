@@ -74,6 +74,8 @@ export interface SysRoutePayload {
   deliveredConns: ConnRef[];
 }
 
+// Reserved for a future runtime-level control event channel.
+// Current business notifications should use injected business protocols instead.
 export interface SysPushPayload<T = unknown> {
   topic: string;
   payload: T;
@@ -100,6 +102,65 @@ export interface ClientTransportErrorInfo {
   message?: string;
 }
 
+export interface ClientProtocolErrorInfo {
+  layer: "envelope" | "system" | "business";
+  message: string;
+  protocol?: string;
+  version?: string;
+  action?: string;
+  msgId?: string;
+  traceId?: string;
+}
+
+export type ClientAwaitableDeliveryStage = "recvAck" | "handleAck";
+
+export type ClientDeliveryStage =
+  | "route"
+  | "recvAck"
+  | "handleAck"
+  | "recvAckTimeout"
+  | "handleAckTimeout"
+  | "error"
+  | "protocolError";
+
+export interface ClientDeliveryTimeoutInfo {
+  stage: ClientAwaitableDeliveryStage;
+  timeoutMs: number;
+  startedAt: number;
+  timedOutAt: number;
+}
+
+export interface ClientDeliveryTimeoutPolicy {
+  recvAckMs?: number;
+  handleAckMs?: number;
+}
+
+export interface ClientDeliveryEvent {
+  stage: ClientDeliveryStage;
+  msgId: string;
+  traceId?: string;
+  protocol?: string;
+  version?: string;
+  action?: string;
+  route?: SysRoutePayload;
+  recvAck?: SysRecvAckPayload;
+  handleAck?: SysHandleAckPayload;
+  error?: SysErrPayload;
+  protocolError?: ClientProtocolErrorInfo;
+  timeout?: ClientDeliveryTimeoutInfo;
+}
+
+export interface ClientSendTracker {
+  msgId: string;
+  traceId: string;
+  onEvent(listener: (event: ClientDeliveryEvent) => void): () => void;
+  waitForRecvAck(): Promise<ClientDeliveryEvent>;
+  waitForHandleAck(): Promise<ClientDeliveryEvent>;
+  waitForResult(options?: {
+    until?: ClientAwaitableDeliveryStage;
+  }): Promise<ClientDeliveryEvent>;
+}
+
 export interface ClientSystemHandlers {
   onAuthOk?: (payload: SysAuthOkPayload) => void;
   onPong?: (payload: SysPongPayload) => void;
@@ -107,6 +168,8 @@ export interface ClientSystemHandlers {
   onHandleAck?: (payload: SysHandleAckPayload) => void;
   onRoute?: (payload: SysRoutePayload) => void;
   onError?: (payload: SysErrPayload) => void;
+  onDeliveryEvent?: (event: ClientDeliveryEvent) => void;
+  onProtocolError?: (info: ClientProtocolErrorInfo) => void;
   onClose?: (info: ClientCloseInfo) => void;
   onTransportError?: (info: ClientTransportErrorInfo) => void;
 }
