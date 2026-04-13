@@ -19,6 +19,7 @@
     "load:http": "bun run src/load/http.ts",
     "load:ws": "bun run src/load/ws.ts",
     "load:cluster-ws": "bun run src/load/cluster-ws.ts",
+    "smoke:local": "bash scripts/local-release-smoke.sh",
     "bench:ws": "bun run src/load/benchmark-ws.ts",
     "bench:ws:local": "BENCH_WS_PROFILE=high BENCH_WS_SLO_PROFILE=local bun run src/load/benchmark-ws.ts",
     "bench:ws:high": "BENCH_WS_PROFILE=high bun run src/load/benchmark-ws.ts",
