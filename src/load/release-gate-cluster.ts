@@ -2,10 +2,11 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { envNumber, envString } from "./shared.ts";
+import { parseClusterPeersAdminResponse } from "../runtime/cluster/schema.ts";
 import { evaluateClusterWsGateSlo, readClusterWsGateSloThresholds } from "./gate-slo.ts";
 import { runClusterWsLoadTest } from "./cluster-ws.ts";
 import { applyClusterReleaseGateProfile } from "./profiles.ts";
+import { envNumber, envString, parseErrorPayload, parseJsonText } from "./shared.ts";
 
 interface ManagedProcess {
   name: string;
@@ -36,6 +37,7 @@ export interface ClusterReleaseGateResult {
   clusterWsLoad: Awaited<ReturnType<typeof runClusterWsLoadTest>>;
   slo: {
     clusterWs: ReturnType<typeof evaluateClusterWsGateSlo> & {
+      profile: string;
       thresholds: ReturnType<typeof readClusterWsGateSloThresholds>;
     };
   };
@@ -47,15 +49,6 @@ function sleep(ms: number): Promise<void> {
 
 function tail(lines: string[], count = 20): string[] {
   return lines.slice(-count);
-}
-
-function parseErrorPayload(error: unknown): unknown {
-  const message = error instanceof Error ? error.message : String(error);
-  try {
-    return JSON.parse(message);
-  } catch {
-    return message;
-  }
 }
 
 function spawnManagedProcess(name: string, args: string[], extraEnv: Record<string, string>): ManagedProcess {
@@ -139,11 +132,11 @@ async function validateClusterPeers(baseUrl: string, expectedNodeId: string): Pr
     throw new Error(`Cluster peers endpoint failed for ${baseUrl}`);
   }
 
-  const body = await response.json() as { nodeId?: string; peers?: Array<{ nodeId: string }> };
+  const body = parseClusterPeersAdminResponse(await response.json());
   if (body.nodeId !== expectedNodeId) {
     throw new Error(`Unexpected nodeId from ${baseUrl}: ${body.nodeId}`);
   }
-  if (!Array.isArray(body.peers) || body.peers.length !== 1) {
+  if (body.peers.length !== 1) {
     throw new Error(`Expected one configured cluster peer from ${baseUrl}`);
   }
 }
@@ -164,6 +157,7 @@ export async function runClusterReleaseGate(
   overrides: ClusterReleaseGateOptions = {}
 ): Promise<ClusterReleaseGateResult> {
   applyClusterReleaseGateProfile(envString("CLUSTER_RELEASE_GATE_PROFILE", "default"));
+  const clusterReleaseGateSloProfile = envString("CLUSTER_RELEASE_GATE_SLO_PROFILE", "default");
   const nodeAPort = overrides.nodeAPort ?? envNumber("CLUSTER_RELEASE_GATE_PORT_A", 3200);
   const nodeBPort = overrides.nodeBPort ?? envNumber("CLUSTER_RELEASE_GATE_PORT_B", 3201);
   const upstreamPort = overrides.upstreamPort ?? envNumber("CLUSTER_RELEASE_GATE_UPSTREAM_PORT", 9200);
@@ -175,7 +169,10 @@ export async function runClusterReleaseGate(
   const sendIntervalMs = overrides.sendIntervalMs ?? envNumber("CLUSTER_RELEASE_GATE_WS_SEND_INTERVAL_MS", 0);
   const completionTimeoutMs = overrides.completionTimeoutMs ?? envNumber("CLUSTER_RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS", 20_000);
   const metricsSink = overrides.metricsSink ?? envString("CLUSTER_RELEASE_GATE_METRICS_SINK", "windowed");
-  const clusterWsGateSloThresholds = readClusterWsGateSloThresholds();
+  const clusterWsGateSloThresholds = readClusterWsGateSloThresholds(
+    "CLUSTER_RELEASE_GATE_WS",
+    clusterReleaseGateSloProfile
+  );
 
   const tempDir = await mkdtemp(join(tmpdir(), "hardess-cluster-release-gate-"));
   let upstream: ManagedProcess | undefined;
@@ -311,6 +308,7 @@ export async function runClusterReleaseGate(
       clusterWsLoad,
       slo: {
         clusterWs: {
+          profile: clusterReleaseGateSloProfile,
           thresholds: clusterWsGateSloThresholds,
           ...clusterWsGateSlo
         }
@@ -352,11 +350,7 @@ if (import.meta.main) {
     console.log(JSON.stringify(await runClusterReleaseGate(), null, 2));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    try {
-      console.error(JSON.stringify(JSON.parse(message), null, 2));
-    } catch {
-      console.error(JSON.stringify({ ok: false, error: message }, null, 2));
-    }
+    console.error(JSON.stringify(parseJsonText(message) ?? { ok: false, error: message }, null, 2));
     process.exitCode = 1;
   }
 }

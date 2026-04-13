@@ -58,6 +58,36 @@ describe("ModuleConfigStore", () => {
     store.dispose();
   });
 
+  it("loads config from a default export", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-default-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export default {
+        pipelines: [
+          {
+            id: "demo-http",
+            matchPrefix: "/demo",
+            downstream: {
+              origin: "http://127.0.0.1:9000",
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000
+            }
+          }
+        ]
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    const config = await store.reload();
+
+    expect(config.pipelines).toHaveLength(1);
+    expect(store.getConfig().pipelines[0]?.id).toBe("demo-http");
+    store.dispose();
+  });
+
   it("reloads automatically when the config file changes", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-config-watch-"));
     cleanupPaths.push(dir);
@@ -209,6 +239,23 @@ describe("ModuleConfigStore", () => {
 
     const store = new ModuleConfigStore(configPath);
     await expect(store.reload()).rejects.toThrow("connectTimeoutMs must be > 0");
+    store.dispose();
+  });
+
+  it("rejects config modules that export neither hardessConfig nor default", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-missing-export-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const somethingElse = {
+        pipelines: []
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    await expect(store.reload()).rejects.toThrow("module must export hardessConfig or default");
     store.dispose();
   });
 });

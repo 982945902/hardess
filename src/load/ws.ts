@@ -1,5 +1,13 @@
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../shared/envelope.ts";
 import {
+  parseSysAuthOkPayload,
+  parseSysErrPayload,
+  parseSysHandleAckEventPayload,
+  parseSysPingPayload,
+  parseSysRecvAckPayload,
+  parseSysRoutePayload
+} from "../shared/index.ts";
+import {
   diffMetricsSnapshot,
   envNumberFirst,
   envStringFirst,
@@ -50,6 +58,9 @@ export interface WsLoadTestResult {
     closeCodes: Record<string, number>;
     sysErrCodes: Record<string, number>;
     pendingMessages: number;
+    oldestPendingAgeMs: number;
+    topPendingSenders: PendingMessageSummary["topPendingSenders"];
+    pendingSamples: PendingMessageSummary["pendingSamples"];
   };
   metricsDelta: MetricsSnapshot | null;
 }
@@ -60,6 +71,27 @@ interface PeerSocket {
   role: Role;
   peerId: string;
   socket: WebSocket;
+}
+
+interface PendingMessageState {
+  sentAt: number;
+  senderPeerId: string;
+  messageIndex: number;
+}
+
+interface PendingMessageSummary {
+  pendingMessages: number;
+  oldestPendingAgeMs: number;
+  topPendingSenders: Array<{
+    peerId: string;
+    count: number;
+  }>;
+  pendingSamples: Array<{
+    msgId: string;
+    senderPeerId: string;
+    messageIndex: number;
+    ageMs: number;
+  }>;
 }
 
 export function defaultWsLoadTestConfig(): WsLoadTestConfig {
@@ -81,6 +113,34 @@ export function defaultWsLoadTestConfig(): WsLoadTestConfig {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function summarizePendingMessages(
+  pendingByMsgId: Map<string, PendingMessageState>,
+  sampleLimit = 5
+): PendingMessageSummary {
+  const now = performance.now();
+  const entries = Array.from(pendingByMsgId.entries());
+  const countsBySender = new Map<string, number>();
+
+  for (const [, pending] of entries) {
+    countsBySender.set(pending.senderPeerId, (countsBySender.get(pending.senderPeerId) ?? 0) + 1);
+  }
+
+  return {
+    pendingMessages: entries.length,
+    oldestPendingAgeMs: entries.reduce((max, [, pending]) => Math.max(max, now - pending.sentAt), 0),
+    topPendingSenders: Array.from(countsBySender.entries())
+      .map(([peerId, count]) => ({ peerId, count }))
+      .sort((left, right) => right.count - left.count || left.peerId.localeCompare(right.peerId))
+      .slice(0, sampleLimit),
+    pendingSamples: entries.slice(0, sampleLimit).map(([msgId, pending]) => ({
+      msgId,
+      senderPeerId: pending.senderPeerId,
+      messageIndex: pending.messageIndex,
+      ageMs: now - pending.sentAt
+    }))
+  };
 }
 
 function sendSystemEnvelope(socket: WebSocket, action: string, payload: unknown, traceId?: string): void {
@@ -111,7 +171,7 @@ export async function runWsLoadTest(
   const handleAckLatenciesMs: number[] = [];
   const sysErrCodes: Record<string, number> = {};
   const closeCodes: Record<string, number> = {};
-  const pendingByMsgId = new Map<string, number>();
+  const pendingByMsgId = new Map<string, PendingMessageState>();
   const recvAckedMsgIds = new Set<string>();
   let rawRecvAckCount = 0;
   let authenticatedPeers = 0;
@@ -126,6 +186,19 @@ export async function runWsLoadTest(
         reject(new Error(`Timed out connecting ${peerId}`));
       }, config.connectTimeoutMs);
       let authenticated = false;
+
+      function failSystemMessage(error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!authenticated) {
+          clearTimeout(timeout);
+          reject(new Error(`Invalid system message before auth for ${peerId}: ${message}`));
+          socket.close();
+          return;
+        }
+
+        incCounter(sysErrCodes, "INVALID_SYSTEM_MESSAGE");
+        socket.close();
+      }
 
       socket.addEventListener("open", () => {
         socket.send(
@@ -152,55 +225,59 @@ export async function runWsLoadTest(
         }
 
         if (envelope.kind === "system") {
-          switch (envelope.action) {
-            case "auth.ok":
-              if (!authenticated) {
-                authenticated = true;
-                authenticatedPeers += 1;
-                clearTimeout(timeout);
-                resolve({ role, peerId, socket });
-              }
-              return;
-            case "ping":
-              sendSystemEnvelope(socket, "pong", envelope.payload, envelope.traceId);
-              return;
-            case "recvAck": {
-              const ackFor = (envelope.payload as { ackFor?: string } | undefined)?.ackFor;
-              rawRecvAckCount += 1;
-              if (!ackFor) {
+          try {
+            switch (envelope.action) {
+              case "auth.ok":
+                parseSysAuthOkPayload(envelope.payload);
+                if (!authenticated) {
+                  authenticated = true;
+                  authenticatedPeers += 1;
+                  clearTimeout(timeout);
+                  resolve({ role, peerId, socket });
+                }
+                return;
+              case "ping":
+                sendSystemEnvelope(socket, "pong", parseSysPingPayload(envelope.payload), envelope.traceId);
+                return;
+              case "recvAck": {
+                const payload = parseSysRecvAckPayload(envelope.payload);
+                rawRecvAckCount += 1;
+
+                if (recvAckedMsgIds.has(payload.ackFor)) {
+                  return;
+                }
+
+                recvAckedMsgIds.add(payload.ackFor);
+                const sentAt = pendingByMsgId.get(payload.ackFor);
+                if (sentAt !== undefined) {
+                  recvAckLatenciesMs.push(performance.now() - sentAt.sentAt);
+                }
                 return;
               }
-
-              if (recvAckedMsgIds.has(ackFor)) {
+              case "handleAck": {
+                const payload = parseSysHandleAckEventPayload(envelope.payload);
+                const sentAt = pendingByMsgId.get(payload.ackFor);
+                if (sentAt !== undefined) {
+                  handleAckLatenciesMs.push(performance.now() - sentAt.sentAt);
+                  pendingByMsgId.delete(payload.ackFor);
+                }
                 return;
               }
-
-              recvAckedMsgIds.add(ackFor);
-              const sentAt = ackFor ? pendingByMsgId.get(ackFor) : undefined;
-              if (sentAt !== undefined) {
-                recvAckLatenciesMs.push(performance.now() - sentAt);
+              case "route":
+                parseSysRoutePayload(envelope.payload);
+                routeCount += 1;
+                return;
+              case "err": {
+                const payload = parseSysErrPayload(envelope.payload);
+                incCounter(sysErrCodes, payload.code);
+                return;
               }
-              return;
+              default:
+                return;
             }
-            case "handleAck": {
-              const ackFor = (envelope.payload as { ackFor?: string } | undefined)?.ackFor;
-              const sentAt = ackFor ? pendingByMsgId.get(ackFor) : undefined;
-              if (ackFor && sentAt !== undefined) {
-                handleAckLatenciesMs.push(performance.now() - sentAt);
-                pendingByMsgId.delete(ackFor);
-              }
-              return;
-            }
-            case "route":
-              routeCount += 1;
-              return;
-            case "err": {
-              const code = (envelope.payload as { code?: string } | undefined)?.code ?? "UNKNOWN";
-              incCounter(sysErrCodes, code);
-              return;
-            }
-            default:
-              return;
+          } catch (error) {
+            failSystemMessage(error);
+            return;
           }
         }
 
@@ -245,7 +322,12 @@ export async function runWsLoadTest(
     }
 
     throw new Error(
-      `Timed out waiting for handleAck completion: expected=${expectedHandleAcks} actual=${handleAckLatenciesMs.length}`
+      JSON.stringify({
+        message:
+          `Timed out waiting for handleAck completion: expected=${expectedHandleAcks} ` +
+          `actual=${handleAckLatenciesMs.length}`,
+        pending: summarizePendingMessages(pendingByMsgId)
+      })
     );
   }
 
@@ -263,7 +345,11 @@ export async function runWsLoadTest(
       const target = receivers[senderIndex % receivers.length];
       for (let messageIndex = 0; messageIndex < config.messagesPerSender; messageIndex += 1) {
         const msgId = `${sender.peerId}-${messageIndex}-${crypto.randomUUID()}`;
-        pendingByMsgId.set(msgId, performance.now());
+        pendingByMsgId.set(msgId, {
+          sentAt: performance.now(),
+          senderPeerId: sender.peerId,
+          messageIndex
+        });
         sender.socket.send(
           serializeEnvelope(
             createEnvelope({
@@ -298,6 +384,7 @@ export async function runWsLoadTest(
   }
   const elapsedMs = Date.now() - startedAt;
   const metricsAfter = await fetchAdminMetrics(config.adminBaseUrl);
+  const pendingSummary = summarizePendingMessages(pendingByMsgId);
 
   return {
     kind: "ws_load_test",
@@ -327,7 +414,10 @@ export async function runWsLoadTest(
       handleAckLatencyMs: summarizeLatencies(handleAckLatenciesMs),
       closeCodes,
       sysErrCodes,
-      pendingMessages: pendingByMsgId.size
+      pendingMessages: pendingSummary.pendingMessages,
+      oldestPendingAgeMs: pendingSummary.oldestPendingAgeMs,
+      topPendingSenders: pendingSummary.topPendingSenders,
+      pendingSamples: pendingSummary.pendingSamples
     },
     metricsDelta: diffMetricsSnapshot(metricsBefore, metricsAfter)
   };

@@ -5,6 +5,7 @@ import type {
   ConnRef,
   Envelope,
   HardessConfig,
+  HardessWorkerModule,
   HardessWorkerResult,
   SysAuthOkPayload,
   SysAuthPayload,
@@ -69,6 +70,11 @@ export const sysAuthPayloadSchema = z.object({
   payload: z.unknown()
 });
 
+export const bearerSysAuthPayloadSchema = z.object({
+  provider: z.literal("bearer"),
+  payload: z.string().min(1, "payload is required")
+});
+
 export const sysAuthOkPayloadSchema = z.object({
   peerId: z.string().min(1, "peerId is required"),
   capabilities: z.array(z.string()),
@@ -122,6 +128,15 @@ export const hardessWorkerResultSchema = z.object({
   response: z.instanceof(Response).optional()
 }).strict();
 
+export const workerModuleExportSchema = z.custom<HardessWorkerModule>(
+  (value) =>
+    value !== null &&
+    typeof value === "object" &&
+    "fetch" in value &&
+    typeof (value as { fetch?: unknown }).fetch === "function",
+  "worker module must export fetch(request, env, ctx)"
+);
+
 export function formatZodError(error: ZodError): string {
   return error.issues
     .map((issue) => {
@@ -138,6 +153,28 @@ export function parseHardessConfig(value: unknown): HardessConfig {
   }
 
   return result.data as HardessConfig;
+}
+
+export function parseConfigModuleExport(
+  value: unknown,
+  options: {
+    exportName?: string;
+    modulePath?: string;
+  } = {}
+): HardessConfig {
+  const exportName = options.exportName ?? "hardessConfig";
+  const modulePath = options.modulePath ?? "config module";
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid ${modulePath}: module must export ${exportName} or default`);
+  }
+
+  const moduleExports = value as Record<string, unknown>;
+  const candidate = moduleExports[exportName] ?? moduleExports.default;
+  if (candidate === undefined) {
+    throw new Error(`Invalid ${modulePath}: module must export ${exportName} or default`);
+  }
+
+  return parseHardessConfig(candidate);
 }
 
 export function parseEnvelopeValue(value: unknown): Envelope<unknown> | null {
@@ -162,6 +199,17 @@ export function parseProtocolPayload<T>(
 
 export function parseSysAuthPayload(payload: unknown): SysAuthPayload {
   return parseProtocolPayload(sysAuthPayloadSchema, payload, "Invalid sys.auth payload");
+}
+
+export function parseBearerSysAuthPayload(payload: unknown): {
+  provider: "bearer";
+  payload: string;
+} {
+  return parseProtocolPayload(
+    bearerSysAuthPayloadSchema,
+    payload,
+    "Invalid bearer auth payload"
+  );
 }
 
 export function parseSysAuthOkPayload(payload: unknown): SysAuthOkPayload {
@@ -217,4 +265,13 @@ export function normalizeWorkerResult(result: Response | HardessWorkerResult | v
   }
 
   return parsed.data as HardessWorkerResult;
+}
+
+export function parseWorkerModuleExport(value: unknown, entry = "worker"): HardessWorkerModule {
+  const result = workerModuleExportSchema.safeParse(value);
+  if (!result.success) {
+    throw new Error(`Invalid worker module ${entry}: ${formatZodError(result.error)}`);
+  }
+
+  return result.data;
 }

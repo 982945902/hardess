@@ -1,6 +1,6 @@
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import type { HardessWorkerModule } from "../../shared/types.ts";
+import { parseWorkerModuleExport, type HardessWorkerModule } from "../../shared/index.ts";
 
 interface CachedWorker {
   mtimeMs: number;
@@ -10,10 +10,6 @@ interface CachedWorker {
 
 const cache = new Map<string, CachedWorker>();
 let shadowCounter = 0;
-
-function isWorkerModule(value: unknown): value is HardessWorkerModule {
-  return Boolean(value && typeof value === "object" && "fetch" in value && typeof (value as { fetch: unknown }).fetch === "function");
-}
 
 export async function loadWorker(entry: string): Promise<HardessWorkerModule> {
   const absolutePath = resolve(entry);
@@ -32,11 +28,7 @@ export async function loadWorker(entry: string): Promise<HardessWorkerModule> {
     await writeFile(shadowCopyPath, source, "utf8");
     const moduleUrl = new URL(`file://${shadowCopyPath}`);
     const loaded = await import(moduleUrl.href);
-    const candidate = (loaded.default ?? loaded) as unknown;
-
-    if (!isWorkerModule(candidate)) {
-      throw new Error(`Worker module ${entry} does not export a fetch handler`);
-    }
+    const workerModule = parseWorkerModuleExport(loaded.default ?? loaded, entry);
 
     if (cached?.shadowCopyPath) {
       await rm(cached.shadowCopyPath, { force: true });
@@ -46,7 +38,7 @@ export async function loadWorker(entry: string): Promise<HardessWorkerModule> {
       nextCached.shadowCopyPath = shadowCopyPath;
     }
 
-    return candidate;
+    return workerModule;
   })();
 
   cache.set(entry, {

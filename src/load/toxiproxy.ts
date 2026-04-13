@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { envNumberFirst, envStringFirst } from "./shared.ts";
 
 interface ProxyDefinition {
@@ -7,6 +8,20 @@ interface ProxyDefinition {
   enabled?: boolean;
   toxics?: Array<{ name: string }>;
 }
+
+const toxiproxyCommandSchema = z.enum(["setup", "reset", "weak-client", "weak-upstream", "status"]);
+
+const proxyDefinitionSchema = z.object({
+  name: z.string().min(1, "proxy name is required"),
+  listen: z.string().min(1, "proxy listen address is required"),
+  upstream: z.string().min(1, "proxy upstream is required"),
+  enabled: z.boolean().optional(),
+  toxics: z.array(z.object({
+    name: z.string().min(1, "toxic name is required")
+  })).optional()
+});
+
+const proxyMapSchema = z.record(z.string(), proxyDefinitionSchema);
 
 const env = globalThis as {
   process?: {
@@ -58,7 +73,7 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
 
 async function listProxies(): Promise<Record<string, ProxyDefinition>> {
   const response = await request("/proxies");
-  return await response.json() as Record<string, ProxyDefinition>;
+  return parseToxiproxyProxyMap(await response.json());
 }
 
 async function populateProxies(): Promise<void> {
@@ -144,74 +159,96 @@ async function applyWeakUpstreamProfile(): Promise<void> {
 
 const command = env.process?.argv?.[2] ?? "status";
 
-switch (command) {
-  case "setup":
-    await populateProxies();
-    console.log(
-      JSON.stringify(
-        {
-          ok: true,
-          command,
-          proxies
-        },
-        null,
-        2
-      )
-    );
-    break;
-  case "reset":
-    await resetAll();
-    console.log(JSON.stringify({ ok: true, command }, null, 2));
-    break;
-  case "weak-client":
-    await resetAll();
-    await populateProxies();
-    await applyWeakClientProfile();
-    console.log(
-      JSON.stringify(
-        {
-          ok: true,
-          command,
-          latencyMs,
-          jitterMs,
-          bandwidthRateKbps
-        },
-        null,
-        2
-      )
-    );
-    break;
-  case "weak-upstream":
-    await resetAll();
-    await populateProxies();
-    await applyWeakUpstreamProfile();
-    console.log(
-      JSON.stringify(
-        {
-          ok: true,
-          command,
-          latencyMs,
-          jitterMs,
-          bandwidthRateKbps
-        },
-        null,
-        2
-      )
-    );
-    break;
-  case "status":
-    console.log(
-      JSON.stringify(
-        {
-          ok: true,
-          command,
-          proxies: await listProxies()
-        },
-        null,
-        2
-      )
-    );
-    break;
-  default:
-    throw new Error(`Unknown toxiproxy command: ${command}`);
+export function parseToxiproxyCommand(value: string): z.infer<typeof toxiproxyCommandSchema> {
+  const result = toxiproxyCommandSchema.safeParse(value);
+  if (!result.success) {
+    throw new Error(`Unknown toxiproxy command: ${value}`);
+  }
+
+  return result.data;
+}
+
+export function parseToxiproxyProxyMap(value: unknown): Record<string, ProxyDefinition> {
+  const result = proxyMapSchema.safeParse(value);
+  if (!result.success) {
+    throw new Error("Invalid Toxiproxy proxies response");
+  }
+
+  return result.data;
+}
+
+export async function runToxiproxyCommand(command: string): Promise<void> {
+  switch (parseToxiproxyCommand(command)) {
+    case "setup":
+      await populateProxies();
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            command,
+            proxies
+          },
+          null,
+          2
+        )
+      );
+      return;
+    case "reset":
+      await resetAll();
+      console.log(JSON.stringify({ ok: true, command }, null, 2));
+      return;
+    case "weak-client":
+      await resetAll();
+      await populateProxies();
+      await applyWeakClientProfile();
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            command,
+            latencyMs,
+            jitterMs,
+            bandwidthRateKbps
+          },
+          null,
+          2
+        )
+      );
+      return;
+    case "weak-upstream":
+      await resetAll();
+      await populateProxies();
+      await applyWeakUpstreamProfile();
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            command,
+            latencyMs,
+            jitterMs,
+            bandwidthRateKbps
+          },
+          null,
+          2
+        )
+      );
+      return;
+    case "status":
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            command,
+            proxies: await listProxies()
+          },
+          null,
+          2
+        )
+      );
+      return;
+  }
+}
+
+if (import.meta.main) {
+  await runToxiproxyCommand(command);
 }

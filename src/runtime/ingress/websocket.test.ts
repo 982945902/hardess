@@ -832,6 +832,7 @@ describe("createWebSocketHandlers", () => {
     registry.register(demoServerModule);
     const timeouts: Array<() => void> = [];
     let backpressured = true;
+    let outboundBizSendAttempts = 0;
 
     const handlers = createWebSocketHandlers({
       nodeId: "local",
@@ -859,6 +860,8 @@ describe("createWebSocketHandlers", () => {
           socket.sent.push(data);
           return data.length;
         }
+
+        outboundBizSendAttempts += 1;
 
         if (backpressured) {
           return -1;
@@ -912,12 +915,14 @@ describe("createWebSocketHandlers", () => {
 
     await Promise.resolve();
     expect(bob.sent.some((raw) => parseEnvelope(raw)?.msgId === "queued-1")).toBe(false);
+    expect(outboundBizSendAttempts).toBe(1);
 
     backpressured = false;
     timeouts.shift()?.();
     await Promise.resolve();
 
     expect(bob.sent.some((raw) => parseEnvelope(raw)?.msgId === "queued-1")).toBe(true);
+    expect(outboundBizSendAttempts).toBe(2);
     handlers.dispose();
   });
 

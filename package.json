@@ -19,12 +19,18 @@
     "load:http": "bun run src/load/http.ts",
     "load:ws": "bun run src/load/ws.ts",
     "load:cluster-ws": "bun run src/load/cluster-ws.ts",
+    "bench:ws": "bun run src/load/benchmark-ws.ts",
+    "bench:ws:local": "BENCH_WS_PROFILE=high BENCH_WS_SLO_PROFILE=local bun run src/load/benchmark-ws.ts",
+    "bench:ws:high": "BENCH_WS_PROFILE=high bun run src/load/benchmark-ws.ts",
     "bench:cluster": "bun run src/load/benchmark-cluster.ts",
+    "bench:cluster:local": "BENCH_CLUSTER_PROFILE=high BENCH_CLUSTER_SLO_PROFILE=local bun run src/load/benchmark-cluster.ts",
     "bench:cluster:high": "BENCH_CLUSTER_PROFILE=high bun run src/load/benchmark-cluster.ts",
+    "release:gate:local": "RELEASE_GATE_SLO_PROFILE=local bun run src/load/release-gate.ts",
     "release:gate:cluster:high": "CLUSTER_RELEASE_GATE_PROFILE=high bun run src/load/release-gate-cluster.ts",
     "load:toxiproxy": "bun run src/load/toxiproxy.ts",
     "release:gate": "bun run src/load/release-gate.ts",
-    "release:gate:cluster": "bun run src/load/release-gate-cluster.ts"
+    "release:gate:cluster": "bun run src/load/release-gate-cluster.ts",
+    "release:gate:cluster:local": "CLUSTER_RELEASE_GATE_SLO_PROFILE=local bun run src/load/release-gate-cluster.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.12",

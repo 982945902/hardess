@@ -271,12 +271,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       connection.outboundQueue.length === 0 &&
       !connection.drainScheduled &&
       connection.drainTimer === undefined;
+    let directSendBackpressured = false;
 
     if (canAttemptDirectSend) {
       const sent = trySendNow(connection, data);
       if (sent) {
         return;
       }
+      directSendBackpressured = true;
     }
 
     if (
@@ -294,6 +296,10 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
     connection.outboundQueue.push({ data, bytes });
     connection.outboundQueuedBytes += bytes;
+    if (directSendBackpressured) {
+      scheduleDrainRetry(connection);
+      return;
+    }
     if (connection.drainTimer !== undefined) {
       return;
     }

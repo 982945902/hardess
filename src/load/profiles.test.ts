@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyClusterBenchmarkProfile, applyClusterReleaseGateProfile } from "./profiles.ts";
+import { applyClusterBenchmarkProfile, applyClusterReleaseGateProfile, applyWsBenchmarkProfile } from "./profiles.ts";
 
 const PROFILE_ENV_KEYS = [
   "WS_RATE_LIMIT_MAX_MESSAGES",
   "WS_OUTBOUND_MAX_QUEUE_MESSAGES",
   "WS_OUTBOUND_MAX_QUEUE_BYTES",
+  "WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES",
   "CLUSTER_REQUEST_TIMEOUT_MS",
   "CLUSTER_LOCATOR_CACHE_TTL_MS",
+  "BENCH_WS_COMPLETION_TIMEOUT_MS",
   "BENCH_CLUSTER_COMPLETION_TIMEOUT_MS",
   "CLUSTER_RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS"
 ] as const;
@@ -32,6 +34,19 @@ afterEach(() => {
 });
 
 describe("load profiles", () => {
+  test("applies high single-node ws benchmark defaults", () => {
+    delete process.env.WS_RATE_LIMIT_MAX_MESSAGES;
+    delete process.env.WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES;
+    delete process.env.BENCH_WS_COMPLETION_TIMEOUT_MS;
+
+    const profileName = applyWsBenchmarkProfile("high");
+
+    expect(profileName).toBe("high");
+    expect(process.env.WS_RATE_LIMIT_MAX_MESSAGES ?? "").toBe("2200");
+    expect(process.env.WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES ?? "").toBe("1048576");
+    expect(process.env.BENCH_WS_COMPLETION_TIMEOUT_MS ?? "").toBe("180000");
+  });
+
   test("applies high benchmark defaults without overriding explicit env", () => {
     delete process.env.WS_RATE_LIMIT_MAX_MESSAGES;
     delete process.env.BENCH_CLUSTER_COMPLETION_TIMEOUT_MS;

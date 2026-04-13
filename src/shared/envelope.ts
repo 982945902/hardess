@@ -4,6 +4,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
 }
 
+// Hot path: keep envelope parsing here as a minimal hand-rolled guard instead of zod.
+// If this contract changes, keep it aligned with shared/schema.ts envelopeSchema and
+// preserve test coverage before broadening the checks.
 function parseEnvelopeValueFast(value: unknown): Envelope<unknown> | null {
   if (!isRecord(value)) {
     return null;

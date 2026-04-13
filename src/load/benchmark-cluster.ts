@@ -1,16 +1,7 @@
-import { envNumber, envString, summarizeSeries } from "./shared.ts";
+import { readClusterWsGateSloThresholds } from "./gate-slo.ts";
+import { envNumber, envString, parseErrorPayload, summarizeSeries } from "./shared.ts";
 import { runClusterReleaseGate } from "./release-gate-cluster.ts";
 import { applyClusterBenchmarkProfile } from "./profiles.ts";
-
-interface BenchmarkSloThresholds {
-  maxRecvAckP99Ms?: number;
-  maxHandleAckP99Ms?: number;
-  maxRouteCacheRetryCount?: number;
-  maxClusterHttpFallbackCount?: number;
-  maxClusterEgressOverflowCount?: number;
-  maxClusterEgressBackpressureCount?: number;
-  maxSysErrCount?: number;
-}
 
 interface BenchmarkSloViolation {
   metric: string;
@@ -67,32 +58,6 @@ function parseScenarioValues(raw: string): number[] {
     .filter((value) => Number.isFinite(value) && value > 0);
 }
 
-function parseErrorPayload(error: unknown): unknown {
-  const message = error instanceof Error ? error.message : String(error);
-  try {
-    return JSON.parse(message);
-  } catch {
-    return {
-      ok: false,
-      error: message
-    };
-  }
-}
-
-function envOptionalNumber(name: string): number | undefined {
-  const raw = envString(name, "").trim();
-  if (raw.length === 0) {
-    return undefined;
-  }
-
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return undefined;
-  }
-
-  return parsed;
-}
-
 function countValues(values: Record<string, number>): number {
   return Object.values(values).reduce((sum, value) => sum + value, 0);
 }
@@ -109,7 +74,7 @@ function formatSloViolations(violations: BenchmarkSloViolation[]): string {
 
 function evaluateSlo(
   summary: Awaited<ReturnType<typeof runClusterReleaseGate>>["clusterWsLoad"]["summary"],
-  thresholds: BenchmarkSloThresholds
+  thresholds: ReturnType<typeof readClusterWsGateSloThresholds>
 ): BenchmarkSloViolation[] {
   const violations: BenchmarkSloViolation[] = [];
 
@@ -125,12 +90,12 @@ function evaluateSlo(
   check("recvAckP99Ms", summary.recvAckLatencyMs.p99Ms, thresholds.maxRecvAckP99Ms);
   check("handleAckP99Ms", summary.handleAckLatencyMs.p99Ms, thresholds.maxHandleAckP99Ms);
   check("routeCacheRetryCount", summary.routeCacheRetryCount, thresholds.maxRouteCacheRetryCount);
-  check("clusterHttpFallbackCount", summary.clusterHttpFallbackCount, thresholds.maxClusterHttpFallbackCount);
-  check("clusterEgressOverflowCount", summary.clusterEgressOverflowCount, thresholds.maxClusterEgressOverflowCount);
+  check("clusterHttpFallbackCount", summary.clusterHttpFallbackCount, thresholds.maxHttpFallbackCount);
+  check("clusterEgressOverflowCount", summary.clusterEgressOverflowCount, thresholds.maxEgressOverflowCount);
   check(
     "clusterEgressBackpressureCount",
     summary.clusterEgressBackpressureCount,
-    thresholds.maxClusterEgressBackpressureCount
+    thresholds.maxEgressBackpressureCount
   );
   check("sysErrCount", countValues(summary.sysErrCodes), thresholds.maxSysErrCount);
 
@@ -139,6 +104,7 @@ function evaluateSlo(
 
 const senderCount = envNumber("BENCH_CLUSTER_SENDERS", 10);
 const benchmarkProfile = applyClusterBenchmarkProfile(envString("BENCH_CLUSTER_PROFILE", "default"));
+const benchmarkSloProfile = envString("BENCH_CLUSTER_SLO_PROFILE", "default");
 const receiverCount = envNumber("BENCH_CLUSTER_RECEIVERS", 10);
 const scenarioValues = parseScenarioValues(envString("BENCH_CLUSTER_SCENARIOS", "30,60,80,100"));
 const runsPerScenario = envNumber("BENCH_CLUSTER_RUNS", 3);
@@ -148,15 +114,7 @@ const upstreamPortBase = envNumber("BENCH_CLUSTER_UPSTREAM_PORT_BASE", 9400);
 const sendIntervalMs = envNumber("BENCH_CLUSTER_SEND_INTERVAL_MS", 0);
 const wsRateLimitWindowMs = envNumber("WS_RATE_LIMIT_WINDOW_MS", 1_000);
 const wsRateLimitMaxMessages = envNumber("WS_RATE_LIMIT_MAX_MESSAGES", 100);
-const sloThresholds: BenchmarkSloThresholds = {
-  maxRecvAckP99Ms: envOptionalNumber("BENCH_CLUSTER_MAX_RECV_ACK_P99_MS"),
-  maxHandleAckP99Ms: envOptionalNumber("BENCH_CLUSTER_MAX_HANDLE_ACK_P99_MS"),
-  maxRouteCacheRetryCount: envOptionalNumber("BENCH_CLUSTER_MAX_ROUTE_CACHE_RETRY_COUNT"),
-  maxClusterHttpFallbackCount: envOptionalNumber("BENCH_CLUSTER_MAX_HTTP_FALLBACK_COUNT"),
-  maxClusterEgressOverflowCount: envOptionalNumber("BENCH_CLUSTER_MAX_EGRESS_OVERFLOW_COUNT"),
-  maxClusterEgressBackpressureCount: envOptionalNumber("BENCH_CLUSTER_MAX_EGRESS_BACKPRESSURE_COUNT"),
-  maxSysErrCount: envOptionalNumber("BENCH_CLUSTER_MAX_SYS_ERR_COUNT")
-};
+const sloThresholds = readClusterWsGateSloThresholds("BENCH_CLUSTER", benchmarkSloProfile);
 
 const results: BenchmarkScenarioResult[] = [];
 let firstUnstableScenario: number | undefined;
@@ -296,20 +254,21 @@ console.log(
         sendIntervalMs,
         completionTimeoutMs,
         scenarioValues,
-        benchmarkProfile,
-        websocketPolicy: {
-          rateLimitWindowMs: wsRateLimitWindowMs,
-          rateLimitMaxMessages: wsRateLimitMaxMessages
-        },
-        sloThresholds: {
-          maxRecvAckP99Ms: sloThresholds.maxRecvAckP99Ms ?? null,
-          maxHandleAckP99Ms: sloThresholds.maxHandleAckP99Ms ?? null,
-          maxRouteCacheRetryCount: sloThresholds.maxRouteCacheRetryCount ?? null,
-          maxClusterHttpFallbackCount: sloThresholds.maxClusterHttpFallbackCount ?? null,
-          maxClusterEgressOverflowCount: sloThresholds.maxClusterEgressOverflowCount ?? null,
-          maxClusterEgressBackpressureCount: sloThresholds.maxClusterEgressBackpressureCount ?? null,
-          maxSysErrCount: sloThresholds.maxSysErrCount ?? null
-        }
+          benchmarkProfile,
+          benchmarkSloProfile,
+          websocketPolicy: {
+            rateLimitWindowMs: wsRateLimitWindowMs,
+            rateLimitMaxMessages: wsRateLimitMaxMessages
+          },
+          sloThresholds: {
+            maxRecvAckP99Ms: sloThresholds.maxRecvAckP99Ms ?? null,
+            maxHandleAckP99Ms: sloThresholds.maxHandleAckP99Ms ?? null,
+            maxRouteCacheRetryCount: sloThresholds.maxRouteCacheRetryCount ?? null,
+            maxClusterHttpFallbackCount: sloThresholds.maxHttpFallbackCount ?? null,
+            maxClusterEgressOverflowCount: sloThresholds.maxEgressOverflowCount ?? null,
+            maxClusterEgressBackpressureCount: sloThresholds.maxEgressBackpressureCount ?? null,
+            maxSysErrCount: sloThresholds.maxSysErrCount ?? null
+          }
       },
       summary: {
         stablePrefixUpToMessagesPerSender: (() => {

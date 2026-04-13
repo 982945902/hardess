@@ -1,7 +1,7 @@
 import {
   ERROR_CODES,
   HardessError,
-  parseSysAuthPayload,
+  parseBearerSysAuthPayload,
   type AuthContext
 } from "../../shared/index.ts";
 
@@ -31,11 +31,7 @@ export class DemoBearerAuthProvider implements AuthProvider {
   }
 
   async validateSystemAuth(payload: unknown): Promise<AuthContext> {
-    const authPayload = parseSysAuthPayload(payload);
-    if (typeof authPayload.payload !== "string") {
-      throw new HardessError(ERROR_CODES.AUTH_INVALID_TOKEN, "Invalid bearer auth payload");
-    }
-
+    const authPayload = parseBearerSysAuthPayload(payload);
     return this.validateBearerToken(authPayload.payload);
   }
 }

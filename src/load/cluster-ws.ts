@@ -1,5 +1,13 @@
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../shared/envelope.ts";
 import {
+  parseSysAuthOkPayload,
+  parseSysErrPayload,
+  parseSysHandleAckEventPayload,
+  parseSysPingPayload,
+  parseSysRecvAckPayload,
+  parseSysRoutePayload
+} from "../shared/index.ts";
+import {
   diffMetricsSnapshot,
   envNumberFirst,
   envStringFirst,
@@ -209,6 +217,19 @@ export async function runClusterWsLoadTest(
       }, config.connectTimeoutMs);
       let authenticated = false;
 
+      function failSystemMessage(error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!authenticated) {
+          clearTimeout(timeout);
+          reject(new Error(`Invalid system message before auth for ${peerId}: ${message}`));
+          socket.close();
+          return;
+        }
+
+        incCounter(sysErrCodes, "INVALID_SYSTEM_MESSAGE");
+        socket.close();
+      }
+
       socket.addEventListener("open", () => {
         socket.send(
           serializeEnvelope(
@@ -234,55 +255,59 @@ export async function runClusterWsLoadTest(
         }
 
         if (envelope.kind === "system") {
-          switch (envelope.action) {
-            case "auth.ok":
-              if (!authenticated) {
-                authenticated = true;
-                authenticatedPeers += 1;
-                clearTimeout(timeout);
-                resolve({ role, peerId, socket });
-              }
-              return;
-            case "ping":
-              sendSystemEnvelope(socket, "pong", envelope.payload, envelope.traceId);
-              return;
-            case "recvAck": {
-              const ackFor = (envelope.payload as { ackFor?: string } | undefined)?.ackFor;
-              rawRecvAckCount += 1;
-              if (!ackFor) {
+          try {
+            switch (envelope.action) {
+              case "auth.ok":
+                parseSysAuthOkPayload(envelope.payload);
+                if (!authenticated) {
+                  authenticated = true;
+                  authenticatedPeers += 1;
+                  clearTimeout(timeout);
+                  resolve({ role, peerId, socket });
+                }
+                return;
+              case "ping":
+                sendSystemEnvelope(socket, "pong", parseSysPingPayload(envelope.payload), envelope.traceId);
+                return;
+              case "recvAck": {
+                const payload = parseSysRecvAckPayload(envelope.payload);
+                rawRecvAckCount += 1;
+
+                if (recvAckedMsgIds.has(payload.ackFor)) {
+                  return;
+                }
+
+                recvAckedMsgIds.add(payload.ackFor);
+                const pending = pendingByMsgId.get(payload.ackFor);
+                if (pending) {
+                  recvAckLatenciesMs.push(performance.now() - pending.sentAt);
+                }
                 return;
               }
-
-              if (recvAckedMsgIds.has(ackFor)) {
+              case "handleAck": {
+                const payload = parseSysHandleAckEventPayload(envelope.payload);
+                const pending = pendingByMsgId.get(payload.ackFor);
+                if (pending) {
+                  handleAckLatenciesMs.push(performance.now() - pending.sentAt);
+                  pendingByMsgId.delete(payload.ackFor);
+                }
                 return;
               }
-
-              recvAckedMsgIds.add(ackFor);
-              const pending = ackFor ? pendingByMsgId.get(ackFor) : undefined;
-              if (pending) {
-                recvAckLatenciesMs.push(performance.now() - pending.sentAt);
+              case "route":
+                parseSysRoutePayload(envelope.payload);
+                routeCount += 1;
+                return;
+              case "err": {
+                const payload = parseSysErrPayload(envelope.payload);
+                incCounter(sysErrCodes, payload.code);
+                return;
               }
-              return;
+              default:
+                return;
             }
-            case "handleAck": {
-              const ackFor = (envelope.payload as { ackFor?: string } | undefined)?.ackFor;
-              const pending = ackFor ? pendingByMsgId.get(ackFor) : undefined;
-              if (ackFor && pending) {
-                handleAckLatenciesMs.push(performance.now() - pending.sentAt);
-                pendingByMsgId.delete(ackFor);
-              }
-              return;
-            }
-            case "route":
-              routeCount += 1;
-              return;
-            case "err": {
-              const code = (envelope.payload as { code?: string } | undefined)?.code ?? "UNKNOWN";
-              incCounter(sysErrCodes, code);
-              return;
-            }
-            default:
-              return;
+          } catch (error) {
+            failSystemMessage(error);
+            return;
           }
         }
 

@@ -1,5 +1,5 @@
 import { createRuntimeApp } from "./app.ts";
-import type { ClusterPeerNode, ClusterTransport } from "./cluster/network.ts";
+import { parseClusterPeersEnv, parseClusterTransportEnv } from "./cluster/schema.ts";
 import { MetricsAlertMonitor, type MetricsAlertThresholds } from "./observability/alerts.ts";
 import { ConsoleLogger } from "./observability/logger.ts";
 import { InMemoryMetrics, WindowedMetrics, type MetricsSnapshotProvider } from "./observability/metrics.ts";
@@ -42,45 +42,12 @@ function envString(name: string): string | undefined {
   return processEnv[name];
 }
 
-function parseClusterPeers(): ClusterPeerNode[] {
-  const raw = envString("CLUSTER_PEERS_JSON");
-  if (!raw) {
-    return [];
-  }
-
-  const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed)) {
-    throw new Error("CLUSTER_PEERS_JSON must be a JSON array");
-  }
-
-  return parsed.map((entry, index) => {
-    if (
-      !entry ||
-      typeof entry !== "object" ||
-      typeof (entry as { nodeId?: unknown }).nodeId !== "string" ||
-      typeof (entry as { baseUrl?: unknown }).baseUrl !== "string"
-    ) {
-      throw new Error(`Invalid cluster peer at index ${index}`);
-    }
-
-    return {
-      nodeId: (entry as { nodeId: string }).nodeId,
-      baseUrl: (entry as { baseUrl: string }).baseUrl
-    };
-  });
+function parseClusterPeers() {
+  return parseClusterPeersEnv(envString("CLUSTER_PEERS_JSON"));
 }
 
-function parseClusterTransport(): ClusterTransport {
-  const value = envString("CLUSTER_TRANSPORT");
-  if (!value) {
-    return "ws";
-  }
-
-  if (value === "http" || value === "ws") {
-    return value;
-  }
-
-  throw new Error(`Invalid CLUSTER_TRANSPORT: ${value}`);
+function parseClusterTransport() {
+  return parseClusterTransportEnv(envString("CLUSTER_TRANSPORT"));
 }
 
 function sleep(ms: number): Promise<void> {

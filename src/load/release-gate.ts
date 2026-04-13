@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { envNumber, envString } from "./shared.ts";
+import { envNumber, envString, parseErrorPayload } from "./shared.ts";
 import { evaluateHttpGateSlo, evaluateWsGateSlo, readHttpGateSloThresholds, readWsGateSloThresholds } from "./gate-slo.ts";
 import { runHttpLoadTest } from "./http.ts";
 import { runWsLoadTest } from "./ws.ts";
@@ -20,6 +20,10 @@ function sleep(ms: number): Promise<void> {
 
 function tail(lines: string[], count = 20): string[] {
   return lines.slice(-count);
+}
+
+function counterValue(counters: Record<string, number> | undefined, name: string): number {
+  return counters?.[name] ?? 0;
 }
 
 function spawnManagedProcess(
@@ -148,8 +152,9 @@ async function runHttpSmoke(baseUrl: string): Promise<{ status: number; body: un
 const runtimePort = envNumber("RELEASE_GATE_PORT", 3100);
 const upstreamPort = envNumber("RELEASE_GATE_UPSTREAM_PORT", 9100);
 const readyTimeoutMs = envNumber("RELEASE_GATE_READY_TIMEOUT_MS", 10_000);
-const httpGateSloThresholds = readHttpGateSloThresholds();
-const wsGateSloThresholds = readWsGateSloThresholds("RELEASE_GATE_WS");
+const releaseGateSloProfile = envString("RELEASE_GATE_SLO_PROFILE", "default");
+const httpGateSloThresholds = readHttpGateSloThresholds("RELEASE_GATE_HTTP", releaseGateSloProfile);
+const wsGateSloThresholds = readWsGateSloThresholds("RELEASE_GATE_WS", releaseGateSloProfile);
 
 const tempDir = await mkdtemp(join(tmpdir(), "hardess-release-gate-"));
 let upstream: ManagedProcess | undefined;
@@ -239,7 +244,14 @@ try {
       `WS load did not fully ack all messages: pending=${wsLoad.summary.pendingMessages} handleAck=${wsLoad.summary.handleAckCount} expected=${wsLoad.summary.messagesSent}`
     );
   }
-  const wsGateSlo = evaluateWsGateSlo(wsLoad.summary, wsGateSloThresholds);
+  const wsGateSlo = evaluateWsGateSlo(
+    {
+      ...wsLoad.summary,
+      egressOverflowCount: counterValue(wsLoad.metricsDelta?.counters, "ws.egress_overflow"),
+      egressBackpressureCount: counterValue(wsLoad.metricsDelta?.counters, "ws.egress_backpressure")
+    },
+    wsGateSloThresholds
+  );
   if (!wsGateSlo.passed) {
     throw new Error(`WS load exceeded SLO thresholds: ${JSON.stringify(wsGateSlo.violations)}`);
   }
@@ -258,10 +270,12 @@ try {
     wsLoad,
     slo: {
       http: {
+        profile: releaseGateSloProfile,
         thresholds: httpGateSloThresholds,
         ...httpGateSlo
       },
       ws: {
+        profile: releaseGateSloProfile,
         thresholds: wsGateSloThresholds,
         ...wsGateSlo
       }
@@ -277,7 +291,7 @@ try {
     JSON.stringify(
       {
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: parseErrorPayload(error),
         upstream: upstream
           ? {
               stdoutTail: tail(upstream.stdout),

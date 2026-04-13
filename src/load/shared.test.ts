@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { envNumberFirst, envOptionalStringFirst, envStringFirst } from "./shared.ts";
+import {
+  envNumberFirst,
+  envOptionalStringFirst,
+  envStringFirst,
+  parseAdminMetricsResponse,
+  parseErrorPayload,
+  parseJsonText
+} from "./shared.ts";
 
 const SHARED_ENV_KEYS = ["LOAD_TEST_PRIMARY", "LOAD_TEST_SECONDARY", "LOAD_TEST_NUMBER"] as const;
 
@@ -43,5 +50,42 @@ describe("load env helpers", () => {
     delete process.env.LOAD_TEST_SECONDARY;
 
     expect(envOptionalStringFirst(["LOAD_TEST_PRIMARY", "LOAD_TEST_SECONDARY"])).toBeUndefined();
+  });
+
+  test("parseAdminMetricsResponse accepts only the metrics snapshot envelope", () => {
+    expect(
+      parseAdminMetricsResponse({
+        metrics: {
+          counters: {
+            "ws.egress_backpressure": 1
+          },
+          timings: {
+            http: [1, 2, 3]
+          }
+        }
+      })
+    ).toEqual({
+      counters: {
+        "ws.egress_backpressure": 1
+      },
+      timings: {
+        http: [1, 2, 3]
+      }
+    });
+
+    expect(parseAdminMetricsResponse({ metrics: { counters: { invalid: "x" } } })).toBeNull();
+  });
+
+  test("parseJsonText and parseErrorPayload keep structured error output when available", () => {
+    expect(parseJsonText('{"ok":false,"error":"boom"}')).toEqual({
+      ok: false,
+      error: "boom"
+    });
+    expect(parseJsonText("not-json")).toBeUndefined();
+    expect(parseErrorPayload(new Error('{"ok":false,"error":"boom"}'))).toEqual({
+      ok: false,
+      error: "boom"
+    });
+    expect(parseErrorPayload(new Error("plain boom"))).toBe("plain boom");
   });
 });

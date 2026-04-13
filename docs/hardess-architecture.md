@@ -59,9 +59,9 @@ Implemented in repository:
 7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
 8. Runtime metrics now include bounded snapshot support for server mode, HTTP/worker/proxy/WebSocket-side counters and timings, cluster-transport counters for internal WS channels, threshold-based structured alert logging over configurable windows, and Prometheus text export for external scraping.
 9. Runtime admin endpoints now exist for `__admin/health`, `__admin/ready`, `__admin/metrics`, `__admin/metrics/prometheus`, and `__admin/cluster/peers`, and the Bun server path supports graceful shutdown signaling with an explicit drain window before stop/dispose.
-10. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional SLO thresholds, optional Toxiproxy weak-network simulation, a repo-level workflow entrypoint, a tuned cluster high-load benchmark profile with optional SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
+10. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional or profile-driven SLO thresholds, optional Toxiproxy weak-network simulation, repo-level workflow entrypoints, tuned single-node plus cluster high-load benchmark profiles with optional or profile-driven SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
 11. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
-12. A shared runtime-schema baseline is now implemented with `zod` for config validation, shared envelope validation, key system payloads, business protocol payloads, and worker result validation.
+12. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/internal HTTP/admin response validation, business protocol payloads, and worker result validation.
 13. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
 14. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
 15. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
@@ -87,7 +87,7 @@ Partially completed:
 3. WebSocket backpressure and egress governance are partially implemented: Bun send-status handling, bounded queueing, socket buffered-amount limits, retry-on-backpressure, and overflow close behavior now exist, but deeper transport-specific flow-control tuning may still be needed under heavier production traffic.
 4. Runtime operational polish is partially implemented: config/worker reload, health/readiness, graceful shutdown with drain window, startup-failure handling, repo-level workflow docs, an operator guide, automated local release-gate execution, SLO-aware release-gate checks, and SLO-aware cluster benchmarking are in place, but broader deployment integration is still environment-specific.
 5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, internal WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
-6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, but not every SDK/runtime extension surface has been migrated yet.
+6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, including cluster env and internal HTTP/admin response parsing plus the worker-module export boundary, but a small tail still remains in the hot-path envelope fast parser and a few runtime helper guards.
 7. ACL / capability enforcement is partially implemented: the `authorize` hook exists and the built-in `demo.send` / `chat.send` path now requires `notify.conn`, but a broader default capability policy for future injected protocols is still open.
 8. Some SDK ergonomics remain intentionally thin above the current sender-side delivery baseline: `emit`, `emitTracked`, `waitForResult`, and `send` now cover the common cases, but request/reply-style business abstractions are still protocol-level decisions rather than a fixed core contract.
 
@@ -99,14 +99,14 @@ Not started or intentionally deferred:
 5. Control plane route/worker version management UI is out of MVP scope and not started.
 
 TODO / still open:
-1. High priority: finish the baseline ACL / capability story for injected protocol actions. The hook exists and built-in direct-notify-style actions now enforce `notify.conn`, but the default policy shape for future injected protocols still needs to be made explicit and consistently covered in tests/docs.
-2. High priority: extend the shared runtime-schema layer to the remaining extension surfaces where ad hoc validation still exists, especially future control-plane inputs and any remaining protocol-extension boundaries outside the now-shared sender-side delivery path.
-3. High priority: continue tuning WebSocket egress and backpressure controls under broader traffic mixes. The baseline safeguards exist, but the thresholds still need production-like calibration.
-4. Medium priority: define and calibrate cluster latency / degradation SLOs per deployment tier. The benchmark runner can enforce operator-provided thresholds now, but the acceptable envelope is still workload-specific.
-5. Medium priority: finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline.
-6. Medium priority: improve deployment automation and runtime operational polish beyond the current local release-gate and graceful-shutdown baseline.
-7. Lower priority: decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
-8. Deferred by dependency: external `AuthProvider` integration should follow the external auth-service contract rather than lead MVP scope.
+1. High priority: extend the shared runtime-schema layer across the remaining small tail of ad hoc validation, especially future control-plane inputs plus the few remaining runtime helper guards outside the intentionally hand-rolled hot-path envelope parser.
+2. High priority: continue tuning WebSocket egress and backpressure controls under broader traffic mixes. The baseline safeguards exist, and the repo now has a repeatable single-node stair-step benchmark for that work, but the thresholds still need production-like calibration.
+3. Medium priority: define and calibrate cluster latency / degradation SLOs per deployment tier. The benchmark runner and release gates now support layered built-in `local` / `high` envelopes plus explicit overrides, but the acceptable envelope is still workload-specific.
+4. Medium priority: finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline.
+5. Medium priority: improve deployment automation and runtime operational polish beyond the current local release-gate and graceful-shutdown baseline.
+6. Lower priority: decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
+7. Deferred by dependency: external `AuthProvider` integration should follow the external auth-service contract rather than lead MVP scope.
+8. Deferred pending upstream standard: finish the default ACL / capability policy for injected protocol actions. The hook exists and built-in direct-notify-style actions now enforce `notify.conn`, but the broader policy should wait for the upstream integration contract rather than churn locally.
 
 Single-node release checklist:
 
@@ -124,10 +124,10 @@ Recommended before first release:
 4. Review worker trust and change-management boundaries so only expected worker modules can be published and activated in the single-node deployment.
 
 Current implementation priority after deferring external auth integration:
-1. Finish the built-in ACL / capability baseline for direct-notify-style protocol actions.
-2. Continue migrating mixed validation paths onto the shared runtime-schema layer.
-3. Validate and tune WebSocket egress / backpressure thresholds under broader traffic mixes.
-4. Keep observability and release-gate wiring production-usable per environment.
+1. Continue migrating mixed validation paths onto the shared runtime-schema layer.
+2. Validate and tune WebSocket egress / backpressure thresholds under broader traffic mixes.
+3. Keep observability and release-gate wiring production-usable per environment.
+4. Keep the default ACL / capability policy for injected protocols deferred until the upstream integration contract is stable.
 
 Can defer for single-node release:
 1. Dynamic cluster membership, stronger distributed routing state, and other scale-out architecture work beyond the current static cluster baseline.
@@ -503,10 +503,10 @@ Minimum WebSocket close code mapping:
 Validation strategy notes:
 1. The current codebase now has a shared runtime-schema baseline, but production-facing config and protocol boundaries should continue converging on that layer rather than reintroducing repeated ad hoc `if` checks.
 2. The highest-value schema boundaries are:
-   - gateway config module shape
+   - gateway config module export plus config shape
    - shared envelope shape plus system payloads such as `sys.auth`, `ping`, `pong`, and `handleAck`
    - business protocol payloads at registry/module boundaries
-   - worker return contract for short-circuit `response` vs rewritten `request`
+   - worker module export plus worker return contract for short-circuit `response` vs rewritten `request`
 3. Those boundaries are now implemented with a shared schema helper and should remain the default pattern for new runtime entry points.
 4. Validation should fail closed and map into existing `HardessError` codes rather than introducing transport-specific error models.
 

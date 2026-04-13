@@ -78,4 +78,23 @@ describe("loadWorker", () => {
 
     expect(secondResult instanceof Response ? await secondResult.text() : null).toBe("v2");
   });
+
+  it("rejects worker modules that do not export fetch(request, env, ctx)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-worker-invalid-module-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "invalid-worker.ts");
+    await writeFile(
+      workerPath,
+      `export default {
+        handle() {
+          return new Response("nope");
+        }
+      };`
+    );
+
+    await expect(loadWorker(workerPath)).rejects.toThrow(
+      "worker module must export fetch(request, env, ctx)"
+    );
+  });
 });

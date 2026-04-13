@@ -1,7 +1,7 @@
 import { watch, type FSWatcher } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { parseHardessConfig, type HardessConfig } from "../../shared/index.ts";
+import { parseConfigModuleExport, type HardessConfig } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
 
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
@@ -83,14 +83,16 @@ export class ModuleConfigStore implements ConfigStore {
     await writeFile(shadowCopyPath, source, "utf8");
     const moduleUrl = new URL(`file://${shadowCopyPath}`);
     const loaded = await import(moduleUrl.href);
-    const candidate = (loaded[this.exportName] ?? loaded.default) as unknown;
 
     if (this.shadowCopyPath) {
       await rm(this.shadowCopyPath, { force: true });
     }
     this.shadowCopyPath = shadowCopyPath;
 
-    const config = parseHardessConfig(candidate);
+    const config = parseConfigModuleExport(loaded, {
+      exportName: this.exportName,
+      modulePath: this.modulePath
+    });
     this.currentConfig = config;
     this.logger?.info("config reloaded", {
       modulePath: this.modulePath,

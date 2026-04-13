@@ -32,12 +32,18 @@ Run load tests:
 bun run load:http
 bun run load:ws
 bun run load:cluster-ws
+bun run bench:ws
+bun run bench:ws:local
+bun run bench:ws:high
 bun run bench:cluster
+bun run bench:cluster:local
 bun run bench:cluster:high
+bun run release:gate:local
 bun run release:gate:cluster:high
 bun run load:toxiproxy setup
 bun run release:gate
 bun run release:gate:cluster
+bun run release:gate:cluster:local
 ```
 
 Clean runtime-generated shadow files:
@@ -50,6 +56,7 @@ bun run clean
 
 - [Local demo walkthrough](docs/local-demo.md)
 - [Load testing and weak-network simulation](docs/load-testing.md)
+- [Current local release baseline](docs/local-release-baseline.md)
 - [Operator guide](docs/operator-guide.md)
 - [Grafana dashboard template](docs/grafana-hardess-overview.dashboard.json)
 - [Architecture design and current status](docs/hardess-architecture.md)
@@ -57,8 +64,8 @@ bun run clean
 ## Still Not Done
 
 - production auth provider integration still replaces only the demo auth path
-- the built-in ACL / capability baseline for protocol actions still needs to be finished beyond the current extension hooks
-- the shared runtime-schema layer still needs to absorb the remaining ad hoc validation at extension/control-plane boundaries
+- the shared runtime-schema layer still has a small tail of ad hoc validation, mostly around the hot-path envelope fast parser and a few runtime helper guards
 - websocket egress and backpressure thresholds still need broader workload validation and tuning
 - external observability stack rollout is still deployment-specific; the repo now ships Prometheus export, a sample Grafana dashboard, bounded metrics, and threshold-based log alerts
 - dynamic membership, stronger cluster coordination, and non-static multi-node routing remain deferred
+- the default ACL / capability policy for injected protocols is intentionally deferred until the upstream integration contract is stable

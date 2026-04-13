@@ -310,6 +310,42 @@ describe("StaticClusterNetwork", () => {
     serverNetwork.dispose();
   });
 
+  it("rejects invalid websocket cluster messages through the shared schema path", async () => {
+    const metrics = new InMemoryMetrics();
+    const network = new StaticClusterNetwork([], {
+      nodeId: "node-a",
+      metrics
+    });
+    const socket = new FakeClusterSocket();
+    let closeInfo: { code?: number; reason?: string } | undefined;
+    socket.addEventListener("close", (event: { code?: number; reason?: string }) => {
+      closeInfo = event;
+    });
+
+    network.openServerSocket(socket);
+    await network.messageServerSocket(
+      socket,
+      JSON.stringify({
+        type: "deliver",
+        ref: "bad-1",
+        sender: { nodeId: "node-b", connId: "conn-bob", peerId: "bob" },
+        envelope: {
+          msgId: "missing-fields-only"
+        },
+        ack: "recv",
+        targets: [{ nodeId: "node-a", connId: "conn-alice", peerId: "alice" }]
+      })
+    );
+
+    expect(closeInfo).toEqual({
+      code: 4400,
+      reason: "invalid cluster message"
+    });
+    expect(metrics.snapshot().counters["cluster.invalid_message"]).toBe(1);
+
+    network.dispose();
+  });
+
   it("warms websocket cluster channels ahead of traffic", async () => {
     const openedUrls: string[] = [];
     const serverNetwork = new StaticClusterNetwork([], {

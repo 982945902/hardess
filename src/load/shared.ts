@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 export interface LatencySummary {
   count: number;
   minMs: number;
@@ -20,6 +22,15 @@ export interface MetricsSnapshot {
   counters?: Record<string, number>;
   timings?: Record<string, number[]>;
 }
+
+const metricsSnapshotSchema = z.object({
+  counters: z.record(z.string(), z.number()).optional(),
+  timings: z.record(z.string(), z.array(z.number())).optional()
+});
+
+const adminMetricsResponseSchema = z.object({
+  metrics: metricsSnapshotSchema.nullish()
+});
 
 const env = globalThis as {
   process?: {
@@ -145,11 +156,32 @@ export async function fetchAdminMetrics(baseUrl: string): Promise<MetricsSnapsho
       return null;
     }
 
-    const payload = await response.json() as { metrics?: MetricsSnapshot };
-    return payload.metrics ?? null;
+    return parseAdminMetricsResponse(await response.json());
   } catch {
     return null;
   }
+}
+
+export function parseAdminMetricsResponse(value: unknown): MetricsSnapshot | null {
+  const result = adminMetricsResponseSchema.safeParse(value);
+  if (!result.success) {
+    return null;
+  }
+
+  return result.data.metrics ?? null;
+}
+
+export function parseJsonText(value: string): unknown | undefined {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseErrorPayload(error: unknown): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  return parseJsonText(message) ?? message;
 }
 
 export function diffMetricsSnapshot(

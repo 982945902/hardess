@@ -1,7 +1,14 @@
 import type { AckMode, ConnRef, Envelope } from "../../shared/types.ts";
-import { parseEnvelopeValue } from "../../shared/schema.ts";
+import {
+  parseClusterDeliverResponse,
+  parseClusterLocateResponse,
+  parseClusterSocketMessage,
+  type ClusterSocketMessage
+} from "./schema.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
+
+type ClusterMessage = ClusterSocketMessage;
 
 export interface ClusterPeerNode {
   nodeId: string;
@@ -75,169 +82,8 @@ export interface ClusterNetworkOptions {
   logger?: Logger;
 }
 
-type ClusterMessage =
-  | {
-      type: "hello";
-      nodeId: string;
-      secret?: string;
-    }
-  | {
-      type: "helloAck";
-      nodeId: string;
-    }
-  | {
-      type: "ping";
-      ts: number;
-    }
-  | {
-      type: "pong";
-      ts: number;
-    }
-  | {
-      type: "deliver";
-      ref: string;
-      sender: ConnRef;
-      envelope: Envelope<unknown>;
-      ack: AckMode;
-      targets: ConnRef[];
-    }
-  | {
-      type: "deliverResult";
-      ref: string;
-      deliveredConns: ConnRef[];
-      error?: string;
-    }
-  | {
-      type: "handleAck";
-      ref: string;
-      sender: ConnRef;
-      ackFor: string;
-      traceId?: string;
-    }
-  | {
-      type: "handleAckResult";
-      ref: string;
-      ok: boolean;
-      error?: string;
-    };
-
-function isConnRef(value: unknown): value is ConnRef {
-  return Boolean(
-    value &&
-    typeof value === "object" &&
-    typeof (value as { nodeId?: unknown }).nodeId === "string" &&
-    typeof (value as { connId?: unknown }).connId === "string" &&
-    typeof (value as { peerId?: unknown }).peerId === "string"
-  );
-}
-
-function isAckMode(value: unknown): value is AckMode {
-  return value === "none" || value === "recv" || value === "handle";
-}
-
 function parseClusterMessage(raw: unknown): ClusterMessage | null {
-  if (typeof raw !== "string") {
-    return null;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-
-  if (!parsed || typeof parsed !== "object") {
-    return null;
-  }
-
-  const message = parsed as Record<string, unknown>;
-  switch (message.type) {
-    case "hello":
-      return typeof message.nodeId === "string"
-        ? {
-            type: "hello",
-            nodeId: message.nodeId,
-            secret: typeof message.secret === "string" ? message.secret : undefined
-          }
-        : null;
-    case "helloAck":
-      return typeof message.nodeId === "string"
-        ? {
-            type: "helloAck",
-            nodeId: message.nodeId
-          }
-        : null;
-    case "ping":
-      return typeof message.ts === "number"
-        ? {
-            type: "ping",
-            ts: message.ts
-          }
-        : null;
-    case "pong":
-      return typeof message.ts === "number"
-        ? {
-            type: "pong",
-            ts: message.ts
-          }
-        : null;
-    case "deliver":
-      if (
-        typeof message.ref === "string" &&
-        isConnRef(message.sender) &&
-        parseEnvelopeValue(message.envelope) &&
-        isAckMode(message.ack) &&
-        Array.isArray(message.targets) &&
-        message.targets.every(isConnRef)
-      ) {
-        return {
-          type: "deliver",
-          ref: message.ref,
-          sender: message.sender,
-          envelope: parseEnvelopeValue(message.envelope) as Envelope<unknown>,
-          ack: message.ack,
-          targets: message.targets
-        };
-      }
-      return null;
-    case "deliverResult":
-      if (
-        typeof message.ref === "string" &&
-        Array.isArray(message.deliveredConns) &&
-        message.deliveredConns.every(isConnRef)
-      ) {
-        return {
-          type: "deliverResult",
-          ref: message.ref,
-          deliveredConns: message.deliveredConns,
-          error: typeof message.error === "string" ? message.error : undefined
-        };
-      }
-      return null;
-    case "handleAck":
-      if (typeof message.ref === "string" && isConnRef(message.sender) && typeof message.ackFor === "string") {
-        return {
-          type: "handleAck",
-          ref: message.ref,
-          sender: message.sender,
-          ackFor: message.ackFor,
-          traceId: typeof message.traceId === "string" ? message.traceId : undefined
-        };
-      }
-      return null;
-    case "handleAckResult":
-      return typeof message.ref === "string" && typeof message.ok === "boolean"
-        ? {
-            type: "handleAckResult",
-            ref: message.ref,
-            ok: message.ok,
-            error: typeof message.error === "string" ? message.error : undefined
-          }
-        : null;
-    default:
-      return null;
-  }
+  return parseClusterSocketMessage(raw);
 }
 
 function toClusterWsUrl(baseUrl: string): string {
@@ -323,12 +169,10 @@ export class StaticClusterNetwork {
             method: "POST",
             body: JSON.stringify({ peerIds })
           });
-          const payload = await response.json() as {
-            peers?: Record<string, ConnRef[]>;
-          };
+          const payload = parseClusterLocateResponse(await response.json());
           for (const peerId of peerIds) {
             const current = merged.get(peerId) ?? [];
-            const next = payload.peers?.[peerId] ?? [];
+            const next = payload.peers[peerId] ?? [];
             merged.set(peerId, [...current, ...next]);
           }
         } catch {
@@ -355,10 +199,7 @@ export class StaticClusterNetwork {
         method: "POST",
         body: JSON.stringify(payload)
       });
-      const body = await response.json() as {
-        deliveredConns?: ConnRef[];
-      };
-      return body.deliveredConns ?? [];
+      return parseClusterDeliverResponse(await response.json()).deliveredConns;
     }
 
     try {
@@ -381,10 +222,7 @@ export class StaticClusterNetwork {
         method: "POST",
         body: JSON.stringify(payload)
       });
-      const body = await response.json() as {
-        deliveredConns?: ConnRef[];
-      };
-      return body.deliveredConns ?? [];
+      return parseClusterDeliverResponse(await response.json()).deliveredConns;
     }
   }
 

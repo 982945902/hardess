@@ -1,6 +1,6 @@
 # Operator Guide
 
-This guide covers the current runtime workflow: startup, health checks, metrics export, alert thresholds, static multi-node routing, release-gate verification, and shutdown expectations.
+This guide covers the current runtime workflow: startup, health checks, metrics export, alert thresholds, static multi-node routing, release-gate verification, and shutdown expectations. For the current measured local envelope, also see [local-release-baseline.md](local-release-baseline.md).
 
 ## Core Commands
 
@@ -76,13 +76,17 @@ Cluster benchmark:
 
 - `BENCH_CLUSTER_*`: stair-step benchmark sizing, ports, profile selection, and optional SLO thresholds
 
+Single-node websocket benchmark:
+
+- `BENCH_WS_*`: single-node websocket stair-step benchmark sizing, profile selection, runtime tuning, and optional SLO thresholds
+
 Single-node release gate:
 
-- `RELEASE_GATE_*`: single-node gate ports, sizing, readiness timing, metrics mode, and optional HTTP / WS SLO thresholds
+- `RELEASE_GATE_*`: single-node gate ports, sizing, readiness timing, metrics mode, an optional layered `RELEASE_GATE_SLO_PROFILE`, and optional HTTP / WS SLO thresholds, including optional `ws.egress_overflow` / `ws.egress_backpressure` guards
 
 Cluster release gate:
 
-- `CLUSTER_RELEASE_GATE_*`: cluster gate profile, ports, shared-secret wiring, sizing, readiness timing, metrics mode, and optional cluster SLO thresholds
+- `CLUSTER_RELEASE_GATE_*`: cluster gate profile, ports, shared-secret wiring, sizing, readiness timing, metrics mode, an optional layered `CLUSTER_RELEASE_GATE_SLO_PROFILE`, and optional cluster SLO thresholds
 
 Detailed per-variable examples and the full verification env reference live in [load-testing.md](load-testing.md).
 
@@ -139,9 +143,16 @@ Current boundary:
 
 High-load benchmark workflow:
 
+- use `bun run bench:ws:high` when you want to calibrate single-node websocket egress / backpressure instead of relying on one short `load:ws` sample
+- use `bun run bench:ws:local` when you want the tuned single-node runtime profile plus the current built-in local SLO envelope in one command
+- the tuned single-node benchmark resolves its runtime defaults from an internal `high` profile, so the benchmark is less likely to stop at the default websocket policy guard before you can observe queue / backpressure behavior
+- then override only `BENCH_WS_SCENARIOS` and `BENCH_WS_RUNS` to probe the next single-node boundary
+- if you want an immediately usable pass/fail envelope instead of hand-writing thresholds, set `BENCH_WS_SLO_PROFILE=local|high`
 - use `bun run bench:cluster:high` as the default tuned profile before concluding the transport itself is the bottleneck
+- use `bun run bench:cluster:local` when you want the tuned cluster runtime profile plus the current built-in local cluster SLO envelope in one command
 - the tuned benchmark and cluster release-gate scripts now resolve their runtime defaults from an internal `high` profile instead of a long inline env chain
 - then override only `BENCH_CLUSTER_SCENARIOS` and `BENCH_CLUSTER_RUNS` to probe the next boundary
+- if you want the same kind of layered pass/fail envelope for cluster runs, set `BENCH_CLUSTER_SLO_PROFILE=local|high` or `CLUSTER_RELEASE_GATE_SLO_PROFILE=local|high`
 - if you need a release-style boundary instead of a raw completion boundary, also set SLO envs such as `BENCH_CLUSTER_MAX_HANDLE_ACK_P99_MS`, `BENCH_CLUSTER_MAX_RECV_ACK_P99_MS`, `BENCH_CLUSTER_MAX_HTTP_FALLBACK_COUNT`, `BENCH_CLUSTER_MAX_ROUTE_CACHE_RETRY_COUNT`, and `BENCH_CLUSTER_MAX_SYS_ERR_COUNT`
 - treat `highestFullyStableMessagesPerSender` as "eventual completion capacity" and `highestSloPassingMessagesPerSender` as the more meaningful "healthy operating tier"
 - if a run times out, inspect the returned `clusterWsLoadSummary.pendingSamples`, `topPendingSenders`, and cluster counters before changing transport design
@@ -149,6 +160,9 @@ High-load benchmark workflow:
 Release-gate interpretation:
 
 - by default the release gates still require basic correctness only: no transport errors, no `sys.err`, full ack completion, and graceful-shutdown readiness behavior
+- `RELEASE_GATE_SLO_PROFILE=local|high` and `CLUSTER_RELEASE_GATE_SLO_PROFILE=local|high` now apply built-in latency / degradation envelopes without changing the old default behavior
+- `bun run release:gate:local` and `bun run release:gate:cluster:local` are the shortest local "healthy baseline" checks
+- when single-node WS SLO envs are set, the gate can now also fail on `ws.egress_overflow` or `ws.egress_backpressure` counters from the runtime metrics delta instead of only checking ack latency and `sys.err`
 - if you set the new gate SLO envs, the release gate also fails on excessive p99 latency or cluster degradation counters even when the run eventually drains
 
 ## Close Codes

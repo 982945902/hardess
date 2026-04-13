@@ -1,6 +1,6 @@
 # Load Testing
 
-Use [../README.md](../README.md) as the repo entrypoint and [local-demo.md](local-demo.md) for the baseline demo flow. This document only covers sustained load and weak-network simulation.
+Use [../README.md](../README.md) as the repo entrypoint, [local-demo.md](local-demo.md) for the baseline demo flow, and [local-release-baseline.md](local-release-baseline.md) for the current local health envelope. This document only covers sustained load and weak-network simulation.
 
 This project includes lightweight HTTP and WebSocket load scripts plus a containerized Toxiproxy setup for weak-network simulation without changing the host macOS network stack.
 
@@ -8,6 +8,7 @@ Env namespace guide:
 - `HTTP_LOAD_*`: HTTP load script inputs
 - `WS_LOAD_*`: single-node WebSocket load script inputs
 - `CLUSTER_WS_LOAD_*`: cross-node WebSocket load script inputs
+- `BENCH_WS_*`: single-node WebSocket stair-step benchmark inputs
 - `BENCH_CLUSTER_*`: cluster stair-step benchmark inputs
 - `RELEASE_GATE_*`: single-node release-gate inputs
 - `CLUSTER_RELEASE_GATE_*`: cluster release-gate inputs
@@ -21,8 +22,13 @@ bun run verify
 bun run load:http
 bun run load:ws
 bun run load:cluster-ws
+bun run bench:ws
+bun run bench:ws:local
+bun run bench:ws:high
 bun run bench:cluster
+bun run bench:cluster:local
 bun run bench:cluster:high
+bun run release:gate:local
 bun run release:gate:cluster:high
 bun run load:toxiproxy setup
 bun run load:toxiproxy weak-client
@@ -30,6 +36,7 @@ bun run load:toxiproxy weak-upstream
 bun run load:toxiproxy reset
 bun run release:gate
 bun run release:gate:cluster
+bun run release:gate:cluster:local
 ```
 
 ## 1. Start the local runtime under test
@@ -87,6 +94,7 @@ Notes:
 - On macOS with Docker Desktop, the default proxy upstream uses `host.docker.internal`, so Toxiproxy stays inside Docker while still reaching the runtime or demo upstream running on the host.
 - To simulate weak `Hardess -> upstream` behavior, point the runtime config downstream origin at `http://127.0.0.1:8667`.
 - weak-network tuning now prefers `TOXI_LATENCY_MS`, `TOXI_JITTER_MS`, and `TOXI_BANDWIDTH_KBPS`; the older bare names still work as compatibility fallbacks
+- the Toxiproxy helper now validates the `/proxies` API response shape before printing status, so malformed control-plane responses fail fast instead of silently drifting
 
 ## 3. Run HTTP load
 
@@ -143,6 +151,7 @@ The script prints JSON including:
 - sent and delivered message counts
 - `recvAck` latency summary
 - `handleAck` latency summary
+- pending message diagnostics (`pendingMessages`, `oldestPendingAgeMs`, `topPendingSenders`, `pendingSamples`) when completion stalls
 - close-code distribution
 - `sys.err` distribution
 - delta from runtime metrics snapshot when `__admin/metrics` is available
@@ -169,8 +178,15 @@ Single-node release-gate SLO example:
 RELEASE_GATE_HTTP_MAX_P99_MS=200 \
 RELEASE_GATE_WS_MAX_RECV_ACK_P99_MS=500 \
 RELEASE_GATE_WS_MAX_HANDLE_ACK_P99_MS=1000 \
+RELEASE_GATE_WS_MAX_EGRESS_OVERFLOW_COUNT=0 \
+RELEASE_GATE_WS_MAX_EGRESS_BACKPRESSURE_COUNT=0 \
 RELEASE_GATE_WS_MAX_SYS_ERR_COUNT=0 \
 bun run release:gate
+```
+
+Single-node release-gate layered profile example:
+```bash
+RELEASE_GATE_SLO_PROFILE=local bun run release:gate
 ```
 
 Cluster release-gate SLO example:
@@ -183,6 +199,11 @@ CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_OVERFLOW_COUNT=0 \
 CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_BACKPRESSURE_COUNT=0 \
 CLUSTER_RELEASE_GATE_WS_MAX_SYS_ERR_COUNT=0 \
 bun run release:gate:cluster:high
+```
+
+Cluster release-gate layered profile example:
+```bash
+CLUSTER_RELEASE_GATE_SLO_PROFILE=local bun run release:gate:cluster
 ```
 
 ## 6. Run Cross-Node WebSocket load
@@ -222,6 +243,11 @@ bun run bench:cluster
 Tuned high-load profile:
 ```bash
 bun run bench:cluster:high
+```
+
+Tuned local-envelope shortcut:
+```bash
+bun run bench:cluster:local
 ```
 
 Equivalent explicit profile form:
@@ -277,6 +303,10 @@ bun run bench:cluster:high
 
 Notes:
 - all SLO thresholds are optional; if you do not set them, the benchmark still reports completion stability only
+- available built-in SLO profiles are `local` and `high`; `default` keeps the old "no thresholds unless you set them" behavior
+- current single-node SLO profile defaults:
+- `local`: `recvAck p99 <= 100ms`, `handleAck p99 <= 200ms`, `sysErr=0`, `egressOverflow=0`, `egressBackpressure=0`
+- `high`: `recvAck p99 <= 150ms`, `handleAck p99 <= 300ms`, `sysErr=0`, `egressOverflow=0`, `egressBackpressure=0`
 - when thresholds are set, each successful run is additionally marked `sloPassed=true|false`
 - scenario-level `sloPassed` means every run completed and every run stayed within the configured limits
 - this lets you separate "the system eventually drained" from "the system stayed inside an acceptable realtime envelope"
@@ -303,7 +333,95 @@ The current built-in `high` profile applies these defaults unless you explicitly
 - `CLUSTER_LOCATOR_CACHE_TTL_MS=10000`
 - `BENCH_CLUSTER_COMPLETION_TIMEOUT_MS=420000`
 
-## 8. Env Reference
+## 8. Run Single-Node WebSocket Stair-Step Benchmark
+
+Use this when you want a repeatable picture of single-node websocket sender/receiver headroom, especially around outbound queueing and backpressure, instead of a single short `load:ws` run.
+
+Default run:
+```bash
+bun run bench:ws
+```
+
+Tuned high-load profile:
+```bash
+bun run bench:ws:high
+```
+
+Tuned local-envelope shortcut:
+```bash
+bun run bench:ws:local
+```
+
+Equivalent explicit profile form:
+```bash
+BENCH_WS_PROFILE=high bun run bench:ws
+```
+
+Useful overrides:
+```bash
+BENCH_WS_SCENARIOS=30,60,90,120 \
+BENCH_WS_RUNS=3 \
+BENCH_WS_SENDERS=10 \
+BENCH_WS_RECEIVERS=10 \
+BENCH_WS_SEND_INTERVAL_MS=0 \
+BENCH_WS_COMPLETION_TIMEOUT_MS=40000 \
+bun run bench:ws
+```
+
+Important note:
+- single-node benchmark scenarios still pass through the normal websocket ingress guards
+- the auth message counts toward the default inbound rate limit, so `messagesPerSender=100` with `sendIntervalMs=0` can intentionally hit policy before it hits egress capacity
+- if you want to probe egress / queue headroom beyond that policy boundary, raise `WS_RATE_LIMIT_MAX_MESSAGES` or add a non-zero send interval
+- the benchmark output marks each scenario with `likelyPolicyLimited` and reports the first such tier in the summary
+
+Optional SLO thresholds:
+```bash
+BENCH_WS_MAX_RECV_ACK_P99_MS=200 \
+BENCH_WS_MAX_HANDLE_ACK_P99_MS=400 \
+BENCH_WS_MAX_EGRESS_OVERFLOW_COUNT=0 \
+BENCH_WS_MAX_EGRESS_BACKPRESSURE_COUNT=0 \
+BENCH_WS_MAX_SYS_ERR_COUNT=0 \
+bun run bench:ws:high
+```
+
+Optional layered SLO profile:
+```bash
+BENCH_WS_SLO_PROFILE=local bun run bench:ws
+```
+
+Notes:
+- all SLO thresholds are optional; if you do not set them, the benchmark still reports completion stability only
+- available built-in SLO profiles are `local` and `high`; `default` keeps the old "no thresholds unless you set them" behavior
+- current cluster SLO profile defaults:
+- `local`: `recvAck p99 <= 300ms`, `handleAck p99 <= 400ms`, `sysErr=0`, `routeCacheRetry=0`, `httpFallback=0`, `egressOverflow=0`, `egressBackpressure=0`
+- `high`: `recvAck p99 <= 450ms`, `handleAck p99 <= 600ms`, `sysErr=0`, `routeCacheRetry=0`, `httpFallback=0`, `egressOverflow=0`, `egressBackpressure=0`
+- when thresholds are set, each successful run is additionally marked `sloPassed=true|false`
+- this separates "the node eventually drained" from "the node stayed within an acceptable realtime envelope"
+
+The benchmark prints:
+- per-scenario success count
+- per-scenario SLO-passing count when thresholds are configured
+- throughput mean / min / max / stddev
+- `recvAck p99` mean / min / max / stddev
+- `handleAck p99` mean / min / max / stddev
+- `sysErrCount` mean / min / max / stddev
+- `egressOverflowCount` mean / min / max / stddev
+- `egressBackpressureCount` mean / min / max / stddev
+- `stablePrefixUpToMessagesPerSender`: the last continuously stable tier from the start of the ladder
+- `highestFullyStableMessagesPerSender`: the highest tier that happened to pass all configured runs
+- `stableSloPrefixUpToMessagesPerSender`: the last continuously SLO-passing tier from the start of the ladder
+- `highestSloPassingMessagesPerSender`: the highest tier that passed all configured runs and all configured SLO thresholds
+- `firstObservedFailureMessagesPerSender`: the first tier where any run failed
+- `firstObservedSloFailureMessagesPerSender`: the first tier that either failed outright or exceeded one of the configured SLO thresholds
+
+The current built-in `high` profile applies these defaults unless you explicitly override them:
+- `WS_RATE_LIMIT_MAX_MESSAGES=2200`
+- `WS_OUTBOUND_MAX_QUEUE_MESSAGES=8192`
+- `WS_OUTBOUND_MAX_QUEUE_BYTES=8388608`
+- `WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES=1048576`
+- `BENCH_WS_COMPLETION_TIMEOUT_MS=180000`
+
+## 9. Env Reference
 
 Compatibility note:
 - the load scripts prefer namespaced envs such as `HTTP_LOAD_*`, `WS_LOAD_*`, and `CLUSTER_WS_LOAD_*`
@@ -345,8 +463,27 @@ Cluster WebSocket load:
 - `CLUSTER_WS_LOAD_CONNECT_TIMEOUT_MS`
 - `CLUSTER_WS_LOAD_COMPLETION_TIMEOUT_MS`
 
+Single-node websocket benchmark:
+- `BENCH_WS_PROFILE`
+- `BENCH_WS_SLO_PROFILE`
+- `BENCH_WS_SCENARIOS`
+- `BENCH_WS_RUNS`
+- `BENCH_WS_SENDERS`
+- `BENCH_WS_RECEIVERS`
+- `BENCH_WS_SEND_INTERVAL_MS`
+- `BENCH_WS_COMPLETION_TIMEOUT_MS`
+- `BENCH_WS_READY_TIMEOUT_MS`
+- `BENCH_WS_PORT_BASE`
+- `BENCH_WS_METRICS_SINK`
+- `BENCH_WS_MAX_RECV_ACK_P99_MS`
+- `BENCH_WS_MAX_HANDLE_ACK_P99_MS`
+- `BENCH_WS_MAX_EGRESS_OVERFLOW_COUNT`
+- `BENCH_WS_MAX_EGRESS_BACKPRESSURE_COUNT`
+- `BENCH_WS_MAX_SYS_ERR_COUNT`
+
 Cluster benchmark:
 - `BENCH_CLUSTER_PROFILE`
+- `BENCH_CLUSTER_SLO_PROFILE`
 - `BENCH_CLUSTER_SCENARIOS`
 - `BENCH_CLUSTER_RUNS`
 - `BENCH_CLUSTER_SENDERS`
@@ -364,8 +501,8 @@ Cluster benchmark:
 - `BENCH_CLUSTER_MAX_SYS_ERR_COUNT`
 
 Release gates:
-- single-node gate: `RELEASE_GATE_PORT`, `RELEASE_GATE_UPSTREAM_PORT`, `RELEASE_GATE_READY_TIMEOUT_MS`, `RELEASE_GATE_METRICS_SINK`, `RELEASE_GATE_SHUTDOWN_DRAIN_MS`, `RELEASE_GATE_HTTP_CONCURRENCY`, `RELEASE_GATE_HTTP_REQUESTS`, `RELEASE_GATE_HTTP_MAX_P99_MS`, `RELEASE_GATE_WS_SENDERS`, `RELEASE_GATE_WS_RECEIVERS`, `RELEASE_GATE_WS_MESSAGES_PER_SENDER`, `RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS`, `RELEASE_GATE_WS_MAX_RECV_ACK_P99_MS`, `RELEASE_GATE_WS_MAX_HANDLE_ACK_P99_MS`, `RELEASE_GATE_WS_MAX_SYS_ERR_COUNT`
-- cluster gate: `CLUSTER_RELEASE_GATE_PROFILE`, `CLUSTER_RELEASE_GATE_PORT_A`, `CLUSTER_RELEASE_GATE_PORT_B`, `CLUSTER_RELEASE_GATE_UPSTREAM_PORT`, `CLUSTER_RELEASE_GATE_READY_TIMEOUT_MS`, `CLUSTER_RELEASE_GATE_SHARED_SECRET`, `CLUSTER_RELEASE_GATE_METRICS_SINK`, `CLUSTER_RELEASE_GATE_WS_SENDERS`, `CLUSTER_RELEASE_GATE_WS_RECEIVERS`, `CLUSTER_RELEASE_GATE_WS_MESSAGES_PER_SENDER`, `CLUSTER_RELEASE_GATE_WS_SEND_INTERVAL_MS`, `CLUSTER_RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_RECV_ACK_P99_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_HANDLE_ACK_P99_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_ROUTE_CACHE_RETRY_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_HTTP_FALLBACK_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_OVERFLOW_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_BACKPRESSURE_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_SYS_ERR_COUNT`
+- single-node gate: `RELEASE_GATE_SLO_PROFILE`, `RELEASE_GATE_PORT`, `RELEASE_GATE_UPSTREAM_PORT`, `RELEASE_GATE_READY_TIMEOUT_MS`, `RELEASE_GATE_METRICS_SINK`, `RELEASE_GATE_SHUTDOWN_DRAIN_MS`, `RELEASE_GATE_HTTP_CONCURRENCY`, `RELEASE_GATE_HTTP_REQUESTS`, `RELEASE_GATE_HTTP_MAX_P99_MS`, `RELEASE_GATE_WS_SENDERS`, `RELEASE_GATE_WS_RECEIVERS`, `RELEASE_GATE_WS_MESSAGES_PER_SENDER`, `RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS`, `RELEASE_GATE_WS_MAX_RECV_ACK_P99_MS`, `RELEASE_GATE_WS_MAX_HANDLE_ACK_P99_MS`, `RELEASE_GATE_WS_MAX_EGRESS_OVERFLOW_COUNT`, `RELEASE_GATE_WS_MAX_EGRESS_BACKPRESSURE_COUNT`, `RELEASE_GATE_WS_MAX_SYS_ERR_COUNT`
+- cluster gate: `CLUSTER_RELEASE_GATE_PROFILE`, `CLUSTER_RELEASE_GATE_SLO_PROFILE`, `CLUSTER_RELEASE_GATE_PORT_A`, `CLUSTER_RELEASE_GATE_PORT_B`, `CLUSTER_RELEASE_GATE_UPSTREAM_PORT`, `CLUSTER_RELEASE_GATE_READY_TIMEOUT_MS`, `CLUSTER_RELEASE_GATE_SHARED_SECRET`, `CLUSTER_RELEASE_GATE_METRICS_SINK`, `CLUSTER_RELEASE_GATE_WS_SENDERS`, `CLUSTER_RELEASE_GATE_WS_RECEIVERS`, `CLUSTER_RELEASE_GATE_WS_MESSAGES_PER_SENDER`, `CLUSTER_RELEASE_GATE_WS_SEND_INTERVAL_MS`, `CLUSTER_RELEASE_GATE_WS_COMPLETION_TIMEOUT_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_RECV_ACK_P99_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_HANDLE_ACK_P99_MS`, `CLUSTER_RELEASE_GATE_WS_MAX_ROUTE_CACHE_RETRY_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_HTTP_FALLBACK_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_OVERFLOW_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_EGRESS_BACKPRESSURE_COUNT`, `CLUSTER_RELEASE_GATE_WS_MAX_SYS_ERR_COUNT`
 
 Toxiproxy:
 - `TOXIPROXY_API_URL`
