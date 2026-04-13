@@ -4,13 +4,34 @@
   "type": "module",
   "scripts": {
     "dev": "bun run src/runtime/server.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test src/runtime src/sdk src/shared src/load",
+    "test:runtime": "bun test src/runtime src/shared",
+    "test:sdk": "bun test src/sdk",
+    "test:shared": "bun test src/shared",
+    "test:load": "bun test src/load",
+    "verify": "bun run check && bun run test",
+    "clean": "bun run clean:runtime-artifacts",
+    "clean:runtime-artifacts": "rm -f config/.*.hardess-config-*.ts workers/.*.hardess-worker-*.ts",
     "demo:upstream": "bun run src/demo/upstream.ts",
     "demo:client": "bun run src/demo/client.ts",
     "demo:http": "bun run src/demo/http-smoke.ts",
-    "check": "tsc --noEmit",
-    "test": "bun test"
+    "load:http": "bun run src/load/http.ts",
+    "load:ws": "bun run src/load/ws.ts",
+    "load:cluster-ws": "bun run src/load/cluster-ws.ts",
+    "bench:cluster": "bun run src/load/benchmark-cluster.ts",
+    "bench:cluster:high": "BENCH_CLUSTER_PROFILE=high bun run src/load/benchmark-cluster.ts",
+    "release:gate:cluster:high": "CLUSTER_RELEASE_GATE_PROFILE=high bun run src/load/release-gate-cluster.ts",
+    "load:toxiproxy": "bun run src/load/toxiproxy.ts",
+    "release:gate": "bun run src/load/release-gate.ts",
+    "release:gate:cluster": "bun run src/load/release-gate-cluster.ts"
   },
   "devDependencies": {
+    "@types/bun": "^1.3.12",
+    "@types/node": "^25.6.0",
     "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
   }
 }

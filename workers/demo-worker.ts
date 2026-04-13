@@ -1,4 +1,4 @@
-import type { HardessWorkerModule } from "../src/runtime/workers/types.ts";
+import type { HardessWorkerModule } from "../src/shared/types.ts";
 
 const demoWorker: HardessWorkerModule = {
   async fetch(request, env) {

@@ -1,8 +1,10 @@
 import { watch, type FSWatcher } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import type { HardessConfig } from "../../shared/types.ts";
+import { parseHardessConfig, type HardessConfig } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
+
+type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
 
 export interface ConfigStore {
   getConfig(): HardessConfig;
@@ -14,25 +16,13 @@ export interface ConfigStore {
 
 export interface ModuleConfigStoreOptions {
   watchDebounceMs?: number;
-  watchFn?: typeof watch;
-  setTimeoutFn?: typeof setTimeout;
-  clearTimeoutFn?: typeof clearTimeout;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object";
-}
-
-function validateConfig(config: HardessConfig): void {
-  if (!Array.isArray(config.pipelines) || config.pipelines.length === 0) {
-    throw new Error("Config must define at least one pipeline");
-  }
-
-  for (const pipeline of config.pipelines) {
-    if (!pipeline.id || !pipeline.matchPrefix || !pipeline.downstream?.origin) {
-      throw new Error(`Invalid pipeline configuration: ${JSON.stringify(pipeline)}`);
-    }
-  }
+  watchFn?: (
+    path: string,
+    options: { persistent: boolean },
+    listener: (eventType: string, filename: string | Buffer | null | undefined) => void
+  ) => FSWatcher;
+  setTimeoutFn?: (callback: () => void, delay: number) => TimeoutHandle;
+  clearTimeoutFn?: (timeout: TimeoutHandle) => void;
 }
 
 export class ModuleConfigStore implements ConfigStore {
@@ -45,7 +35,7 @@ export class ModuleConfigStore implements ConfigStore {
   private watcher?: FSWatcher;
   private reloadInFlight?: Promise<HardessConfig>;
   private reloadQueued = false;
-  private watchDebounceTimer?: ReturnType<typeof setTimeout>;
+  private watchDebounceTimer?: TimeoutHandle;
 
   constructor(
     private readonly modulePath: string,
@@ -100,12 +90,7 @@ export class ModuleConfigStore implements ConfigStore {
     }
     this.shadowCopyPath = shadowCopyPath;
 
-    if (!isRecord(candidate)) {
-      throw new Error(`Config module ${this.modulePath} does not export a valid config object`);
-    }
-
-    const config = candidate as HardessConfig;
-    validateConfig(config);
+    const config = parseHardessConfig(candidate);
     this.currentConfig = config;
     this.logger?.info("config reloaded", {
       modulePath: this.modulePath,
@@ -148,14 +133,18 @@ export class ModuleConfigStore implements ConfigStore {
     const absolutePath = resolve(this.modulePath);
     const targetDir = dirname(absolutePath);
     const targetFile = basename(absolutePath);
-    this.watcher = (this.options.watchFn ?? watch)(targetDir, { persistent: false }, (_eventType, filename) => {
+    this.watcher = (this.options.watchFn ?? watch)(
+      targetDir,
+      { persistent: false },
+      (_eventType: string, filename: string | Buffer | null | undefined) => {
       const changedFile = typeof filename === "string" ? filename : filename?.toString();
       if (changedFile && changedFile !== targetFile) {
         return;
       }
 
       this.scheduleReload();
-    });
+      }
+    );
   }
 
   dispose(): void {

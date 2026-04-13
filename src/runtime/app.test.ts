@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { InMemoryMetrics } from "./observability/metrics.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRuntimeApp } from "./app.ts";
+import { parseEnvelope, serializeEnvelope } from "../shared/envelope.ts";
 
 const originalFetch = globalThis.fetch;
 const cleanupPaths: string[] = [];
@@ -16,7 +18,7 @@ beforeEach(() => {
       peerId: request.headers.get("x-hardess-peer-id"),
       workerId: request.headers.get("x-hardess-worker")
     });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 });
 
 afterEach(() => {
@@ -84,6 +86,102 @@ describe("createRuntimeApp", () => {
     );
 
     expect(response?.status).toBe(426);
+  });
+
+  it("exposes admin health, readiness, and metrics endpoints", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+
+    const health = await app.fetch(
+      new Request("http://localhost/__admin/health"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+    const ready = await app.fetch(
+      new Request("http://localhost/__admin/ready"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+    const metrics = await app.fetch(
+      new Request("http://localhost/__admin/metrics"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+    const prometheus = await app.fetch(
+      new Request("http://localhost/__admin/metrics/prometheus"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+    const clusterPeers = await app.fetch(
+      new Request("http://localhost/__admin/cluster/peers"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+
+    expect(health?.status).toBe(200);
+    expect((await health?.json())?.ok).toBe(true);
+    expect(ready?.status).toBe(200);
+    expect((await ready?.json())?.status).toBe("ready");
+    expect(metrics?.status).toBe(200);
+    expect((await metrics?.json())?.metrics).toEqual({
+      counters: {},
+      timings: {}
+    });
+    expect(prometheus?.status).toBe(200);
+    expect(prometheus?.headers.get("content-type")).toContain("text/plain");
+    expect(clusterPeers?.status).toBe(200);
+    expect((await clusterPeers?.json())?.peers).toEqual([]);
+  });
+
+  it("reports not ready and rejects traffic during shutdown", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+    app.beginShutdown();
+
+    const ready = await app.fetch(
+      new Request("http://localhost/__admin/ready"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/demo/health", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+
+    expect(ready?.status).toBe(503);
+    expect(response?.status).toBe(503);
   });
 
   it("applies reloaded config to new requests", async () => {
@@ -165,5 +263,323 @@ describe("createRuntimeApp", () => {
       peerId: "alice",
       workerId: "demo-http"
     });
+  });
+
+  it("routes websocket traffic across two runtime nodes through cluster relay", async () => {
+    interface TestSocket {
+      data: { connId: string };
+      sent: string[];
+      closed?: { code?: number; reason?: string };
+      send(data: string): number;
+      getBufferedAmount(): number;
+      close(code?: number, reason?: string): void;
+    }
+
+    function createSocket(connId: string): TestSocket {
+      return {
+        data: { connId },
+        sent: [],
+        send(data: string) {
+          this.sent.push(data);
+          return data.length;
+        },
+        getBufferedAmount() {
+          return 0;
+        },
+        close(code?: number, reason?: string) {
+          this.closed = { code, reason };
+        }
+      };
+    }
+
+    let appA: Awaited<ReturnType<typeof createRuntimeApp>>;
+    let appB: Awaited<ReturnType<typeof createRuntimeApp>>;
+    const upgradeRef = {
+      upgrade() {
+        return false;
+      }
+    };
+    const fetchA = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      return await appB.fetch(new Request(url, init), upgradeRef);
+    }) as unknown as typeof fetch;
+    const fetchB = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      return await appA.fetch(new Request(url, init), upgradeRef);
+    }) as unknown as typeof fetch;
+
+    appA = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      nodeId: "node-a",
+      cluster: {
+        transport: "http",
+        peers: [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+        sharedSecret: "secret",
+        fetchFn: fetchA
+      }
+    });
+    appB = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      nodeId: "node-b",
+      cluster: {
+        transport: "http",
+        peers: [{ nodeId: "node-a", baseUrl: "http://node-a.internal" }],
+        sharedSecret: "secret",
+        fetchFn: fetchB
+      }
+    });
+    appDisposers.push(() => appA.dispose());
+    appDisposers.push(() => appB.dispose());
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    appA.websocket.open(alice);
+    appB.websocket.open(bob);
+
+    await appA.websocket.message(
+      alice,
+      serializeEnvelope({
+        msgId: "auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+    await appB.websocket.message(
+      bob,
+      serializeEnvelope({
+        msgId: "auth-bob",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob"
+        }
+      })
+    );
+
+    await appA.websocket.message(
+      alice,
+      serializeEnvelope({
+        msgId: "chat-send-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "chat",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "cross-node"
+        }
+      })
+    );
+
+    const bobMessage = parseEnvelope(bob.sent.at(-1) ?? "");
+    expect(bobMessage?.action).toBe("message");
+    expect(bobMessage?.payload).toEqual({
+      fromPeerId: "alice",
+      content: "cross-node"
+    });
+    expect(parseEnvelope(alice.sent.at(-1) ?? "")?.action).toBe("recvAck");
+
+    await appB.websocket.message(
+      bob,
+      serializeEnvelope({
+        msgId: "handle-1",
+        kind: "system",
+        src: { peerId: "bob", connId: "conn-bob" },
+        protocol: "sys",
+        version: "1.0",
+        action: "handleAck",
+        ts: Date.now(),
+        payload: {
+          ackFor: "chat-send-1"
+        }
+      })
+    );
+
+    expect(parseEnvelope(alice.sent.at(-1) ?? "")?.action).toBe("handleAck");
+  });
+
+  it("retries cluster routing after invalidating stale remote locator cache", async () => {
+    interface TestSocket {
+      data: { connId: string };
+      sent: string[];
+      closed?: { code?: number; reason?: string };
+      send(data: string): number;
+      getBufferedAmount(): number;
+      close(code?: number, reason?: string): void;
+    }
+
+    function createSocket(connId: string): TestSocket {
+      return {
+        data: { connId },
+        sent: [],
+        send(data: string) {
+          this.sent.push(data);
+          return data.length;
+        },
+        getBufferedAmount() {
+          return 0;
+        },
+        close(code?: number, reason?: string) {
+          this.closed = { code, reason };
+        }
+      };
+    }
+
+    async function auth(app: Awaited<ReturnType<typeof createRuntimeApp>>, socket: TestSocket, peerId: string) {
+      await app.websocket.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${peerId}-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: `demo:${peerId}`
+          }
+        })
+      );
+    }
+
+    async function sendChat(
+      app: Awaited<ReturnType<typeof createRuntimeApp>>,
+      socket: TestSocket,
+      msgId: string
+    ) {
+      await app.websocket.message(
+        socket,
+        serializeEnvelope({
+          msgId,
+          kind: "biz",
+          src: { peerId: "alice", connId: socket.data.connId },
+          protocol: "chat",
+          version: "1.0",
+          action: "send",
+          ts: Date.now(),
+          payload: {
+            toPeerId: "bob",
+            content: msgId
+          }
+        })
+      );
+    }
+
+    let appA: Awaited<ReturnType<typeof createRuntimeApp>>;
+    let appB: Awaited<ReturnType<typeof createRuntimeApp>>;
+    const upgradeRef = {
+      upgrade() {
+        return false;
+      }
+    };
+    const fetchA = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      return await appB.fetch(new Request(String(input), init), upgradeRef);
+    }) as unknown as typeof fetch;
+    const fetchB = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      return await appA.fetch(new Request(String(input), init), upgradeRef);
+    }) as unknown as typeof fetch;
+
+    appA = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      nodeId: "node-a",
+      metrics: new InMemoryMetrics(),
+      cluster: {
+        transport: "http",
+        peers: [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+        sharedSecret: "secret",
+        fetchFn: fetchA,
+        locatorCacheTtlMs: 10_000
+      }
+    });
+    appB = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      nodeId: "node-b",
+      metrics: new InMemoryMetrics(),
+      cluster: {
+        transport: "http",
+        peers: [{ nodeId: "node-a", baseUrl: "http://node-a.internal" }],
+        sharedSecret: "secret",
+        fetchFn: fetchB,
+        locatorCacheTtlMs: 10_000
+      }
+    });
+    appDisposers.push(() => appA.dispose());
+    appDisposers.push(() => appB.dispose());
+
+    const alice = createSocket("conn-alice");
+    const bobOld = createSocket("conn-bob-old");
+    appA.websocket.open(alice);
+    appB.websocket.open(bobOld);
+    await auth(appA, alice, "alice");
+    await auth(appB, bobOld, "bob");
+
+    await sendChat(appA, alice, "chat-send-warm");
+    expect(parseEnvelope(bobOld.sent.at(-1) ?? "")?.action).toBe("message");
+
+    appB.websocket.close(bobOld);
+
+    const bobNew = createSocket("conn-bob-new");
+    appB.websocket.open(bobNew);
+    await auth(appB, bobNew, "bob");
+
+    await sendChat(appA, alice, "chat-send-retry");
+
+    const deliveredToNew = bobNew.sent
+      .map((raw) => parseEnvelope(raw))
+      .find((envelope) => envelope?.kind === "biz" && envelope.msgId === "chat-send-retry");
+    expect(deliveredToNew?.action).toBe("message");
+    expect(parseEnvelope(alice.sent.at(-1) ?? "")?.action).toBe("recvAck");
+    expect(
+      (appA.metrics as InMemoryMetrics).snapshot().counters["ws.route_cache_retry"]
+    ).toBe(1);
+  });
+
+  it("rejects unauthorized cluster relay requests when a shared secret is configured", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      nodeId: "node-a",
+      cluster: {
+        peers: [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+        sharedSecret: "secret"
+      }
+    });
+    appDisposers.push(() => app.dispose());
+
+    const response = await app.fetch(
+      new Request("http://localhost/__cluster/locate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          peerIds: ["alice"]
+        })
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+
+    expect(response?.status).toBe(401);
+    expect((await response?.json())?.error).toBe("Unauthorized cluster request");
   });
 });

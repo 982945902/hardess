@@ -1,8 +1,21 @@
-import { ERROR_CODES, HardessError, type ServerProtocolModule } from "../../shared/index.ts";
+import { parseProtocolPayload, type ServerProtocolModule } from "../../shared/index.ts";
+import { z } from "zod";
 
-interface DemoSendPayload {
-  toPeerId: string;
-  content: string;
+const demoSendPayloadSchema = z.object({
+  toPeerId: z.string().min(1, "toPeerId is required"),
+  content: z.string()
+});
+
+type DemoSendPayload = z.infer<typeof demoSendPayloadSchema>;
+
+function isDemoSendPayload(value: unknown): value is DemoSendPayload {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as { toPeerId?: unknown }).toPeerId === "string" &&
+      (value as { toPeerId: string }).toPeerId.length > 0 &&
+      typeof (value as { content?: unknown }).content === "string"
+  );
 }
 
 export const demoServerModule: ServerProtocolModule<DemoSendPayload> = {
@@ -11,13 +24,11 @@ export const demoServerModule: ServerProtocolModule<DemoSendPayload> = {
   actions: {
     send: {
       validate(ctx) {
-        if (!ctx.payload || typeof ctx.payload !== "object") {
-          throw new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Payload must be an object");
+        if (isDemoSendPayload(ctx.payload)) {
+          return;
         }
 
-        if (typeof ctx.payload.toPeerId !== "string" || typeof ctx.payload.content !== "string") {
-          throw new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Missing toPeerId or content");
-        }
+        parseProtocolPayload(demoSendPayloadSchema, ctx.payload, "Invalid demo.send payload");
       },
       resolveRecipients(ctx) {
         return [ctx.payload.toPeerId];

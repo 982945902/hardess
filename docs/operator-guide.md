@@ -1,0 +1,166 @@
+# Operator Guide
+
+This guide covers the current runtime workflow: startup, health checks, metrics export, alert thresholds, static multi-node routing, release-gate verification, and shutdown expectations.
+
+## Core Commands
+
+```bash
+bun run dev
+bun run verify
+bun run release:gate
+bun run release:gate:cluster:high
+bun run clean
+```
+
+## Runtime Env Vars
+
+HTTP / process:
+
+- `PORT`: runtime listen port, default `3000`
+- `CONFIG_MODULE_PATH`: config module path, default `./config/hardess.config.ts`
+- `SHUTDOWN_DRAIN_MS`: time to stay not-ready before stopping the server, default `250`
+- `SHUTDOWN_TIMEOUT_MS`: hard stop timeout, default `10000`
+
+WebSocket ingress / egress:
+
+- `WS_HEARTBEAT_INTERVAL_MS`: heartbeat interval
+- `WS_STALE_AFTER_MS`: stale timeout
+- `WS_MAX_CONNECTIONS`: total connection cap
+- `WS_MAX_CONNECTIONS_PER_PEER`: per-peer cap
+- `WS_RATE_LIMIT_WINDOW_MS`: inbound rate-limit window
+- `WS_RATE_LIMIT_MAX_MESSAGES`: inbound rate-limit quota
+- `WS_OUTBOUND_MAX_QUEUE_MESSAGES`: per-connection outbound queue depth cap
+- `WS_OUTBOUND_MAX_QUEUE_BYTES`: per-connection outbound queue bytes cap
+- `WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES`: socket buffered-amount cap before closing the connection
+- `WS_OUTBOUND_BACKPRESSURE_RETRY_MS`: retry delay after Bun reports websocket backpressure
+
+Metrics / alerts:
+
+- `METRICS_SINK`: `windowed` or `inmemory`, default `windowed`
+- `METRICS_MAX_TIMINGS_PER_METRIC`: retained timing samples per metric in `windowed` mode
+- `PROMETHEUS_METRIC_PREFIX`: exporter metric prefix, default `hardess`
+- `ALERT_WINDOW_MS`: alert evaluation window, default `30000`
+- `ALERT_HTTP_ERRORS`
+- `ALERT_UPSTREAM_TIMEOUTS`
+- `ALERT_UPSTREAM_UNAVAILABLE`
+- `ALERT_WORKER_ERRORS`
+- `ALERT_WS_ERRORS`
+- `ALERT_WS_BACKPRESSURE_EVENTS`
+- `ALERT_WS_RATE_LIMIT_EXCEEDED`
+- `ALERT_WS_HEARTBEAT_TIMEOUTS`
+- `ALERT_HTTP_REQUEST_P99_MS`
+- `ALERT_UPSTREAM_P99_MS`
+- `ALERT_WORKER_P99_MS`
+
+Cluster / multi-node:
+
+- `NODE_ID`: current runtime node id, default `local`
+- `CLUSTER_PEERS_JSON`: static peer list JSON, for example `[{"nodeId":"node-b","baseUrl":"http://127.0.0.1:3101"}]`
+- `CLUSTER_TRANSPORT`: `ws` or `http`, default `ws` in the runtime server entrypoint
+- `CLUSTER_SHARED_SECRET`: optional shared secret for internal cluster locate requests and WS channel handshake
+- `CLUSTER_REQUEST_TIMEOUT_MS`: timeout for cluster locate and cross-node request/response operations, default `10000`
+- `CLUSTER_OUTBOUND_MAX_QUEUE_MESSAGES`: per-node internal WS channel outbound queue cap, default `16384`
+- `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS`: retry delay after internal cluster WS backpressure, default `10`
+- `CLUSTER_LOCATOR_CACHE_TTL_MS`: remote peer-location cache TTL on each node
+
+## Verification Env Vars
+
+Load script namespaces:
+
+- `HTTP_LOAD_*`: HTTP load inputs; prefer these over legacy aliases such as `BASE_URL`, `CONCURRENCY`, and `REQUESTS`
+- `WS_LOAD_*`: single-node websocket load inputs; prefer these over legacy aliases such as `WS_URL`, `SENDER_COUNT`, and `MESSAGES_PER_SENDER`
+- `CLUSTER_WS_LOAD_*`: cross-node websocket load inputs
+- `TOXI_*`: Toxiproxy setup and weak-network profile inputs
+
+Cluster benchmark:
+
+- `BENCH_CLUSTER_*`: stair-step benchmark sizing, ports, profile selection, and optional SLO thresholds
+
+Single-node release gate:
+
+- `RELEASE_GATE_*`: single-node gate ports, sizing, readiness timing, metrics mode, and optional HTTP / WS SLO thresholds
+
+Cluster release gate:
+
+- `CLUSTER_RELEASE_GATE_*`: cluster gate profile, ports, shared-secret wiring, sizing, readiness timing, metrics mode, and optional cluster SLO thresholds
+
+Detailed per-variable examples and the full verification env reference live in [load-testing.md](load-testing.md).
+
+## Health And Metrics
+
+- `GET /__admin/health`: liveness view
+- `GET /__admin/ready`: readiness view; returns `503` after shutdown starts
+- `GET /__admin/metrics`: counter/timing snapshot from the configured metrics sink
+- `GET /__admin/metrics/prometheus`: Prometheus scrape endpoint
+- `GET /__admin/cluster/peers`: static cluster peer view for the current node
+
+Recommended minimum checks:
+
+- readiness must be `200` before receiving traffic
+- readiness must flip to `503` before process exit during graceful shutdown
+- monitor `http.error`, `http.upstream_timeout`, `http.upstream_unavailable`, `worker.run_error`, `ws.error`, `ws.egress_backpressure`, `ws.heartbeat_timeout`
+- when debugging websocket failures, also inspect per-code counters such as `ws.error_code.route_no_recipient` or `ws.error_code.route_peer_offline`
+
+External observability bootstrap:
+
+- sample Prometheus scrape config: [../docker/prometheus.yml](../docker/prometheus.yml)
+- sample Grafana dashboard: [grafana-hardess-overview.dashboard.json](grafana-hardess-overview.dashboard.json)
+- cluster transport counters now include `cluster.message_in`, `cluster.message_out`, `cluster.egress_backpressure`, `cluster.egress_overflow`, `cluster.request_timeout`, `cluster.auth_rejected`, and `cluster.channel_closed`
+
+## Release Gate
+
+`bun run release:gate` currently does all of the following automatically:
+
+- starts a dedicated demo upstream and runtime instance on isolated ports
+- waits for the upstream and runtime to answer before sending smoke/load traffic
+- runs HTTP smoke
+- runs HTTP load
+- runs WebSocket load
+- sends `SIGTERM` and verifies readiness drops to `503` before runtime exit
+
+Useful overrides live in the `Verification Env Vars` section above.
+
+## Static Multi-Node Routing
+
+The current multi-node baseline is static-peer based:
+
+- each node keeps local websocket connections in-memory
+- `PeerLocator` expands recipients from local memory plus cached remote lookups
+- peer locate uses internal HTTP `POST /__cluster/locate`
+- remote `deliver` and `handleAck` use a long-lived internal websocket channel at `GET /__cluster/ws`
+- `CLUSTER_TRANSPORT=http` keeps the older pure-HTTP transport available as a fallback path
+- when `CLUSTER_TRANSPORT=ws`, per-request fallback to the internal HTTP endpoints is now used if the cluster WS channel is temporarily unavailable or its outbound queue overflows
+
+Current boundary:
+
+- this is a static cluster peer list, not automatic membership or gossip
+- there is no durable distributed state, only per-node in-memory connection state plus short peer-location caches
+- rollout, retries, channel lifecycle, and topology management still need deployment-specific conventions
+
+High-load benchmark workflow:
+
+- use `bun run bench:cluster:high` as the default tuned profile before concluding the transport itself is the bottleneck
+- the tuned benchmark and cluster release-gate scripts now resolve their runtime defaults from an internal `high` profile instead of a long inline env chain
+- then override only `BENCH_CLUSTER_SCENARIOS` and `BENCH_CLUSTER_RUNS` to probe the next boundary
+- if you need a release-style boundary instead of a raw completion boundary, also set SLO envs such as `BENCH_CLUSTER_MAX_HANDLE_ACK_P99_MS`, `BENCH_CLUSTER_MAX_RECV_ACK_P99_MS`, `BENCH_CLUSTER_MAX_HTTP_FALLBACK_COUNT`, `BENCH_CLUSTER_MAX_ROUTE_CACHE_RETRY_COUNT`, and `BENCH_CLUSTER_MAX_SYS_ERR_COUNT`
+- treat `highestFullyStableMessagesPerSender` as "eventual completion capacity" and `highestSloPassingMessagesPerSender` as the more meaningful "healthy operating tier"
+- if a run times out, inspect the returned `clusterWsLoadSummary.pendingSamples`, `topPendingSenders`, and cluster counters before changing transport design
+
+Release-gate interpretation:
+
+- by default the release gates still require basic correctness only: no transport errors, no `sys.err`, full ack completion, and graceful-shutdown readiness behavior
+- if you set the new gate SLO envs, the release gate also fails on excessive p99 latency or cluster degradation counters even when the run eventually drains
+
+## Close Codes
+
+- `4400`: protocol / payload invalid
+- `4401`: auth invalid / expired / revoked
+- `4403`: ACL denied
+- `4429`: rate limit or connection quota exceeded
+- `4508`: websocket backpressure or outbound overflow guard fired
+
+## Current Limits
+
+- external production `AuthProvider` wiring is still intentionally not part of this guide
+- dashboard rollout and Prometheus/Grafana hosting still stay deployment-specific
+- cluster membership is static; there is no leader election, gossip, or shared distributed registry yet

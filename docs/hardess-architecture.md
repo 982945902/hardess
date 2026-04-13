@@ -52,21 +52,78 @@ Completed in this document:
 Implemented in repository:
 1. HTTP gateway main path is running: auth -> worker -> proxy.
 2. WebSocket runtime is running on Bun upgrade path with `sys.auth`, `ping/pong`, `route`, `recvAck`, and `handleAck`.
-3. Shared auth abstraction, in-memory `PeerLocator`, dispatcher, worker loader, and config store are implemented.
+3. Shared auth abstraction, dispatcher, worker loader, config store, and both local plus static-cluster `PeerLocator` implementations are implemented.
 4. Config reload and worker reload work through shadow-copy module loading, directory-level watch with debounce, serialized reload execution, and explicit disposal points.
 5. SDK transport, reconnect, heartbeat, protocol registry, conflict detection, and explicit `replace` semantics are implemented.
 6. Demo business protocols exist for `demo` and `chat`, including server-side dispatch transformation (`send -> message`).
 7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
-8. Basic runtime metrics are implemented with noop and in-memory sinks, plus HTTP/worker/proxy/WebSocket-side counters and timing hooks for the main request/message paths.
-9. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
-10. Tests cover HTTP ingress, WebSocket runtime, worker reload, config reload, SDK transport/client behavior, protocol registries, and routing.
+8. Runtime metrics now include bounded snapshot support for server mode, HTTP/worker/proxy/WebSocket-side counters and timings, cluster-transport counters for internal WS channels, threshold-based structured alert logging over configurable windows, and Prometheus text export for external scraping.
+9. Runtime admin endpoints now exist for `__admin/health`, `__admin/ready`, `__admin/metrics`, `__admin/metrics/prometheus`, and `__admin/cluster/peers`, and the Bun server path supports graceful shutdown signaling with an explicit drain window before stop/dispose.
+10. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional SLO thresholds, optional Toxiproxy weak-network simulation, a repo-level workflow entrypoint, a tuned cluster high-load benchmark profile with optional SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
+11. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
+12. A shared runtime-schema baseline is now implemented with `zod` for config validation, shared envelope validation, key system payloads, business protocol payloads, and worker result validation.
+13. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
+14. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
+
+Implementation checklist by module:
+
+Completed:
+1. Shared contracts and envelope model are implemented and reused by runtime, SDK, and workers.
+2. HTTP ingress main path is implemented: route match, shared auth, worker execution, proxy forwarding, and unified error mapping.
+3. Worker runtime baseline is implemented: stable worker contract, module loading, timeout guard, shadow-copy reload, and explicit invalidation/disposal points.
+4. WebSocket runtime baseline is implemented: auth handshake, heartbeat, direct routing, server-side recipient expansion, recv/handle ack flow, and close/error mapping.
+5. WebSocket safety baseline is implemented: per-peer connection quota, inbound rate-limit, bounded outbound queue, invalid-envelope close behavior, and connection rebinding cleanup.
+6. SDK baseline is implemented: protocol registry, outbound/inbound hooks, reconnect, heartbeat, structured close/error callbacks, and terminal-close no-reconnect behavior.
+7. Demo protocol path is implemented end-to-end for `demo` and `chat`, including server-side dispatch transformation.
+8. Config/runtime lifecycle baseline is implemented: config watch with debounce, serialized reload execution, worker invalidation on config changes, and runtime disposal wiring.
+9. Runtime-schema baseline is implemented for config, shared envelope parsing, key system payloads, business protocol payloads, and worker return-contract validation.
+10. Runtime operational baseline is implemented for health/readiness/metrics endpoints, graceful shutdown signaling, and local load-testing tooling.
+11. Test baseline is implemented across HTTP ingress, WebSocket runtime, config reload, worker reload, SDK transport/client behavior, protocol registries, routing, admin endpoints, timeout mapping, and schema behavior.
+
+Partially completed:
+1. Observability is partially implemented: bounded metrics snapshots, threshold-based structured alert logging, admin metrics snapshots, Prometheus text export, and a sample Grafana dashboard template now exist, but external monitoring stack rollout still needs environment integration work.
+2. Auth integration is partially implemented: the shared `AuthService` abstraction, provider dispatch, expiry checks, and revocation path exist, but only the local demo provider is wired today.
+3. WebSocket backpressure and egress governance are partially implemented: Bun send-status handling, bounded queueing, socket buffered-amount limits, retry-on-backpressure, and overflow close behavior now exist, but deeper transport-specific flow-control tuning may still be needed under heavier production traffic.
+4. Runtime operational polish is partially implemented: config/worker reload, health/readiness, graceful shutdown with drain window, startup-failure handling, repo-level workflow docs, an operator guide, automated local release-gate execution, SLO-aware release-gate checks, and SLO-aware cluster benchmarking are in place, but broader deployment integration is still environment-specific.
+5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, internal WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
+6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, but not every SDK/runtime extension surface has been migrated yet.
+
+Not started or intentionally deferred:
+1. External `AuthProvider` integration is intentionally deferred until the external auth-service contract is stable.
+2. Stronger worker isolation beyond same-process Bun execution is deferred to Phase 2.
+3. Persistent offline storage, replay, and exactly-once semantics are out of MVP scope and not started.
+4. Dynamic cluster membership, shared distributed routing state, and non-static topology management are deferred beyond the current static multi-node baseline.
+5. Control plane route/worker version management UI is out of MVP scope and not started.
 
 TODO / still open:
-1. Add stronger runtime controls beyond the current baseline: real socket backpressure integration, queue/write-buffer governance refinement, and egress flow control tuning.
-2. Add observability hardening beyond the current in-memory/noop metrics baseline and console logs: real metrics sinks, dashboards, and alert thresholds.
-3. Improve runtime operational polish beyond the current baseline: better local smoke/integration scripts.
-4. Keep future distributed `PeerLocator` implementation abstract until scale-out starts.
-5. External `AuthProvider` integration is intentionally deferred; the abstraction already exists, but concrete integration should follow the external auth-service contract rather than lead MVP scope.
+1. Continue tuning runtime controls beyond the current baseline: Bun socket backpressure integration and buffered-amount governance are now implemented, but egress flow-control tuning still needs validation under broader production traffic mixes.
+2. Define and calibrate cluster latency / degradation SLOs per deployment tier; the benchmark runner can enforce operator-provided thresholds now, but the acceptable envelope is still workload-specific.
+3. Finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline: real external monitoring stack rollout remains deployment work.
+4. Improve runtime operational polish beyond the current baseline: automated local release-gate execution and clearer startup failure behavior now exist, but broader deployment automation still depends on the target environment.
+5. Decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
+6. External `AuthProvider` integration is intentionally deferred; the abstraction already exists, but concrete integration should follow the external auth-service contract rather than lead MVP scope.
+7. Extend the shared runtime-schema layer to the remaining extension surfaces where ad hoc validation still exists, especially SDK-facing protocol boundaries and any future control-plane inputs.
+
+Single-node release checklist:
+
+Must complete before single-node production release:
+1. Replace the demo auth path with a real `AuthProvider` integration and validate both HTTP bearer auth and WebSocket `sys.auth` against the same production authority.
+2. Keep the current proxy timeout split validated under realistic weak-network scenarios so connect timeout and upstream response timeout stay aligned with config semantics in production.
+3. Expose production-usable observability for the main paths: request volume, error rate, upstream timeout/unavailable counts, worker error/latency, and WebSocket open/close/error/quota/backpressure signals are now emitted in-process and exported for Prometheus scraping, but external stack rollout still depends on deployment.
+4. Finish the deployment lifecycle story beyond the current baseline: health/readiness checks, explicit drain-before-stop behavior, and startup failure handling now exist, but rollout-specific orchestration expectations still need environment documentation.
+5. The local smoke/load scripts are now wrapped in an automated local release-gate flow, but realistic deployment-specific gates still need environment integration.
+
+Recommended before first release:
+1. Validate the new WebSocket egress governance under wider production traffic mixes, especially around socket backpressure thresholds and retry timing.
+2. Keep the operator guide current as deployment conventions stabilize.
+3. Calibrate threshold-based log monitoring for upstream timeout spikes, worker failures, and WebSocket overflow/rate-limit events against production traffic.
+4. Review worker trust and change-management boundaries so only expected worker modules can be published and activated in the single-node deployment.
+
+Can defer for single-node release:
+1. Dynamic cluster membership, stronger distributed routing state, and other scale-out architecture work beyond the current static cluster baseline.
+2. Stronger worker isolation via process or isolate boundaries.
+3. Persistent offline storage, replay, and exactly-once delivery semantics.
+4. Control-plane route/worker version management UI.
 
 ## 4. High-Level Architecture
 
@@ -219,9 +276,23 @@ interface PeerLocator {
 
 Rules:
 1. All `peerId -> ConnRef[]` expansion must go through `PeerLocator`.
-2. MVP uses a local in-memory implementation backed by runtime connection indexes.
+2. The current repo ships two implementations: local in-memory lookup for single-node mode and a static-peer distributed lookup that merges local indexes with cached remote lookups.
 3. `ConnRef` always includes `nodeId`, even in single-node mode.
-4. Future distributed lookup can replace the implementation without changing protocol hooks or SDK contracts.
+4. Cluster peer membership is currently static and configured per node; stronger distributed coordination can replace this without changing protocol hooks or SDK contracts.
+
+### 6.5 Static Cluster Transport Baseline
+The current multi-node transport is intentionally hybrid rather than fully distributed.
+
+Current behavior:
+1. Peer discovery still uses internal HTTP `POST /__cluster/locate` against the statically configured peer list.
+2. Cross-node message delivery and cross-node `sys.handleAck` forwarding use a long-lived internal WebSocket channel at `GET /__cluster/ws`.
+3. The runtime server defaults `CLUSTER_TRANSPORT` to `ws`; `http` remains supported as a compatibility and fallback mode, and the `ws` mode can degrade individual requests back to the internal HTTP endpoints when the WS channel is temporarily unavailable or backpressured.
+4. The optional shared secret is enforced on HTTP locate requests and during the internal WebSocket `hello` handshake.
+
+Why this shape exists:
+1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.
+2. `deliver` and `handleAck` are the hotter cross-node path, so moving them onto a reused internal channel removes repeated HTTP setup overhead.
+3. This is still a static-cluster baseline, not a distributed membership or durable routing system.
 
 ## 7. Protocol Model
 Hardess protocol is split into two layers:
@@ -413,6 +484,16 @@ Minimum WebSocket close code mapping:
 2. Routed through protocol registry by `protocol + version + action`.
 3. Payload schema validated by plugin-provided validators.
 4. Multiple business protocols can share one transport connection.
+
+Validation strategy notes:
+1. The current codebase now has a shared runtime-schema baseline, but production-facing config and protocol boundaries should continue converging on that layer rather than reintroducing repeated ad hoc `if` checks.
+2. The highest-value schema boundaries are:
+   - gateway config module shape
+   - shared envelope shape plus system payloads such as `sys.auth`, `ping`, `pong`, and `handleAck`
+   - business protocol payloads at registry/module boundaries
+   - worker return contract for short-circuit `response` vs rewritten `request`
+3. Those boundaries are now implemented with a shared schema helper and should remain the default pattern for new runtime entry points.
+4. Validation should fail closed and map into existing `HardessError` codes rather than introducing transport-specific error models.
 
 ## 8. SDK Architecture (Single SDK for All Peers)
 The same SDK package is used by all peer implementations.
@@ -633,7 +714,8 @@ Rules:
 2. Request mutation is represented by returning a replacement `Request`, not by mutating the original request in place.
 3. Returning `Response` or `{ response }` short-circuits proxy forwarding.
 4. Returning `{ request }` continues upstream proxying with the replacement request.
-5. `ctx.waitUntil()` is allowed for side effects such as async logging, but it must not delay the main request path.
+5. Worker return values should be runtime-validated so invalid extension results fail fast instead of silently mutating platform behavior.
+6. `ctx.waitUntil()` is allowed for side effects such as async logging, but it must not delay the main request path.
 
 ### 10.2 Worker Runtime API Boundary
 Allowed APIs in MVP:
@@ -706,8 +788,16 @@ Default runtime policies:
    - message in/out rate
    - fanout count
    - worker latency/error rate
+   - upstream connect-timeout vs response-timeout counts
+   - Prometheus scrape export via `__admin/metrics/prometheus`
 2. Logs:
    - `traceId`, `msgId`, `peerId`, `action`, `latencyMs`, `result`
+   - threshold-based structured alerts for key HTTP / worker / WebSocket failure signals
+3. Admin/runtime status:
+   - `__admin/health`
+   - `__admin/ready`
+   - `__admin/metrics`
+   - `__admin/cluster/peers`
 
 ## 13. Config Model (MVP)
 Gateway config file structure:
@@ -771,6 +861,8 @@ Behavior:
 3. Keep previous valid config if new config invalid.
 4. New config only applies to new requests/connections.
 5. Runtime-owned header injection is configured centrally, not by arbitrary client input.
+6. Config validation now enforces semantic constraints beyond field presence, including positive timeout values, valid downstream origins, and non-empty slash-prefixed pipeline prefixes.
+7. Future config validation can expand further into cross-field or deployment-policy constraints without changing the public config shape.
 
 ## 14. Recommended Project Structure
 One practical TypeScript + Bun layout for MVP:
@@ -847,6 +939,7 @@ Rules:
 2. Better backpressure, rate-limit, and queue/write-buffer controls.
 3. Metrics sinks, dashboard, and alert thresholds.
 4. Better lifecycle handling for runtime/watch/reload behavior.
+5. Extend the current runtime-schema baseline across the remaining runtime and SDK boundaries rather than keeping mixed validation styles.
 
 ### Phase 3 (scale-out)
 1. Redis pub/sub adapter for multi-node fanout.
@@ -854,11 +947,61 @@ Rules:
 3. Control plane for route/worker version management.
 4. Distributed `PeerLocator` backend.
 
+### 15.1 Technology Fit Notes
+The following notes are intentionally pragmatic rather than aspirational; they describe where additional libraries or runtime features help Hardess, and where they currently add more complexity than value.
+
+#### `zod`
+Recommended as the first additional dependency if runtime validation is strengthened.
+
+Best-fit use cases:
+1. Config module validation for `HardessConfig` and `PipelineConfig`.
+2. Shared envelope and system-payload validation at transport boundaries.
+3. Business protocol payload validation at registry/module boundaries.
+4. Worker result validation to keep the HTTP worker contract explicit.
+
+Why it fits:
+1. Hardess already has multiple runtime trust boundaries but currently validates many of them with light, repeated manual checks.
+2. `zod` improves error locality and consistency without forcing a different execution model on the runtime.
+3. The adoption path is incremental and can be introduced boundary by boundary.
+
+Non-goals:
+1. `zod` should not become a replacement for the existing `HardessError` mapping layer.
+2. `zod` should not drive a large architectural rewrite of the runtime control flow.
+
+#### `effect`
+Not recommended for the core runtime at the current project stage.
+
+Why it is not a near-term fit:
+1. The current runtime already has a direct and understandable model for errors, metrics, timeouts, and logging.
+2. Adopting `effect` well would pull the codebase toward a different programming model rather than solving one sharply bounded gap.
+3. For the current MVP and single-node hardening work, the likely cost in abstraction and refactor churn is higher than the near-term operational gain.
+
+When to reconsider:
+1. If config reload, worker lifecycle, timeout/cancel handling, retries, and observability are later unified into a more complex orchestration layer.
+2. If the runtime needs a typed effect system for larger dependency graphs, structured concurrency, or richer recovery policy composition.
+
+#### `bun.worker`
+Useful as a Phase 2 hardening option, but not as the default worker execution mode today.
+
+Best-fit use case:
+1. Optional isolation backend for HTTP pre-processing workers that are CPU-heavy, platform-authored, or likely to block the main runtime thread.
+
+Why it should remain optional first:
+1. The current worker model is intentionally same-process and reload-friendly for MVP simplicity.
+2. Moving worker execution to Bun workers introduces serialization, lifecycle, timeout, cancellation, and reload complexity around `Request`, `Response`, auth context, and metrics propagation.
+3. Worker threads improve fault isolation and main-thread protection, but they are not a security sandbox and should not be framed as one.
+
+Recommended adoption shape:
+1. Preserve `inline` execution as the default worker mode.
+2. If isolation is added, expose it as an explicit pipeline or runtime option such as `worker.mode = "inline" | "thread"`.
+3. Limit the first rollout to HTTP worker execution rather than the WebSocket hub or the main runtime loop.
+
 ## 16. Open Decisions
 1. Future distributed `PeerLocator` backend selection after scale-out begins.
 2. Whether peer-target routing should be added after multi-connection semantics are finalized.
 3. Whether Phase 2 should introduce stronger worker isolation via process/isolate boundaries.
 4. When a real external auth-service contract is stable, how `AuthProvider` should map remote revocation and expiry semantics into the local `AuthContext`.
+5. Whether runtime-schema standardization should converge on `zod` or remain library-agnostic until more plugin authorship requirements are defined.
 
 ## 17. Summary
 Hardess adopts a **single-connection, multi-protocol architecture** with:

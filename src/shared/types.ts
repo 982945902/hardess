@@ -194,6 +194,7 @@ export interface DeliveryPlan {
 export interface PeerLocator {
   find(peerId: string): Promise<ConnRef[]>;
   findMany(peerIds: string[]): Promise<Map<string, ConnRef[]>>;
+  invalidate?(peerId?: string): void;
 }
 
 export interface HardessWorkerEnv {

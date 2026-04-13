@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { InMemoryMetrics } from "./metrics.ts";
+import { CompositeMetrics, InMemoryMetrics, WindowedMetrics } from "./metrics.ts";
 
 describe("InMemoryMetrics", () => {
   it("tracks counters and timings and can snapshot state", () => {
@@ -20,5 +20,39 @@ describe("InMemoryMetrics", () => {
         "http.request_ms": [12, 18]
       }
     });
+  });
+
+  it("keeps timing history bounded in windowed metrics", () => {
+    const metrics = new WindowedMetrics(2);
+
+    metrics.timing("http.request_ms", 10);
+    metrics.timing("http.request_ms", 20);
+    metrics.timing("http.request_ms", 30);
+
+    expect(metrics.snapshot()).toEqual({
+      counters: {},
+      timings: {
+        "http.request_ms": [20, 30]
+      }
+    });
+  });
+
+  it("fans out metrics updates to multiple sinks", () => {
+    const left = new InMemoryMetrics();
+    const right = new InMemoryMetrics();
+    const metrics = new CompositeMetrics([left, right]);
+
+    metrics.increment("ws.open");
+    metrics.timing("http.request_ms", 12);
+
+    expect(left.snapshot()).toEqual({
+      counters: {
+        "ws.open": 1
+      },
+      timings: {
+        "http.request_ms": [12]
+      }
+    });
+    expect(right.snapshot()).toEqual(left.snapshot());
   });
 });

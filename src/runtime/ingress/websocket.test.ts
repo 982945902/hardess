@@ -20,16 +20,37 @@ interface TestSocket {
     code?: number;
     reason?: string;
   };
-  send(data: string): void;
+  bufferedAmount?: number;
+  send(data: string): number | void;
+  getBufferedAmount?(): number;
   close(code?: number, reason?: string): void;
 }
 
-function createSocket(connId: string): TestSocket {
+function createSocket(
+  connId: string,
+  overrides: {
+    sendImpl?: (socket: TestSocket, data: string) => number | void;
+    getBufferedAmountImpl?: (socket: TestSocket) => number;
+  } = {}
+): TestSocket {
   return {
     data: { connId },
     sent: [],
+    bufferedAmount: 0,
     send(data: string) {
+      if (overrides.sendImpl) {
+        return overrides.sendImpl(this, data);
+      }
+
       this.sent.push(data);
+      return data.length;
+    },
+    getBufferedAmount() {
+      if (overrides.getBufferedAmountImpl) {
+        return overrides.getBufferedAmountImpl(this);
+      }
+
+      return this.bufferedAmount ?? 0;
     },
     close(code?: number, reason?: string) {
       this.closed = { code, reason };
@@ -351,6 +372,129 @@ describe("createWebSocketHandlers", () => {
     handlers.dispose();
   });
 
+  it("suppresses duplicate cluster deliveries for the same message id", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(chatServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "node-b",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const bob = createSocket("conn-bob");
+    handlers.open(bob);
+
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "auth-bob",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob"
+        }
+      })
+    );
+
+    const payload = {
+      sender: { nodeId: "node-a", connId: "conn-alice", peerId: "alice" },
+      envelope: {
+        msgId: "cluster-dup-1",
+        kind: "biz" as const,
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "chat",
+        version: "1.0",
+        action: "message",
+        ts: Date.now(),
+        payload: {
+          fromPeerId: "alice",
+          content: "hello"
+        }
+      },
+      ack: "handle" as const,
+      targets: [{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }]
+    };
+
+    const first = await handlers.deliverCluster(payload);
+    const second = await handlers.deliverCluster(payload);
+
+    const bizMessages = bob.sent
+      .map((raw) => parseEnvelope(raw))
+      .filter((envelope) => envelope?.kind === "biz" && envelope.msgId === "cluster-dup-1");
+
+    expect(first).toEqual(payload.targets);
+    expect(second).toEqual(payload.targets);
+    expect(bizMessages).toHaveLength(1);
+    handlers.dispose();
+  });
+
+  it("closes the socket on invalid system payloads", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "bad-handle-ack",
+        kind: "system",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "sys",
+        version: "1.0",
+        action: "handleAck",
+        ts: Date.now(),
+        payload: {}
+      })
+    );
+
+    expect(lastEnvelope(alice)?.action).toBe("err");
+    expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("PROTO_INVALID_PAYLOAD");
+    expect(alice.closed?.code).toBe(4400);
+    handlers.dispose();
+  });
+
   it("closes the socket on invalid websocket envelope", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
     const peerLocator = new InMemoryPeerLocator();
@@ -513,7 +657,6 @@ describe("createWebSocketHandlers", () => {
     const dispatcher = new Dispatcher(peerLocator);
     const registry = new ServerProtocolRegistry();
     registry.register(demoServerModule);
-    const queuedDrains: VoidFunction[] = [];
 
     const handlers = createWebSocketHandlers({
       nodeId: "local",
@@ -525,13 +668,19 @@ describe("createWebSocketHandlers", () => {
       outbound: {
         maxQueueMessages: 1,
         maxQueueBytes: 64 * 1024
-      },
-      queueMicrotaskFn(callback) {
-        queuedDrains.push(callback);
       }
     });
 
-    const alice = createSocket("conn-alice");
+    const alice = createSocket("conn-alice", {
+      sendImpl(socket, data) {
+        if (parseEnvelope(data)?.action === "auth.ok") {
+          socket.sent.push(data);
+          return data.length;
+        }
+
+        return -1;
+      }
+    });
     const bob = createSocket("conn-bob");
     handlers.open(alice);
     handlers.open(bob);
@@ -556,9 +705,6 @@ describe("createWebSocketHandlers", () => {
           }
         })
       );
-      while (queuedDrains.length > 0) {
-        queuedDrains.shift()?.();
-      }
     }
 
     await handlers.message(
@@ -574,6 +720,152 @@ describe("createWebSocketHandlers", () => {
         payload: {
           toPeerId: "bob",
           content: "hello"
+        }
+      })
+    );
+
+    expect(alice.closed?.code).toBe(4508);
+    expect(alice.closed?.reason).toBe("BACKPRESSURE_OVERFLOW");
+    handlers.dispose();
+  });
+
+  it("retries queued sends after websocket backpressure clears", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+    const timeouts: Array<() => void> = [];
+    let backpressured = true;
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      outbound: {
+        maxQueueMessages: 8,
+        maxQueueBytes: 64 * 1024,
+        backpressureRetryMs: 5
+      },
+      setTimeoutFn(callback) {
+        timeouts.push(callback);
+        return timeouts.length as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn() {}
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob", {
+      sendImpl(socket, data: string) {
+        if (parseEnvelope(data)?.action === "auth.ok") {
+          socket.sent.push(data);
+          return data.length;
+        }
+
+        if (backpressured) {
+          return -1;
+        }
+
+        socket.sent.push(data);
+        return data.length;
+      }
+    });
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, token] of [
+      [alice, "demo:alice"],
+      [bob, "demo:bob"]
+    ] as const) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: token
+          }
+        })
+      );
+    }
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "queued-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    );
+
+    await Promise.resolve();
+    expect(bob.sent.some((raw) => parseEnvelope(raw)?.msgId === "queued-1")).toBe(false);
+
+    backpressured = false;
+    timeouts.shift()?.();
+    await Promise.resolve();
+
+    expect(bob.sent.some((raw) => parseEnvelope(raw)?.msgId === "queued-1")).toBe(true);
+    handlers.dispose();
+  });
+
+  it("closes the socket when the websocket buffered amount exceeds the configured limit", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      outbound: {
+        maxQueueMessages: 8,
+        maxQueueBytes: 64 * 1024,
+        maxSocketBufferBytes: 32
+      }
+    });
+
+    const alice = createSocket("conn-alice", {
+      getBufferedAmountImpl() {
+        return 64;
+      }
+    });
+    handlers.open(alice);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
         }
       })
     );

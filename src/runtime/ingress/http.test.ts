@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { HardessConfig } from "../../shared/types.ts";
+import type { ConfigStore } from "../config/store.ts";
 import { handleHttpRequest } from "./http.ts";
 import { DemoBearerAuthProvider } from "../auth/provider.ts";
 import { RuntimeAuthService } from "../auth/service.ts";
@@ -35,12 +36,22 @@ beforeEach(() => {
         "content-type": "application/json"
       }
     });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
 });
+
+function createConfigStoreMock(nextConfig: HardessConfig): ConfigStore {
+  return {
+    getConfig: () => nextConfig,
+    reload: async () => nextConfig,
+    watch: () => {},
+    dispose: () => {},
+    subscribe: () => () => {}
+  };
+}
 
 describe("handleHttpRequest", () => {
   it("proxies authenticated requests", async () => {
@@ -52,11 +63,7 @@ describe("handleHttpRequest", () => {
         }
       }),
       {
-        configStore: {
-          getConfig: () => config,
-          reload: async () => config,
-          watch: () => {}
-        },
+        configStore: createConfigStoreMock(config),
         authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
         logger: new ConsoleLogger(),
         metrics
@@ -87,11 +94,7 @@ describe("handleHttpRequest", () => {
         }
       }),
       {
-        configStore: {
-          getConfig: () => config,
-          reload: async () => config,
-          watch: () => {}
-        },
+        configStore: createConfigStoreMock(config),
         authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
         logger: new ConsoleLogger(),
         metrics
@@ -101,6 +104,46 @@ describe("handleHttpRequest", () => {
     expect(response.status).toBe(404);
     expect(metrics.counter("http.request_in")).toBe(1);
     expect(metrics.counter("http.route_missing")).toBe(1);
+    expect(metrics.counter("http.error")).toBe(1);
+  });
+
+  it("maps upstream connect timeout failures", async () => {
+    globalThis.fetch = mock((request: Request) => {
+      return new Promise<Response>((_, reject) => {
+        request.signal.addEventListener("abort", () => {
+          reject(new Error("aborted"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        configStore: createConfigStoreMock({
+          pipelines: [
+            {
+              ...config.pipelines[0]!,
+              downstream: {
+                ...config.pipelines[0]!.downstream,
+                connectTimeoutMs: 5,
+                responseTimeoutMs: 20
+              }
+            }
+          ]
+        }),
+        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
+        logger: new ConsoleLogger(),
+        metrics
+      }
+    );
+
+    expect(response.status).toBe(504);
+    expect(metrics.counter("http.upstream_connect_timeout")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
   });
 });

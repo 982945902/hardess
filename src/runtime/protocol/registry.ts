@@ -12,7 +12,7 @@ function keyOf(protocol: string, version: string, action: string): string {
 export class ServerProtocolRegistry {
   private readonly actions = new Map<string, ServerActionHooks<unknown>>();
 
-  register(module: ServerProtocolModule<unknown>): void {
+  register<Payload>(module: ServerProtocolModule<Payload>): void {
     for (const [action, hooks] of Object.entries(module.actions)) {
       const key = keyOf(module.protocol, module.version, action);
       if (this.actions.has(key)) {
@@ -22,14 +22,14 @@ export class ServerProtocolRegistry {
         );
       }
 
-      this.actions.set(key, hooks);
+      this.actions.set(key, hooks as ServerActionHooks<unknown>);
     }
   }
 
-  replace(module: ServerProtocolModule<unknown>): void {
+  replace<Payload>(module: ServerProtocolModule<Payload>): void {
     this.unregister(module.protocol, module.version);
     for (const [action, hooks] of Object.entries(module.actions)) {
-      this.actions.set(keyOf(module.protocol, module.version, action), hooks);
+      this.actions.set(keyOf(module.protocol, module.version, action), hooks as ServerActionHooks<unknown>);
     }
   }
 

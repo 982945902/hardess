@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import type { FSWatcher } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -89,11 +90,15 @@ describe("ModuleConfigStore", () => {
     let nextTimerId = 1;
     const store = new ModuleConfigStore(configPath, "hardessConfig", undefined, {
       watchDebounceMs: 5,
-      watchFn(_path, _options, listener) {
+      watchFn(
+        _path: string,
+        _options: { persistent: boolean },
+        listener: (eventType: string, filename: string | Buffer | null | undefined) => void
+      ) {
         watchCallback = listener;
         return {
           close() {}
-        } as unknown as import("node:fs").FSWatcher;
+        } as FSWatcher;
       },
       setTimeoutFn(callback) {
         const id = nextTimerId++;
@@ -149,11 +154,15 @@ describe("ModuleConfigStore", () => {
     let nextTimerId = 1;
     const store = new ModuleConfigStore(configPath, "hardessConfig", undefined, {
       watchDebounceMs: 5,
-      watchFn(_path, _options, listener) {
+      watchFn(
+        _path: string,
+        _options: { persistent: boolean },
+        listener: (eventType: string, filename: string | Buffer | null | undefined) => void
+      ) {
         watchCallback = listener;
         return {
           close() {}
-        } as unknown as import("node:fs").FSWatcher;
+        } as FSWatcher;
       },
       setTimeoutFn(callback) {
         const id = nextTimerId++;
@@ -174,5 +183,32 @@ describe("ModuleConfigStore", () => {
     await Bun.sleep(20);
 
     expect(store.getConfig().pipelines[0]?.downstream.origin).toBe("http://upstream-a.internal");
+  });
+
+  it("rejects config with invalid timeout semantics", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-invalid-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: [
+          {
+            id: "demo-http",
+            matchPrefix: "/demo",
+            downstream: {
+              origin: "http://127.0.0.1:9000",
+              connectTimeoutMs: 0,
+              responseTimeoutMs: 5000
+            }
+          }
+        ]
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    await expect(store.reload()).rejects.toThrow("connectTimeoutMs must be > 0");
+    store.dispose();
   });
 });

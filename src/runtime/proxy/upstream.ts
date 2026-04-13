@@ -46,7 +46,15 @@ export async function proxyUpstream(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), pipeline.downstream.responseTimeoutMs);
+  let timeoutStage: "connect" | "response" | undefined;
+  const connectTimeout = setTimeout(() => {
+    timeoutStage = "connect";
+    controller.abort();
+  }, pipeline.downstream.connectTimeoutMs);
+  const responseTimeout = setTimeout(() => {
+    timeoutStage = "response";
+    controller.abort();
+  }, pipeline.downstream.responseTimeoutMs);
 
   try {
     const response = await fetch(
@@ -58,16 +66,27 @@ export async function proxyUpstream(
         redirect: "manual"
       })
     );
+    clearTimeout(connectTimeout);
+    clearTimeout(responseTimeout);
     metrics.increment("http.upstream_ok");
     metrics.timing("http.upstream_ms", Date.now() - startedAt);
     return response;
   } catch (error) {
     if (controller.signal.aborted) {
-      metrics.increment("http.upstream_timeout");
+      if (timeoutStage === "connect") {
+        metrics.increment("http.upstream_connect_timeout");
+      } else {
+        metrics.increment("http.upstream_timeout");
+      }
       metrics.timing("http.upstream_ms", Date.now() - startedAt);
-      throw new HardessError(ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT, "Upstream request timed out", {
-        retryable: true
-      });
+      throw new HardessError(
+        ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT,
+        timeoutStage === "connect" ? "Upstream connect timed out" : "Upstream request timed out",
+        {
+          retryable: true,
+          detail: timeoutStage ? `timeout_stage=${timeoutStage}` : undefined
+        }
+      );
     }
 
     metrics.increment("http.upstream_unavailable");
@@ -82,6 +101,7 @@ export async function proxyUpstream(
       }
     );
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(connectTimeout);
+    clearTimeout(responseTimeout);
   }
 }

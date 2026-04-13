@@ -8,13 +8,17 @@ export interface MetricsSnapshot {
   timings: Record<string, number[]>;
 }
 
+export interface MetricsSnapshotProvider extends Metrics {
+  snapshot(): MetricsSnapshot;
+}
+
 export class NoopMetrics implements Metrics {
   increment(_name: string, _value = 1): void {}
 
   timing(_name: string, _valueMs: number): void {}
 }
 
-export class InMemoryMetrics implements Metrics {
+export class InMemoryMetrics implements MetricsSnapshotProvider {
   private readonly counters = new Map<string, number>();
   private readonly timingsByName = new Map<string, number[]>();
 
@@ -48,5 +52,50 @@ export class InMemoryMetrics implements Metrics {
   reset(): void {
     this.counters.clear();
     this.timingsByName.clear();
+  }
+}
+
+export class WindowedMetrics implements MetricsSnapshotProvider {
+  private readonly counters = new Map<string, number>();
+  private readonly timingsByName = new Map<string, number[]>();
+
+  constructor(private readonly maxTimingsPerMetric = 1024) {}
+
+  increment(name: string, value = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + value);
+  }
+
+  timing(name: string, valueMs: number): void {
+    const values = this.timingsByName.get(name) ?? [];
+    values.push(valueMs);
+    if (values.length > this.maxTimingsPerMetric) {
+      values.splice(0, values.length - this.maxTimingsPerMetric);
+    }
+    this.timingsByName.set(name, values);
+  }
+
+  snapshot(): MetricsSnapshot {
+    return {
+      counters: Object.fromEntries(this.counters),
+      timings: Object.fromEntries(
+        Array.from(this.timingsByName.entries()).map(([name, values]) => [name, [...values]])
+      )
+    };
+  }
+}
+
+export class CompositeMetrics implements Metrics {
+  constructor(private readonly sinks: Metrics[]) {}
+
+  increment(name: string, value = 1): void {
+    for (const sink of this.sinks) {
+      sink.increment(name, value);
+    }
+  }
+
+  timing(name: string, valueMs: number): void {
+    for (const sink of this.sinks) {
+      sink.timing(name, valueMs);
+    }
   }
 }

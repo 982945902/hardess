@@ -1,4 +1,5 @@
 export * from "./codes.ts";
 export * from "./envelope.ts";
 export * from "./errors.ts";
+export * from "./schema.ts";
 export * from "./types.ts";

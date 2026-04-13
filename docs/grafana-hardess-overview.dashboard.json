@@ -1,0 +1,161 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum(rate(hardess_http_request_in_total[1m]))",
+          "legendFormat": "http_rps",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "sum(rate(hardess_ws_message_in_total[1m]))",
+          "legendFormat": "ws_in",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(hardess_ws_message_out_total[1m]))",
+          "legendFormat": "ws_out",
+          "refId": "B"
+        }
+      ],
+      "title": "WS Message Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "hardess_http_request_ms_milliseconds{stat=\"p99\"}",
+          "legendFormat": "http_p99",
+          "refId": "A"
+        },
+        {
+          "expr": "hardess_worker_run_ms_milliseconds{stat=\"p99\"}",
+          "legendFormat": "worker_p99",
+          "refId": "B"
+        }
+      ],
+      "title": "HTTP / Worker P99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum(rate(hardess_http_error_total[1m]))",
+          "legendFormat": "http_error",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(hardess_http_upstream_timeout_total[1m]))",
+          "legendFormat": "upstream_timeout",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(hardess_ws_error_total[1m]))",
+          "legendFormat": "ws_error",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(hardess_ws_egress_backpressure_total[1m]))",
+          "legendFormat": "ws_backpressure",
+          "refId": "D"
+        }
+      ],
+      "title": "Error And Backpressure Rate",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "hardess"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "title": "Hardess Overview",
+  "version": 1
+}

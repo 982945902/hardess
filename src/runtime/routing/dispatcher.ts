@@ -20,4 +20,10 @@ export class Dispatcher {
       ack: options.ack ?? "recv"
     };
   }
+
+  invalidate(peerIds: string[]): void {
+    for (const peerId of new Set(peerIds)) {
+      this.peerLocator.invalidate?.(peerId);
+    }
+  }
 }

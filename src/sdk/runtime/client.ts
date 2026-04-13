@@ -19,8 +19,8 @@ export interface HardessClientOptions {
   transport?: TransportOptions;
   systemHandlers?: ClientSystemHandlers;
   timers?: {
-    setInterval: typeof setInterval;
-    clearInterval: typeof clearInterval;
+    setInterval: (handler: () => void, delay: number) => ReturnType<typeof setInterval>;
+    clearInterval: (timeout: ReturnType<typeof setInterval>) => void;
   };
 }
 
@@ -31,8 +31,8 @@ export class HardessClient {
   private readonly heartbeatIntervalMs: number;
   private readonly systemHandlers: ClientSystemHandlers;
   private readonly timerApi: {
-    setInterval: typeof setInterval;
-    clearInterval: typeof clearInterval;
+    setInterval: (handler: () => void, delay: number) => ReturnType<typeof setInterval>;
+    clearInterval: (timeout: ReturnType<typeof setInterval>) => void;
   };
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private token?: string;

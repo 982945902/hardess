@@ -1,5 +1,25 @@
 # Local Demo
 
+Use [../README.md](../README.md) as the repo entrypoint. This document stays focused on the local demo flow only.
+
+## Quick Commands
+
+```bash
+bun run dev
+bun run demo:upstream
+bun run demo:client
+bun run demo:http
+bun run verify
+bun run clean
+```
+
+Focused checks when you only changed one area:
+
+```bash
+bun run test:runtime
+bun run test:sdk
+```
+
 ## 1. Start Demo Upstream
 ```bash
 bun run demo:upstream
@@ -49,3 +69,4 @@ Expected result:
 Notes:
 - `demo:client` now defaults to `PROTOCOL=chat`
 - set `PROTOCOL=demo` if you want the older echo-style demo payload
+- for HTTP / WS load and weak-network simulation, continue in [load-testing.md](load-testing.md)

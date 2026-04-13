@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
 import { HardessClient } from "./client.ts";
-import type { WebSocketLike } from "../transport/ws.ts";
+import type { WebSocketLike, WebSocketLikeEvent } from "../transport/ws.ts";
 
 class FakeSocket implements WebSocketLike {
-  private listeners = new Map<string, Array<(event?: { data?: unknown }) => void>>();
+  private listeners = new Map<string, Array<(event?: WebSocketLikeEvent) => void>>();
   sent: string[] = [];
 
   addEventListener(
     type: "open" | "close" | "message" | "error",
-    listener: (event?: { data?: unknown }) => void
+    listener: (event?: WebSocketLikeEvent) => void
   ): void {
     const existing = this.listeners.get(type) ?? [];
     existing.push(listener);
@@ -24,7 +24,7 @@ class FakeSocket implements WebSocketLike {
     this.emit("close");
   }
 
-  emit(type: "open" | "close" | "message" | "error", event?: { data?: unknown }): void {
+  emit(type: "open" | "close" | "message" | "error", event?: WebSocketLikeEvent): void {
     for (const listener of this.listeners.get(type) ?? []) {
       listener(event);
     }

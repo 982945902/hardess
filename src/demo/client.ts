@@ -45,10 +45,10 @@ const demoModule: ClientProtocolModule<
   }
 };
 
-const modules = new Map<string, ClientProtocolModule<unknown, unknown>>([
-  ["demo", demoModule],
-  ["chat", chatClientModule]
-]);
+const moduleForProtocol: ClientProtocolModule<unknown, unknown> =
+  protocol === "demo"
+    ? (demoModule as ClientProtocolModule<unknown, unknown>)
+    : (chatClientModule as ClientProtocolModule<unknown, unknown>);
 
 const client = new HardessClient(wsUrl, {
   systemHandlers: {
@@ -73,7 +73,7 @@ const client = new HardessClient(wsUrl, {
   }
 });
 
-client.use(modules.get(protocol) ?? chatClientModule);
+client.use(moduleForProtocol);
 client.connect(`demo:${peerId}`);
 
 console.log(

@@ -1,12 +1,17 @@
 import {
   ERROR_CODES,
   HardessError,
+  parseSysAuthPayload,
+  parseSysHandleAckPayload,
+  parseSysPingPayload,
+  parseSysPongPayload,
   type AckMode,
   type AuthContext,
-  type Envelope,
-  type SysAuthPayload
+  type ConnRef,
+  type Envelope
 } from "../../shared/index.ts";
 import type { AuthService } from "../auth/service.ts";
+import type { StaticClusterNetwork } from "../cluster/network.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { Dispatcher } from "../routing/dispatcher.ts";
@@ -29,7 +34,8 @@ interface ConnectionState {
     data: {
       connId: string;
     };
-    send(data: string): void;
+    send(data: string): number | void;
+    getBufferedAmount?(): number;
     close(code?: number, reason?: string): void;
   };
   auth?: AuthContext;
@@ -39,14 +45,23 @@ interface ConnectionState {
   outboundQueue: Array<{ data: string; bytes: number }>;
   outboundQueuedBytes: number;
   drainScheduled: boolean;
+  drainTimer?: TimeoutHandle;
   closed: boolean;
 }
+
+type IntervalHandle = ReturnType<typeof globalThis.setInterval> | number;
+type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
+type SetIntervalLike = (callback: () => void, delay: number) => IntervalHandle;
+type ClearIntervalLike = (handle: IntervalHandle) => void;
+type SetTimeoutLike = (callback: () => void, delay: number) => TimeoutHandle;
+type ClearTimeoutLike = (handle: TimeoutHandle) => void;
 
 export interface WebSocketRuntimeDeps {
   nodeId: string;
   authService: AuthService;
   peerLocator: InMemoryPeerLocator;
   dispatcher: Dispatcher;
+  clusterNetwork?: StaticClusterNetwork;
   registry: ServerProtocolRegistry;
   logger: Logger;
   metrics?: Metrics;
@@ -61,10 +76,14 @@ export interface WebSocketRuntimeDeps {
   outbound?: {
     maxQueueMessages: number;
     maxQueueBytes: number;
+    maxSocketBufferBytes?: number;
+    backpressureRetryMs?: number;
   };
   now?: () => number;
-  setIntervalFn?: typeof setInterval;
-  clearIntervalFn?: typeof clearInterval;
+  setIntervalFn?: SetIntervalLike;
+  clearIntervalFn?: ClearIntervalLike;
+  setTimeoutFn?: SetTimeoutLike;
+  clearTimeoutFn?: ClearTimeoutLike;
   queueMicrotaskFn?: (callback: VoidFunction) => void;
 }
 
@@ -82,7 +101,8 @@ function messageToString(raw: string | ArrayBuffer | Uint8Array): string {
 
 export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const connections = new Map<string, ConnectionState>();
-  const pendingHandleAckByMsgId = new Map<string, string>();
+  const pendingHandleAckByMsgId = new Map<string, ConnRef>();
+  const recentClusterDeliveryByMsgId = new Map<string, number>();
   const now = deps.now ?? (() => Date.now());
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 25_000;
   const staleAfterMs = deps.staleAfterMs ?? 60_000;
@@ -91,8 +111,13 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const rateLimitMaxMessages = deps.rateLimit?.maxMessages ?? 100;
   const outboundMaxQueueMessages = deps.outbound?.maxQueueMessages ?? 256;
   const outboundMaxQueueBytes = deps.outbound?.maxQueueBytes ?? 512 * 1024;
+  const outboundMaxSocketBufferBytes = deps.outbound?.maxSocketBufferBytes ?? 512 * 1024;
+  const outboundBackpressureRetryMs = deps.outbound?.backpressureRetryMs ?? 10;
+  const recentClusterDeliveryTtlMs = Math.max(staleAfterMs, 60_000);
   const setIntervalFn = deps.setIntervalFn ?? setInterval;
   const clearIntervalFn = deps.clearIntervalFn ?? clearInterval;
+  const setTimeoutFn = deps.setTimeoutFn ?? setTimeout;
+  const clearTimeoutFn = deps.clearTimeoutFn ?? clearTimeout;
   const queueMicrotaskFn = deps.queueMicrotaskFn ?? queueMicrotask;
 
   function closeCodeForError(error: HardessError): number | undefined {
@@ -125,7 +150,79 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
 
     connection.closed = true;
+    if (connection.drainTimer !== undefined) {
+      clearTimeoutFn(connection.drainTimer);
+      connection.drainTimer = undefined;
+    }
     connection.socket.close(code, reason);
+  }
+
+  function createBackpressureError(message: string, detail?: string): HardessError {
+    return new HardessError(ERROR_CODES.BACKPRESSURE_OVERFLOW, message, {
+      detail
+    });
+  }
+
+  function currentSocketBufferedAmount(connection: ConnectionState): number {
+    return connection.socket.getBufferedAmount?.() ?? 0;
+  }
+
+  function ensureSocketBufferWithinLimit(connection: ConnectionState): void {
+    const bufferedAmount = currentSocketBufferedAmount(connection);
+    if (bufferedAmount <= outboundMaxSocketBufferBytes) {
+      return;
+    }
+
+    metrics.increment("ws.egress_buffer_limit_exceeded");
+    const error = createBackpressureError("WebSocket socket buffer overflow", `buffered_amount=${bufferedAmount}`);
+    closeConnection(connection, closeCodeForError(error), error.code);
+    throw error;
+  }
+
+  function trySendNow(connection: ConnectionState, data: string): boolean {
+    ensureSocketBufferWithinLimit(connection);
+
+    let status: number | void;
+    try {
+      status = connection.socket.send(data);
+    } catch (error) {
+      metrics.increment("ws.egress_error");
+      const normalized = createBackpressureError(
+        "WebSocket outbound send failed",
+        error instanceof Error ? error.message : String(error)
+      );
+      closeConnection(connection, closeCodeForError(normalized), normalized.code);
+      throw normalized;
+    }
+
+    if (status === -1) {
+      metrics.increment("ws.egress_backpressure");
+      return false;
+    }
+
+    if (status === 0) {
+      metrics.increment("ws.egress_drop");
+      const error = createBackpressureError("WebSocket outbound send dropped by runtime");
+      closeConnection(connection, closeCodeForError(error), error.code);
+      throw error;
+    }
+
+    ensureSocketBufferWithinLimit(connection);
+    metrics.increment("ws.message_out");
+    return true;
+  }
+
+  function scheduleDrainRetry(connection: ConnectionState): void {
+    if (connection.closed || connection.drainTimer !== undefined) {
+      return;
+    }
+
+    connection.drainTimer = setTimeoutFn(() => {
+      connection.drainTimer = undefined;
+      if (connection.outboundQueue.length > 0) {
+        scheduleDrain(connection);
+      }
+    }, outboundBackpressureRetryMs);
   }
 
   function drainOutboundQueue(connection: ConnectionState): void {
@@ -140,19 +237,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       connection.outboundQueuedBytes -= next.bytes;
 
       try {
-        connection.socket.send(next.data);
-        metrics.increment("ws.message_out");
-      } catch (error) {
-        metrics.increment("ws.egress_error");
-        const normalized = new HardessError(
-          ERROR_CODES.BACKPRESSURE_OVERFLOW,
-          "WebSocket outbound send failed",
-          {
-            detail: error instanceof Error ? error.message : String(error),
-            cause: error
-          }
-        );
-        closeConnection(connection, closeCodeForError(normalized), normalized.code);
+        const sent = trySendNow(connection, next.data);
+        if (!sent) {
+          connection.outboundQueue.unshift(next);
+          connection.outboundQueuedBytes += next.bytes;
+          scheduleDrainRetry(connection);
+          break;
+        }
+      } catch {
         break;
       }
     }
@@ -175,6 +267,18 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
 
     const bytes = new TextEncoder().encode(data).byteLength;
+    const canAttemptDirectSend =
+      connection.outboundQueue.length === 0 &&
+      !connection.drainScheduled &&
+      connection.drainTimer === undefined;
+
+    if (canAttemptDirectSend) {
+      const sent = trySendNow(connection, data);
+      if (sent) {
+        return;
+      }
+    }
+
     if (
       connection.outboundQueue.length + 1 > outboundMaxQueueMessages ||
       connection.outboundQueuedBytes + bytes > outboundMaxQueueBytes
@@ -190,6 +294,9 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
     connection.outboundQueue.push({ data, bytes });
     connection.outboundQueuedBytes += bytes;
+    if (connection.drainTimer !== undefined) {
+      return;
+    }
     scheduleDrain(connection);
   }
 
@@ -213,12 +320,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         (!connection.lastPingAt || currentTime - connection.lastPingAt >= heartbeatIntervalMs)
       ) {
         connection.lastPingAt = currentTime;
-        enqueueOutbound(
-          connection,
-          serializeEnvelope(
-            createPingEnvelope(connection.socket.data.connId, crypto.randomUUID())
-          )
-        );
+        try {
+          enqueueOutbound(
+            connection,
+            serializeEnvelope(
+              createPingEnvelope(connection.socket.data.connId, crypto.randomUUID())
+            )
+          );
+        } catch {}
       }
     }
   }
@@ -229,38 +338,92 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     peerIds: string[],
     ack: AckMode = "recv"
   ): Promise<void> {
-    const plan = await deps.dispatcher.buildPlan(peerIds, {
-      streamId: envelope.streamId,
-      ack
-    });
+    const senderRef: ConnRef = {
+      nodeId: deps.nodeId,
+      connId: sender.socket.data.connId,
+      peerId: sender.auth?.peerId ?? envelope.src.peerId
+    };
 
-    if (plan.targets.length === 0) {
-      throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "No active target connections");
+    async function attemptDelivery(targetPeerIds: string[]): Promise<ConnRef[]> {
+      const plan = await deps.dispatcher.buildPlan(targetPeerIds, {
+        streamId: envelope.streamId,
+        ack
+      });
+
+      if (plan.targets.length === 0) {
+        return [];
+      }
+
+      const deliveredTargets: typeof plan.targets = [];
+      const remoteTargetsByNode = new Map<string, ConnRef[]>();
+
+      for (const target of plan.targets) {
+        if (target.nodeId !== deps.nodeId) {
+          const nodeTargets = remoteTargetsByNode.get(target.nodeId) ?? [];
+          nodeTargets.push(target);
+          remoteTargetsByNode.set(target.nodeId, nodeTargets);
+          continue;
+        }
+
+        const connection = connections.get(target.connId);
+        if (!connection?.auth) {
+          continue;
+        }
+
+        if (!(await deps.authService.isAuthContextValid(connection.auth))) {
+          continue;
+        }
+
+        deliveredTargets.push(target);
+        enqueueOutbound(
+          connection,
+          serializeEnvelope({
+            ...envelope,
+            src: {
+              peerId: sender.auth?.peerId ?? envelope.src.peerId,
+              connId: sender.socket.data.connId
+            }
+          })
+        );
+      }
+
+      for (const [nodeId, targets] of remoteTargetsByNode.entries()) {
+        if (!deps.clusterNetwork) {
+          continue;
+        }
+
+        try {
+          const delivered = await deps.clusterNetwork.deliver(nodeId, {
+            sender: senderRef,
+            envelope: {
+              ...envelope,
+              src: {
+                peerId: senderRef.peerId,
+                connId: senderRef.connId
+              }
+            },
+            ack,
+            targets
+          });
+          deliveredTargets.push(...delivered);
+        } catch (error) {
+          metrics.increment("ws.relay_error");
+          deps.logger.error("cluster relay delivery failed", {
+            nodeId,
+            traceId: envelope.traceId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      return deliveredTargets;
     }
 
-    const deliveredTargets: typeof plan.targets = [];
-
-    for (const target of plan.targets) {
-      const connection = connections.get(target.connId);
-      if (!connection?.auth) {
-        continue;
-      }
-
-      if (!(await deps.authService.isAuthContextValid(connection.auth))) {
-        continue;
-      }
-
-      deliveredTargets.push(target);
-      enqueueOutbound(
-        connection,
-        serializeEnvelope({
-          ...envelope,
-          src: {
-            peerId: sender.auth?.peerId ?? envelope.src.peerId,
-            connId: sender.socket.data.connId
-          }
-        })
-      );
+    let deliveredTargets = await attemptDelivery(peerIds);
+    if (deliveredTargets.length === 0) {
+      deps.dispatcher.invalidate(peerIds);
+      metrics.increment("ws.route_cache_retry");
+      deliveredTargets = await attemptDelivery(peerIds);
     }
 
     if (deliveredTargets.length === 0) {
@@ -268,7 +431,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
 
     if (ack !== "none") {
-      pendingHandleAckByMsgId.set(envelope.msgId, sender.socket.data.connId);
+      pendingHandleAckByMsgId.set(envelope.msgId, senderRef);
     }
 
     enqueueOutbound(
@@ -293,10 +456,18 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
   }
 
+  function pruneRecentClusterDeliveries(currentTime: number): void {
+    for (const [msgId, expiresAt] of recentClusterDeliveryByMsgId.entries()) {
+      if (expiresAt <= currentTime) {
+        recentClusterDeliveryByMsgId.delete(msgId);
+      }
+    }
+  }
+
   async function handleSystemMessage(connection: ConnectionState, envelope: Envelope<unknown>): Promise<void> {
     switch (envelope.action) {
       case "auth": {
-        const auth = await deps.authService.validateSystemAuth(envelope.payload as SysAuthPayload);
+        const auth = await deps.authService.validateSystemAuth(parseSysAuthPayload(envelope.payload));
 
         const currentConnRef = deps.peerLocator.getByConnId(connection.socket.data.connId);
         const existingPeerCount = deps.peerLocator.countConnectionsForPeer(auth.peerId);
@@ -325,15 +496,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         return;
       }
       case "ping": {
+        const payload = parseSysPingPayload(envelope.payload);
         connection.lastSeenAt = now();
         enqueueOutbound(
           connection,
           serializeEnvelope(
             createPongEnvelope(
               connection.socket.data.connId,
-              typeof envelope.payload === "object" && envelope.payload && "nonce" in envelope.payload
-                ? String((envelope.payload as { nonce?: string }).nonce ?? "")
-                : undefined,
+              payload.nonce,
               envelope.traceId
             )
           )
@@ -341,32 +511,42 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         return;
       }
       case "pong": {
+        parseSysPongPayload(envelope.payload);
         connection.lastSeenAt = now();
         connection.lastPingAt = undefined;
         return;
       }
       case "handleAck": {
-        const auth = ensureAuthenticated(connection.auth);
-        const payload = envelope.payload as { ackFor?: string } | null;
-        if (!payload?.ackFor) {
-          throw new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Missing ackFor in handleAck");
-        }
+        ensureAuthenticated(connection.auth);
+        const payload = parseSysHandleAckPayload(envelope.payload);
 
-        const senderConnId = pendingHandleAckByMsgId.get(payload.ackFor);
-        if (!senderConnId) {
+        const senderRef = pendingHandleAckByMsgId.get(payload.ackFor);
+        if (!senderRef) {
           throw new HardessError(ERROR_CODES.ROUTE_NO_RECIPIENT, "No sender found for handleAck", {
             refMsgId: payload.ackFor
           });
         }
 
-        const senderConnection = connections.get(senderConnId);
+        pendingHandleAckByMsgId.delete(payload.ackFor);
+
+        if (senderRef.nodeId !== deps.nodeId) {
+          if (!deps.clusterNetwork) {
+            throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "Sender node is unavailable", {
+              refMsgId: payload.ackFor
+            });
+          }
+
+          await deps.clusterNetwork.forwardHandleAck(senderRef, payload.ackFor, envelope.traceId);
+          return;
+        }
+
+        const senderConnection = connections.get(senderRef.connId);
         if (!senderConnection?.auth || !(await deps.authService.isAuthContextValid(senderConnection.auth))) {
           throw new HardessError(ERROR_CODES.ROUTE_PEER_OFFLINE, "Sender is offline", {
             refMsgId: payload.ackFor
           });
         }
 
-        pendingHandleAckByMsgId.delete(payload.ackFor);
         enqueueOutbound(
           senderConnection,
           serializeEnvelope(
@@ -446,6 +626,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         outboundQueue: [],
         outboundQueuedBytes: 0,
         drainScheduled: false,
+        drainTimer: undefined,
         closed: false
       });
       metrics.increment("ws.open");
@@ -504,6 +685,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
               detail: error instanceof Error ? error.message : String(error),
               cause: error
             });
+        metrics.increment(`ws.error_code.${normalized.code.toLowerCase()}`);
         socket.send(
           serializeEnvelope(
             createSysErrEnvelope(normalized, socket.data.connId, envelope.traceId, envelope.msgId)
@@ -519,16 +701,85 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       const connection = connections.get(socket.data.connId);
       if (connection) {
         connection.closed = true;
+        if (connection.drainTimer !== undefined) {
+          clearTimeoutFn(connection.drainTimer);
+          connection.drainTimer = undefined;
+        }
       }
       deps.peerLocator.unregister(socket.data.connId);
       connections.delete(socket.data.connId);
-      for (const [msgId, connId] of pendingHandleAckByMsgId.entries()) {
-        if (connId === socket.data.connId) {
+      for (const [msgId, senderRef] of pendingHandleAckByMsgId.entries()) {
+        if (senderRef.nodeId === deps.nodeId && senderRef.connId === socket.data.connId) {
           pendingHandleAckByMsgId.delete(msgId);
         }
       }
       metrics.increment("ws.close");
       deps.logger.info("websocket closed", { connId: socket.data.connId });
+    },
+    async deliverCluster(payload: {
+      sender: ConnRef;
+      envelope: Envelope<unknown>;
+      ack: AckMode;
+      targets: ConnRef[];
+    }): Promise<ConnRef[]> {
+      const currentTime = now();
+      pruneRecentClusterDeliveries(currentTime);
+      const duplicateUntil = recentClusterDeliveryByMsgId.get(payload.envelope.msgId);
+      if (duplicateUntil && duplicateUntil > currentTime) {
+        metrics.increment("ws.cluster_duplicate_delivery");
+        return payload.targets.filter((target) => target.nodeId === deps.nodeId);
+      }
+
+      const deliveredTargets: ConnRef[] = [];
+
+      for (const target of payload.targets) {
+        const connection = connections.get(target.connId);
+        if (!connection?.auth || target.nodeId !== deps.nodeId) {
+          continue;
+        }
+
+        if (!(await deps.authService.isAuthContextValid(connection.auth))) {
+          continue;
+        }
+
+        if (payload.ack !== "none") {
+          pendingHandleAckByMsgId.set(payload.envelope.msgId, payload.sender);
+        }
+
+        enqueueOutbound(
+          connection,
+          serializeEnvelope({
+            ...payload.envelope
+          })
+        );
+        deliveredTargets.push(target);
+      }
+
+      if (deliveredTargets.length > 0) {
+        recentClusterDeliveryByMsgId.set(payload.envelope.msgId, currentTime + recentClusterDeliveryTtlMs);
+      }
+
+      return deliveredTargets;
+    },
+    async forwardClusterHandleAck(payload: {
+      sender: ConnRef;
+      ackFor: string;
+      traceId?: string;
+    }): Promise<boolean> {
+      pendingHandleAckByMsgId.delete(payload.ackFor);
+
+      const senderConnection = connections.get(payload.sender.connId);
+      if (!senderConnection?.auth || !(await deps.authService.isAuthContextValid(senderConnection.auth))) {
+        return false;
+      }
+
+      enqueueOutbound(
+        senderConnection,
+        serializeEnvelope(
+          createHandleAckEnvelope("cluster", payload.ackFor, payload.traceId)
+        )
+      );
+      return true;
     },
     dispose() {
       clearIntervalFn(heartbeatTimer);

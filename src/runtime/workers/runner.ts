@@ -1,19 +1,7 @@
-import type { AuthContext, HardessWorkerResult, PipelineConfig } from "../../shared/types.ts";
+import { normalizeWorkerResult, type AuthContext, type HardessWorkerResult, type PipelineConfig } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { loadWorker } from "./loader.ts";
-
-function normalizeWorkerResult(result: Response | HardessWorkerResult | void): HardessWorkerResult {
-  if (!result) {
-    return {};
-  }
-
-  if (result instanceof Response) {
-    return { response: result };
-  }
-
-  return result;
-}
 
 export async function runWorker(
   request: Request,
