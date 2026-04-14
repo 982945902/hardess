@@ -146,4 +146,105 @@ describe("handleHttpRequest", () => {
     expect(metrics.counter("http.upstream_connect_timeout")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
   });
+
+  it("keeps response-body latency under responseTimeout instead of connectTimeout", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            await Bun.sleep(10);
+            controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true })));
+            controller.close();
+          }
+        }),
+        {
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        configStore: createConfigStoreMock({
+          pipelines: [
+            {
+              ...config.pipelines[0]!,
+              downstream: {
+                ...config.pipelines[0]!.downstream,
+                connectTimeoutMs: 5,
+                responseTimeoutMs: 20
+              }
+            }
+          ]
+        }),
+        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
+        logger: new ConsoleLogger(),
+        metrics
+      }
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(metrics.counter("http.upstream_connect_timeout")).toBe(0);
+    expect(metrics.counter("http.upstream_timeout")).toBe(0);
+    expect(metrics.counter("http.upstream_ok")).toBe(1);
+  });
+
+  it("maps upstream response timeout failures after headers are received", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            await Bun.sleep(30);
+            controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true })));
+            controller.close();
+          }
+        }),
+        {
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        configStore: createConfigStoreMock({
+          pipelines: [
+            {
+              ...config.pipelines[0]!,
+              downstream: {
+                ...config.pipelines[0]!.downstream,
+                connectTimeoutMs: 20,
+                responseTimeoutMs: 5
+              }
+            }
+          ]
+        }),
+        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
+        logger: new ConsoleLogger(),
+        metrics
+      }
+    );
+
+    expect(response.status).toBe(504);
+    expect(metrics.counter("http.upstream_connect_timeout")).toBe(0);
+    expect(metrics.counter("http.upstream_timeout")).toBe(1);
+    expect(metrics.counter("http.error")).toBe(1);
+  });
 });

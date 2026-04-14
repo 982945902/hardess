@@ -21,7 +21,16 @@ export async function runWorker(
   const ctx = {
     waitUntil(promise: Promise<unknown>) {
       pending.add(promise);
-      void promise.finally(() => pending.delete(promise));
+      void promise
+        .catch((error) => {
+          metrics.increment("worker.wait_until_error");
+          logger.error("worker waitUntil failed", {
+            traceId,
+            pipelineId: pipeline.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        })
+        .finally(() => pending.delete(promise));
     }
   };
 

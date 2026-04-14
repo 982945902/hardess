@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthContext, PipelineConfig } from "../../shared/types.ts";
 import { ConsoleLogger } from "../observability/logger.ts";
+import { InMemoryMetrics } from "../observability/metrics.ts";
 import { runWorker } from "./runner.ts";
 
 const cleanupPaths: string[] = [];
@@ -90,5 +91,56 @@ describe("runWorker", () => {
         new ConsoleLogger()
       )
     ).rejects.toThrow("Worker returned an invalid result");
+  });
+
+  it("logs and swallows waitUntil rejections", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-worker-wait-until-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "wait-until-worker.ts");
+    await writeFile(
+      workerPath,
+      `export default {
+        fetch(_request, _env, ctx) {
+          ctx.waitUntil(Promise.reject(new Error("background failed")));
+          return {
+            response: new Response("ok")
+          };
+        }
+      };`
+    );
+
+    const testPipeline: PipelineConfig = {
+      ...pipeline,
+      worker: {
+        entry: workerPath,
+        timeoutMs: 100
+      }
+    };
+    const logger = {
+      info: mock(() => {}),
+      warn: mock(() => {}),
+      error: mock(() => {})
+    };
+    const metrics = new InMemoryMetrics();
+
+    const result = await runWorker(
+      new Request("http://localhost/demo"),
+      auth,
+      testPipeline,
+      "trace-wait-until",
+      logger,
+      metrics
+    );
+
+    await Promise.resolve();
+
+    expect(result.response?.status).toBe(200);
+    expect(metrics.counter("worker.wait_until_error")).toBe(1);
+    expect(logger.error).toHaveBeenCalledWith("worker waitUntil failed", {
+      traceId: "trace-wait-until",
+      pipelineId: "demo-http",
+      error: "background failed"
+    });
   });
 });

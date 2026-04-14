@@ -206,6 +206,8 @@ HTTP proxy contract:
 3. Runtime-owned request headers include authoritative auth/trace metadata injected by Hardess.
 4. Request body is buffered in MVP; streaming proxy is out of scope for the first version.
 5. Proxy forwarding uses explicit connect timeout and upstream response timeout.
+   - `connectTimeoutMs` applies until Hardess gets the upstream response.
+   - `responseTimeoutMs` applies while reading the upstream response body after headers are available.
 6. Upstream response status/body/headers are returned to caller unless worker short-circuits first.
 7. Upstream network failures are mapped to platform-defined gateway error codes.
 8. `AuthContext` may be propagated upstream through Hardess-owned headers rather than reusing the client bearer token directly.
@@ -731,6 +733,11 @@ Execution flow:
 9. Hardess builds `DeliveryPlan` and dispatches over WebSocket.
 10. Receiver SDK decodes and handles the inbound business message.
 
+Fanout behavior notes:
+1. Delivery is best-effort per resolved target connection.
+2. If at least one target transport path accepts the message, sender-side delivery continues with `sys.route` plus the configured ack mode.
+3. Partial target failures should be logged and surfaced through `deliveredConns`; they should not retroactively turn an already-accepted fanout into a sender-visible hard failure.
+
 ### 8.5 End-to-End Flow
 ```mermaid
 sequenceDiagram
@@ -845,6 +852,7 @@ Failure handling:
 3. Config/worker reload only affects new requests; in-flight requests continue on the version they started with.
 4. Invalid updated worker/config keeps the previous active version.
 5. MVP worker execution remains in the same Bun process; fault containment is contractually provided by timeout, exception capture, and non-shared request context rather than process isolation.
+6. `waitUntil()` side effects should be logged and metered on failure, but they must not surface as unhandled promise rejections or retroactively fail the completed request.
 
 Future hardening:
 1. better isolate boundaries for fault containment

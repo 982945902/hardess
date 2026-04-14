@@ -21,6 +21,10 @@ HTTP / process:
 - `SHUTDOWN_DRAIN_MS`: time to stay not-ready before stopping the server, default `250`
 - `SHUTDOWN_TIMEOUT_MS`: hard stop timeout, default `10000`
 
+HTTP proxy timeout semantics:
+- `connectTimeoutMs`: budget until Hardess gets the upstream response
+- `responseTimeoutMs`: budget to read the upstream response body after headers are available
+
 WebSocket ingress / egress:
 
 - `WS_HEARTBEAT_INTERVAL_MS`: heartbeat interval
@@ -103,6 +107,8 @@ Recommended minimum checks:
 - readiness must be `200` before receiving traffic
 - readiness must flip to `503` before process exit during graceful shutdown
 - monitor `http.error`, `http.upstream_timeout`, `http.upstream_unavailable`, `worker.run_error`, `ws.error`, `ws.egress_backpressure`, `ws.heartbeat_timeout`
+- when debugging worker side effects, also inspect `worker.wait_until_error`
+- when debugging best-effort fanout behavior, inspect `ws.partial_delivery` and `ws.delivery_target_error`
 - when debugging websocket failures, also inspect per-code counters such as `ws.error_code.route_no_recipient` or `ws.error_code.route_peer_offline`
 
 External observability bootstrap:

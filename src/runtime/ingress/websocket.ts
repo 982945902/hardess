@@ -362,6 +362,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
       const deliveredTargets: typeof plan.targets = [];
       const remoteTargetsByNode = new Map<string, ConnRef[]>();
+      let targetFailures = 0;
 
       for (const target of plan.targets) {
         if (target.nodeId !== deps.nodeId) {
@@ -380,17 +381,30 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
           continue;
         }
 
-        deliveredTargets.push(target);
-        enqueueOutbound(
-          connection,
-          serializeEnvelope({
-            ...envelope,
-            src: {
-              peerId: sender.auth?.peerId ?? envelope.src.peerId,
-              connId: sender.socket.data.connId
-            }
-          })
-        );
+        try {
+          enqueueOutbound(
+            connection,
+            serializeEnvelope({
+              ...envelope,
+              src: {
+                peerId: sender.auth?.peerId ?? envelope.src.peerId,
+                connId: sender.socket.data.connId
+              }
+            })
+          );
+          deliveredTargets.push(target);
+        } catch (error) {
+          targetFailures += 1;
+          metrics.increment("ws.delivery_target_error");
+          deps.logger.warn("local websocket delivery failed", {
+            traceId: envelope.traceId,
+            msgId: envelope.msgId,
+            targetNodeId: target.nodeId,
+            targetConnId: target.connId,
+            targetPeerId: target.peerId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
       }
 
       for (const [nodeId, targets] of remoteTargetsByNode.entries()) {
@@ -413,13 +427,27 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
           });
           deliveredTargets.push(...delivered);
         } catch (error) {
+          targetFailures += targets.length;
           metrics.increment("ws.relay_error");
           deps.logger.error("cluster relay delivery failed", {
             nodeId,
+            msgId: envelope.msgId,
             traceId: envelope.traceId,
             error: error instanceof Error ? error.message : String(error)
           });
         }
+      }
+
+      if (deliveredTargets.length > 0 && targetFailures > 0) {
+        metrics.increment("ws.partial_delivery");
+        deps.logger.warn("websocket fanout partially delivered", {
+          msgId: envelope.msgId,
+          traceId: envelope.traceId,
+          resolvedPeerCount: targetPeerIds.length,
+          plannedTargetCount: plan.targets.length,
+          deliveredTargetCount: deliveredTargets.length,
+          failedTargetCount: targetFailures
+        });
       }
 
       return deliveredTargets;
