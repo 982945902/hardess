@@ -20,6 +20,7 @@ HTTP / process:
 - `CONFIG_MODULE_PATH`: config module path, default `./config/hardess.config.ts`
 - `SHUTDOWN_DRAIN_MS`: time to stay not-ready before stopping the server, default `250`
 - `SHUTDOWN_TIMEOUT_MS`: hard stop timeout, default `10000`
+- `WS_SHUTDOWN_GRACE_MS`: websocket drain grace after shutdown starts, default `3000`
 
 HTTP proxy timeout semantics:
 - `connectTimeoutMs`: budget until Hardess gets the upstream response
@@ -106,6 +107,7 @@ Recommended minimum checks:
 
 - readiness must be `200` before receiving traffic
 - readiness must flip to `503` before process exit during graceful shutdown
+- websocket upgrades should stop once readiness drops, while existing websocket sessions should only keep protocol-level shutdown cleanup such as `pong` / `handleAck`
 - monitor `http.error`, `http.upstream_timeout`, `http.upstream_unavailable`, `worker.run_error`, `ws.error`, `ws.egress_backpressure`, `ws.heartbeat_timeout`
 - when debugging worker side effects, also inspect `worker.wait_until_error`
 - when debugging best-effort fanout behavior, inspect `ws.partial_delivery` and `ws.delivery_target_error`

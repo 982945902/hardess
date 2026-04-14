@@ -39,8 +39,15 @@ function counterDelta(current: MetricsSnapshot, previous: MetricsSnapshot, name:
 
 function appendedTimings(current: MetricsSnapshot, previous: MetricsSnapshot, name: string): number[] {
   const currentValues = current.timings[name] ?? [];
-  const previousValues = previous.timings[name] ?? [];
-  return currentValues.slice(previousValues.length);
+  const currentCount = current.timingCounts[name] ?? currentValues.length;
+  const previousCount = previous.timingCounts[name] ?? (previous.timings[name] ?? []).length;
+  const appendedCount = currentCount - previousCount;
+
+  if (appendedCount <= 0) {
+    return [];
+  }
+
+  return currentValues.slice(Math.max(0, currentValues.length - appendedCount));
 }
 
 export class MetricsAlertMonitor {

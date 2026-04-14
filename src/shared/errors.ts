@@ -1,5 +1,5 @@
-import { ERROR_CODES, type ErrorCode } from "./codes.ts";
-import type { PlatformErrorBody, SysErrPayload } from "./types.ts";
+import { type ClientErrorCode, type ErrorCode, type SdkErrorCode, ERROR_CODES } from "./codes.ts";
+import type { ClientCloseInfo, HardessSdkErrorShape, PlatformErrorBody, SysErrPayload } from "./types.ts";
 
 const STATUS_BY_CODE: Record<ErrorCode, number> = {
   [ERROR_CODES.AUTH_INVALID_TOKEN]: 401,
@@ -15,6 +15,7 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   [ERROR_CODES.ROUTE_NO_RECIPIENT]: 404,
   [ERROR_CODES.ROUTE_PEER_OFFLINE]: 404,
   [ERROR_CODES.ROUTE_DELIVERY_TIMEOUT]: 504,
+  [ERROR_CODES.SERVER_DRAINING]: 503,
   [ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT]: 504,
   [ERROR_CODES.GATEWAY_UPSTREAM_UNAVAILABLE]: 503,
   [ERROR_CODES.INTERNAL_ERROR]: 500
@@ -45,6 +46,40 @@ export class HardessError extends Error {
     this.status = options.status ?? STATUS_BY_CODE[code];
     this.detail = options.detail;
     this.refMsgId = options.refMsgId;
+  }
+}
+
+export class HardessSdkError extends Error implements HardessSdkErrorShape {
+  readonly code: SdkErrorCode;
+  readonly source: "client" | "remote";
+  readonly retryable: boolean;
+  readonly traceId?: string;
+  readonly refMsgId?: string;
+  readonly detail?: unknown;
+  readonly close?: ClientCloseInfo;
+
+  constructor(
+    code: SdkErrorCode,
+    message: string,
+    options: {
+      source: "client" | "remote";
+      retryable?: boolean;
+      traceId?: string;
+      refMsgId?: string;
+      detail?: unknown;
+      close?: ClientCloseInfo;
+      cause?: unknown;
+    }
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "HardessSdkError";
+    this.code = code;
+    this.source = options.source;
+    this.retryable = options.retryable ?? false;
+    this.traceId = options.traceId;
+    this.refMsgId = options.refMsgId;
+    this.detail = options.detail;
+    this.close = options.close;
   }
 }
 
@@ -102,5 +137,38 @@ export function asHardessError(error: unknown): HardessError {
   return new HardessError(ERROR_CODES.INTERNAL_ERROR, "Unexpected internal error", {
     detail: error instanceof Error ? error.message : String(error),
     cause: error
+  });
+}
+
+export function createClientSdkError(
+  code: ClientErrorCode,
+  message: string,
+  options: {
+    retryable?: boolean;
+    traceId?: string;
+    refMsgId?: string;
+    detail?: unknown;
+    close?: ClientCloseInfo;
+    cause?: unknown;
+  } = {}
+): HardessSdkError {
+  return new HardessSdkError(code, message, {
+    source: "client",
+    retryable: options.retryable,
+    traceId: options.traceId,
+    refMsgId: options.refMsgId,
+    detail: options.detail,
+    close: options.close,
+    cause: options.cause
+  });
+}
+
+export function createRemoteSdkError(payload: SysErrPayload): HardessSdkError {
+  return new HardessSdkError(payload.code, payload.message, {
+    source: "remote",
+    retryable: payload.retryable,
+    traceId: payload.traceId,
+    refMsgId: payload.refMsgId,
+    detail: payload.detail
   });
 }

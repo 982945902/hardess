@@ -61,6 +61,9 @@ describe("load env helpers", () => {
           },
           timings: {
             http: [1, 2, 3]
+          },
+          timingCounts: {
+            http: 3
           }
         }
       })
@@ -70,6 +73,9 @@ describe("load env helpers", () => {
       },
       timings: {
         http: [1, 2, 3]
+      },
+      timingCounts: {
+        http: 3
       }
     });
 

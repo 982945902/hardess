@@ -52,6 +52,79 @@ Clean runtime-generated shadow files:
 bun run clean
 ```
 
+## SDK Quick Start
+
+Recommended client flow:
+
+1. `connect(...)`
+2. `waitUntilReady()`
+3. `send(...)` or `emitTracked(...)`
+4. branch on structured SDK errors instead of parsing error strings
+
+Example:
+
+```ts
+import {
+  CLIENT_ERROR_CODES,
+  ERROR_CODES,
+  HardessClient,
+  type HardessSdkErrorShape
+} from "./src/sdk/index.ts";
+
+const client = new HardessClient("ws://127.0.0.1:3000/ws", {
+  systemHandlers: {
+    onClose(info) {
+      console.log("ws closed", info);
+    },
+    onDeliveryEvent(event) {
+      if (event.sdkError) {
+        console.log("delivery failed", event.sdkError.code, event.sdkError.source);
+      }
+    }
+  }
+});
+
+client.connect("demo:alice");
+await client.waitUntilReady();
+
+try {
+  await client.send({
+    protocol: "demo",
+    version: "1.0",
+    action: "send",
+    payload: {
+      toPeerId: "bob",
+      content: "hello"
+    }
+  });
+} catch (error) {
+  const sdkError = error as Partial<HardessSdkErrorShape>;
+
+  if (sdkError.code === CLIENT_ERROR_CODES.CLIENT_NOT_READY) {
+    // local client state is not ready yet; wait for auth.ok or reconnect
+  } else if (sdkError.code === CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED) {
+    // transport closed before ack completed; usually safe to retry after reconnect
+  } else if (sdkError.code === CLIENT_ERROR_CODES.CLIENT_DELIVERY_TIMEOUT) {
+    // sender-side timeout waiting for recvAck / handleAck
+  } else if (sdkError.code === ERROR_CODES.SERVER_DRAINING) {
+    // remote node is draining; retry on another healthy node / after reconnect
+  } else if (sdkError.code === ERROR_CODES.ROUTE_PEER_OFFLINE) {
+    // remote peer is currently offline
+  }
+
+  throw error;
+}
+
+client.close();
+```
+
+SDK behavior notes:
+
+- business sends should start after `sys.auth.ok`; use `waitUntilReady()` instead of assuming `WebSocket open` is enough
+- `send(...)` rejects with a structured SDK error carrying `code`, `source`, and `retryable`
+- pending tracked sends fail immediately on transport close, including shutdown-driven `1001 / server shutting down`
+- server-side `sys.err` surfaces as `source="remote"`; SDK-local state failures surface as `source="client"`
+
 ## Docs
 
 - [Local demo walkthrough](docs/local-demo.md)

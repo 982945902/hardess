@@ -1,5 +1,8 @@
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
 import {
+  CLIENT_ERROR_CODES,
+  createClientSdkError,
+  createRemoteSdkError,
   type ClientAwaitableDeliveryStage,
   type ClientDeliveryEvent,
   type ClientDeliveryTimeoutPolicy,
@@ -75,6 +78,14 @@ interface PendingDelivery {
   completed: boolean;
 }
 
+interface ReadyWaiter {
+  resolve(): void;
+  reject(error: Error): void;
+  timer?: TimeoutHandle;
+}
+
+type ClientReadyState = "idle" | "connecting" | "authenticating" | "ready" | "closed";
+
 export class HardessClient {
   private readonly registry = new ClientProtocolRegistry();
   private readonly transport: WebSocketTransport;
@@ -91,6 +102,8 @@ export class HardessClient {
   private heartbeatTimer?: IntervalHandle;
   private token?: string;
   private readonly pendingDeliveries = new Map<string, PendingDelivery>();
+  private readonly readyWaiters = new Set<ReadyWaiter>();
+  private readyState: ClientReadyState = "idle";
 
   constructor(
     private readonly websocketUrl: string,
@@ -126,13 +139,28 @@ export class HardessClient {
 
   connect(token: string): void {
     this.token = token;
+    this.readyState = "connecting";
     this.transport.connect(this.websocketUrl, {
       onOpen: () => {
+        this.readyState = "authenticating";
         this.sendAuth(token);
         this.startHeartbeat();
       },
       onClose: (info) => {
         this.stopHeartbeat();
+        this.readyState = this.token ? "connecting" : "closed";
+        this.failPendingDeliveriesOnClose(info);
+        if (isTerminalClientClose(info)) {
+          this.rejectReadyWaiters(
+            createClientSdkError(
+              CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+              `Client failed to become ready${this.formatCloseSuffix(info)}`,
+              {
+                close: info
+              }
+            )
+          );
+        }
         this.systemHandlers.onClose?.(info);
       },
       onMessage: (raw) => {
@@ -165,6 +193,7 @@ export class HardessClient {
   }
 
   emit(input: ClientEmitInput): void {
+    this.ensureReady();
     const { envelope, msgId, traceId } = this.createBusinessEnvelope(input);
     this.createPendingDelivery(msgId, traceId, input);
     this.transport.send(serializeEnvelope(envelope));
@@ -176,10 +205,15 @@ export class HardessClient {
       until?: ClientAwaitableDeliveryStage;
     }
   ): Promise<ClientDeliveryEvent> {
-    return this.emitTracked(input).waitForResult(options);
+    try {
+      return this.emitTracked(input).waitForResult(options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   emitTracked(input: ClientEmitInput): ClientSendTracker {
+    this.ensureReady();
     const { envelope, msgId, traceId } = this.createBusinessEnvelope(input);
     const pending = this.createPendingDelivery(msgId, traceId, input);
     this.transport.send(serializeEnvelope(envelope));
@@ -200,15 +234,82 @@ export class HardessClient {
 
   close(): void {
     this.stopHeartbeat();
+    this.readyState = "closed";
+    this.token = undefined;
+    this.rejectReadyWaiters(
+      createClientSdkError(CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED, "Client closed before becoming ready", {
+        close: {
+          reason: "client closed"
+        }
+      })
+    );
     for (const pending of this.pendingDeliveries.values()) {
       this.clearPendingTimers(pending);
-      const error = new Error("Client closed before delivery completed");
+      const error = createClientSdkError(
+        CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+        "Client closed before delivery completed",
+        {
+          close: {
+            reason: "client closed"
+          }
+        }
+      );
       this.markPendingStageFailure(pending, "recvAck", error);
       this.markPendingStageFailure(pending, "handleAck", error);
-      this.rejectPendingWaiters(pending, new Error("Client closed before delivery completed"));
+      this.rejectPendingWaiters(pending, error);
     }
     this.pendingDeliveries.clear();
     this.transport.close();
+  }
+
+  isReady(): boolean {
+    return this.readyState === "ready";
+  }
+
+  waitUntilReady(options: {
+    timeoutMs?: number;
+  } = {}): Promise<void> {
+    if (this.isReady()) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const waiter: ReadyWaiter = {
+        resolve: () => {
+          if (waiter.timer !== undefined) {
+            this.timerApi.clearTimeout(waiter.timer);
+          }
+          this.readyWaiters.delete(waiter);
+          resolve();
+        },
+        reject: (error) => {
+          if (waiter.timer !== undefined) {
+            this.timerApi.clearTimeout(waiter.timer);
+          }
+          this.readyWaiters.delete(waiter);
+          reject(error);
+        }
+      };
+
+      if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+        waiter.timer = this.timerApi.setTimeout(() => {
+          waiter.reject(
+            createClientSdkError(
+              CLIENT_ERROR_CODES.CLIENT_NOT_READY,
+              `Timed out waiting for client readiness after ${options.timeoutMs}ms`,
+              {
+                retryable: true,
+                detail: {
+                  timeoutMs: options.timeoutMs
+                }
+              }
+            )
+          );
+        }, options.timeoutMs);
+      }
+
+      this.readyWaiters.add(waiter);
+    });
   }
 
   ackHandled(msgId: string, traceId?: string): void {
@@ -344,6 +445,8 @@ export class HardessClient {
     switch (envelope.action) {
       case "auth.ok": {
         const payload = parseSysAuthOkPayload(envelope.payload);
+        this.readyState = "ready";
+        this.resolveReadyWaiters();
         this.systemHandlers.onAuthOk?.(payload);
         return;
       }
@@ -412,7 +515,8 @@ export class HardessClient {
             stage: "error",
             msgId,
             traceId: envelope.traceId,
-            error: payload
+            error: payload,
+            sdkError: createRemoteSdkError(payload)
           });
         }
         return;
@@ -579,6 +683,7 @@ export class HardessClient {
         pending.completed = true;
         return;
       case "handleAckTimeout":
+      case "transportClosed":
       case "error":
       case "protocolError": {
         const error = this.deliveryFailureError(normalizedEvent);
@@ -617,15 +722,92 @@ export class HardessClient {
     switch (event.stage) {
       case "recvAckTimeout":
       case "handleAckTimeout":
-        return new Error(
-          `Timed out waiting for ${event.timeout?.stage ?? "delivery"} after ${event.timeout?.timeoutMs ?? 0}ms`
+        return createClientSdkError(
+          CLIENT_ERROR_CODES.CLIENT_DELIVERY_TIMEOUT,
+          `Timed out waiting for ${event.timeout?.stage ?? "delivery"} after ${event.timeout?.timeoutMs ?? 0}ms`,
+          {
+            retryable: true,
+            traceId: event.traceId,
+            refMsgId: event.msgId,
+            detail: event.timeout
+          }
         );
+      case "transportClosed":
+        return event.sdkError instanceof Error
+          ? event.sdkError
+          : createClientSdkError(
+              CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+              `Transport closed before delivery completed${this.formatCloseSuffix(event.close)}`,
+              {
+                retryable: true,
+                traceId: event.traceId,
+                refMsgId: event.msgId,
+                close: event.close
+              }
+            );
       case "error":
-        return new Error(event.error?.message ?? "Delivery failed");
+        return event.sdkError instanceof Error
+          ? event.sdkError
+          : createClientSdkError(
+              CLIENT_ERROR_CODES.CLIENT_PROTOCOL_ERROR,
+              event.error?.message ?? "Delivery failed",
+              {
+                traceId: event.traceId,
+                refMsgId: event.msgId,
+                detail: event.error
+              }
+            );
       case "protocolError":
-        return new Error(event.protocolError?.message ?? "Protocol error");
+        return createClientSdkError(
+          CLIENT_ERROR_CODES.CLIENT_PROTOCOL_ERROR,
+          event.protocolError?.message ?? "Protocol error",
+          {
+            traceId: event.traceId,
+            refMsgId: event.msgId,
+            detail: event.protocolError
+          }
+        );
       default:
-        return new Error(`Unexpected delivery failure stage: ${event.stage}`);
+        return createClientSdkError(
+          CLIENT_ERROR_CODES.CLIENT_PROTOCOL_ERROR,
+          `Unexpected delivery failure stage: ${event.stage}`,
+          {
+            traceId: event.traceId,
+            refMsgId: event.msgId,
+            detail: {
+              stage: event.stage
+            }
+          }
+        );
+    }
+  }
+
+  private failPendingDeliveriesOnClose(info: { code?: number; reason?: string; wasClean?: boolean }): void {
+    for (const pending of this.pendingDeliveries.values()) {
+      this.emitDeliveryEvent({
+        stage: "transportClosed",
+        msgId: pending.msgId,
+        traceId: pending.traceId,
+        close: {
+          code: info.code,
+          reason: info.reason,
+          wasClean: info.wasClean
+        },
+        sdkError: createClientSdkError(
+          CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+          `Transport closed before delivery completed${this.formatCloseSuffix(info)}`,
+          {
+            retryable: true,
+            traceId: pending.traceId,
+            refMsgId: pending.msgId,
+            close: {
+              code: info.code,
+              reason: info.reason,
+              wasClean: info.wasClean
+            }
+          }
+        )
+      });
     }
   }
 
@@ -781,6 +963,7 @@ export class HardessClient {
     switch (event.stage) {
       case "error":
       case "protocolError":
+      case "transportClosed":
       case "handleAckTimeout":
         return true;
       case "recvAckTimeout":
@@ -788,5 +971,53 @@ export class HardessClient {
       default:
         return false;
     }
+  }
+
+  private ensureReady(): void {
+    if (this.readyState === "ready") {
+      return;
+    }
+
+    throw createClientSdkError(
+      CLIENT_ERROR_CODES.CLIENT_NOT_READY,
+      `Client is not ready; wait for auth.ok before sending (state: ${this.readyState})`,
+      {
+        retryable: true,
+        detail: {
+          state: this.readyState
+        }
+      }
+    );
+  }
+
+  private resolveReadyWaiters(): void {
+    for (const waiter of Array.from(this.readyWaiters)) {
+      waiter.resolve();
+    }
+  }
+
+  private rejectReadyWaiters(error: Error): void {
+    for (const waiter of Array.from(this.readyWaiters)) {
+      waiter.reject(error);
+    }
+  }
+
+  private formatCloseSuffix(info?: { code?: number; reason?: string }): string {
+    return (info?.code !== undefined ? ` (code ${info.code}` : "") +
+      (info?.reason ? `${info.code !== undefined ? ", " : " ("}reason ${info.reason}` : "") +
+      (info?.code !== undefined || info?.reason ? ")" : "");
+  }
+}
+
+function isTerminalClientClose(info: { code?: number }): boolean {
+  switch (info.code) {
+    case 4400:
+    case 4401:
+    case 4403:
+    case 4429:
+    case 4508:
+      return true;
+    default:
+      return false;
   }
 }

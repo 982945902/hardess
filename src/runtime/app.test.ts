@@ -143,7 +143,8 @@ describe("createRuntimeApp", () => {
     expect(metrics?.status).toBe(200);
     expect((await metrics?.json())?.metrics).toEqual({
       counters: {},
-      timings: {}
+      timings: {},
+      timingCounts: {}
     });
     expect(prometheus?.status).toBe(200);
     expect(prometheus?.headers.get("content-type")).toContain("text/plain");
@@ -182,6 +183,75 @@ describe("createRuntimeApp", () => {
 
     expect(ready?.status).toBe(503);
     expect(response?.status).toBe(503);
+  });
+
+  it("rejects websocket upgrades during shutdown", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+    app.beginShutdown();
+
+    const response = await app.fetch(
+      new Request("http://localhost/ws"),
+      {
+        upgrade() {
+          return true;
+        }
+      }
+    );
+
+    expect(response?.status).toBe(503);
+  });
+
+  it("waits for in-flight http requests to drain during shutdown", async () => {
+    let releaseUpstream!: () => void;
+    globalThis.fetch = mock(async () => {
+      await new Promise<void>((resolve) => {
+        releaseUpstream = resolve;
+      });
+
+      return Response.json({
+        ok: true
+      });
+    }) as unknown as typeof fetch;
+
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+
+    const requestPromise = app.fetch(
+      new Request("http://localhost/demo/slow", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
+
+    while (app.runtimeState().inFlightHttpRequests !== 1) {
+      await Bun.sleep(1);
+    }
+
+    app.beginShutdown();
+
+    const drainedBeforeRelease = await app.waitForHttpDrain({ timeoutMs: 5, pollIntervalMs: 1 });
+    expect(drainedBeforeRelease).toBe(false);
+
+    releaseUpstream();
+    const response = await requestPromise;
+    const drained = await app.waitForHttpDrain({ timeoutMs: 50, pollIntervalMs: 1 });
+
+    expect(response?.status).toBe(200);
+    expect(drained).toBe(true);
+    expect(app.runtimeState().inFlightHttpRequests).toBe(0);
   });
 
   it("applies reloaded config to new requests", async () => {

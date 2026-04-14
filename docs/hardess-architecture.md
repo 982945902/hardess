@@ -63,7 +63,7 @@ Implemented in repository:
 11. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
 12. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/internal HTTP/admin response validation, business protocol payloads, and worker result validation.
 13. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
-14. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
+14. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, immediate tracked-send failure on transport close, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
 15. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
 
 Implementation checklist by module:
@@ -443,6 +443,7 @@ Rules:
 1. Error codes are stable protocol contracts; `message` is human-readable but non-contractual.
 2. WebSocket close reasons should map to the same auth/error code family where applicable.
 3. HTTP proxy failures and WebSocket runtime failures share the same error code namespace when they originate from the same platform concern.
+4. SDK-local failures should still reuse shared definitions, but they should be a separate client-facing error family instead of leaking every internal runtime detail to application code.
 
 Default WebSocket close mapping (current baseline):
 1. `4400` -> invalid protocol payload
@@ -456,8 +457,9 @@ Client handling notes:
 1. Terminal server close codes such as `4400`, `4401`, `4403`, `4429`, and `4508` should not trigger automatic reconnect by default.
 2. Non-terminal closes such as heartbeat timeout may still use reconnect policy.
 3. Clients should surface `code` and `reason` to application handlers even when a preceding `sys.err` was already observed.
-4. `onTransportError` is reserved for transport/socket failures; protocol decoding or validation failures should use a distinct protocol-error surface instead of being merged into transport semantics.
-5. Sender-side control-path failures must not be silent: malformed `sys.route`, `sys.recvAck`, `sys.handleAck`, `sys.err`, or other control-plane messages must still be surfaced to the sender SDK as protocol errors even when the connection stays open.
+4. Pending sender-side waits should fail immediately on transport close instead of waiting for delivery timeout, especially during graceful shutdown or reconnect churn.
+5. `onTransportError` is reserved for transport/socket failures; protocol decoding or validation failures should use a distinct protocol-error surface instead of being merged into transport semantics.
+6. Sender-side control-path failures must not be silent: malformed `sys.route`, `sys.recvAck`, `sys.handleAck`, `sys.err`, or other control-plane messages must still be surfaced to the sender SDK as protocol errors even when the connection stays open.
 
 ### 7.2.3 Shared Error Response Shape
 HTTP and WebSocket share one platform error body shape even though the transport framing differs.
@@ -648,6 +650,8 @@ Client error-surface rules:
 3. Envelope / system / business protocol decoding or validation failures use `onProtocolError`.
 4. Receiver-side business payload failures may be handled more loosely than sender-side control-path failures, but they should still have a local protocol-error surface when the SDK detects them.
 5. Sender-side delivery progression should support both a global event stream (`onDeliveryEvent`) and per-message correlation, so application code can choose between centralized observability and request-scoped control flow.
+6. Client send readiness should be explicit: business sends should only start after `sys.auth.ok`, and SDK callers should have a clear ready gate instead of inferring readiness from transport `open`.
+7. SDK promise rejections should prefer one structured client-facing error contract with `code`, `source`, and `retryable`, so application code can branch on intent instead of parsing error strings.
 
 Delivery-correlation notes:
 1. The SDK should preserve both forms:
@@ -661,6 +665,7 @@ Delivery-correlation notes:
 5. Even fire-and-forget `emit(...)` should still enter the sender-side delivery tracking path for global observability, while `emitTracked(...)` layers request-scoped waiting/subscription on top of that same underlying correlation table.
 6. The SDK should also expose a higher-level await form on top of tracked sends, such as `waitForResult()` or `client.send(...)`, so common business code can say "send and wait until recvAck/handleAck" without manually sequencing multiple low-level waits.
 7. That higher-level await form should fail fast on sender-visible failures, including early `recvAck` timeout, instead of waiting for a later stage timeout just because the target stage was `handleAck`.
+8. Business sends issued before readiness should fail fast instead of being implicitly queued behind auth, so application code is forced onto an explicit `waitUntilReady()` or equivalent gate.
 
 ### 8.3 Server Protocol Hook Contract
 Business recipient resolution runs inside Hardess, not inside the client SDK.

@@ -1,7 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { Logger } from "./logger.ts";
 import { MetricsAlertMonitor } from "./alerts.ts";
-import { InMemoryMetrics } from "./metrics.ts";
+import { InMemoryMetrics, WindowedMetrics } from "./metrics.ts";
 
 function createLogger() {
   return {
@@ -66,6 +66,39 @@ describe("MetricsAlertMonitor", () => {
         alert: "http.request_p99_high",
         metric: "http.request_ms",
         observedP99Ms: 75
+      })
+    );
+  });
+
+  it("keeps timing alerts accurate after the windowed buffer rolls over", () => {
+    const metrics = new WindowedMetrics(2);
+    const logger = createLogger();
+    const monitor = new MetricsAlertMonitor({
+      metrics,
+      logger,
+      windowMs: 30_000,
+      thresholds: {
+        httpRequestP99Ms: 50
+      }
+    });
+
+    metrics.timing("http.request_ms", 10);
+    metrics.timing("http.request_ms", 20);
+    monitor.check();
+    expect(logger.warn).toHaveBeenCalledTimes(0);
+
+    metrics.timing("http.request_ms", 70);
+    metrics.timing("http.request_ms", 80);
+    monitor.check();
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "runtime metrics alert",
+      expect.objectContaining({
+        alert: "http.request_p99_high",
+        metric: "http.request_ms",
+        observedP99Ms: 80,
+        sampleCount: 2
       })
     );
   });

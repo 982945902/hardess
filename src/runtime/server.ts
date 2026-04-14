@@ -91,6 +91,7 @@ function hasAlertThresholds(thresholds: MetricsAlertThresholds): boolean {
 
 try {
   const { sink: metrics, mode: metricsMode } = createMetricsSink();
+  const websocketShutdownGraceMs = envNumber("WS_SHUTDOWN_GRACE_MS") ?? 3_000;
   const app = await createRuntimeApp({
     configModulePath: processEnv.CONFIG_MODULE_PATH,
     nodeId: envString("NODE_ID") ?? "local",
@@ -126,7 +127,8 @@ try {
             maxSocketBufferBytes: envNumber("WS_OUTBOUND_MAX_SOCKET_BUFFER_BYTES") ?? 512 * 1024,
             backpressureRetryMs: envNumber("WS_OUTBOUND_BACKPRESSURE_RETRY_MS") ?? 10
           }
-        : undefined
+        : undefined,
+      shutdownGraceMs: websocketShutdownGraceMs
     }
   });
 
@@ -183,7 +185,8 @@ try {
     app.logger.info("hardess runtime shutting down", {
       signal,
       gracefulShutdownTimeoutMs,
-      shutdownDrainMs
+      shutdownDrainMs,
+      websocketShutdownGraceMs
     });
 
     const forceStopTimer = setTimeout(() => {
@@ -194,6 +197,16 @@ try {
     try {
       if (shutdownDrainMs > 0) {
         await sleep(shutdownDrainMs);
+      }
+      const drained = await app.waitForHttpDrain({
+        timeoutMs: Math.max(0, gracefulShutdownTimeoutMs - shutdownDrainMs),
+        pollIntervalMs: 25
+      });
+      if (!drained) {
+        app.logger.warn("hardess runtime drain deadline reached", {
+          signal,
+          inFlightHttpRequests: app.runtimeState().inFlightHttpRequests
+        });
       }
       await server.stop();
       app.logger.info("hardess runtime stopped", { signal });

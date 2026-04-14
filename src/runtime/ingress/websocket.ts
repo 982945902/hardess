@@ -79,6 +79,7 @@ export interface WebSocketRuntimeDeps {
     maxSocketBufferBytes?: number;
     backpressureRetryMs?: number;
   };
+  shutdownGraceMs?: number;
   now?: () => number;
   setIntervalFn?: SetIntervalLike;
   clearIntervalFn?: ClearIntervalLike;
@@ -113,12 +114,15 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const outboundMaxQueueBytes = deps.outbound?.maxQueueBytes ?? 512 * 1024;
   const outboundMaxSocketBufferBytes = deps.outbound?.maxSocketBufferBytes ?? 512 * 1024;
   const outboundBackpressureRetryMs = deps.outbound?.backpressureRetryMs ?? 10;
+  const shutdownGraceMs = deps.shutdownGraceMs ?? 3_000;
   const recentClusterDeliveryTtlMs = Math.max(staleAfterMs, 60_000);
   const setIntervalFn = deps.setIntervalFn ?? setInterval;
   const clearIntervalFn = deps.clearIntervalFn ?? clearInterval;
   const setTimeoutFn = deps.setTimeoutFn ?? setTimeout;
   const clearTimeoutFn = deps.clearTimeoutFn ?? clearTimeout;
   const queueMicrotaskFn = deps.queueMicrotaskFn ?? queueMicrotask;
+  let shuttingDown = false;
+  let shutdownTimer: TimeoutHandle | undefined;
 
   function closeCodeForError(error: HardessError): number | undefined {
     switch (error.code) {
@@ -160,6 +164,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   function createBackpressureError(message: string, detail?: string): HardessError {
     return new HardessError(ERROR_CODES.BACKPRESSURE_OVERFLOW, message, {
       detail
+    });
+  }
+
+  function createDrainingError(refMsgId?: string): HardessError {
+    return new HardessError(ERROR_CODES.SERVER_DRAINING, "Runtime websocket ingress is draining", {
+      retryable: true,
+      detail: "retry_on_another_healthy_node",
+      refMsgId
     });
   }
 
@@ -259,6 +271,48 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     queueMicrotaskFn(() => {
       drainOutboundQueue(connection);
     });
+  }
+
+  function forceCloseDrainingConnections(): void {
+    const drainingConnections = Array.from(connections.values()).filter((connection) => !connection.closed);
+    if (drainingConnections.length === 0) {
+      return;
+    }
+
+    metrics.increment("ws.shutdown_close", drainingConnections.length);
+    deps.logger.info("websocket shutdown grace expired", {
+      activeConnections: drainingConnections.length
+    });
+
+    for (const connection of drainingConnections) {
+      closeConnection(connection, 1001, "server shutting down");
+    }
+  }
+
+  function beginShutdown(): void {
+    if (shuttingDown) {
+      return;
+    }
+
+    shuttingDown = true;
+    for (const connection of connections.values()) {
+      deps.peerLocator.unregister(connection.socket.data.connId);
+    }
+
+    deps.logger.info("websocket shutdown draining", {
+      activeConnections: connections.size,
+      shutdownGraceMs
+    });
+
+    if (shutdownGraceMs <= 0) {
+      forceCloseDrainingConnections();
+      return;
+    }
+
+    shutdownTimer = setTimeoutFn(() => {
+      shutdownTimer = undefined;
+      forceCloseDrainingConnections();
+    }, shutdownGraceMs);
   }
 
   function enqueueOutbound(connection: ConnectionState, data: string): void {
@@ -501,6 +555,10 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   async function handleSystemMessage(connection: ConnectionState, envelope: Envelope<unknown>): Promise<void> {
     switch (envelope.action) {
       case "auth": {
+        if (shuttingDown) {
+          throw createDrainingError(envelope.msgId);
+        }
+
         const auth = await deps.authService.validateSystemAuth(parseSysAuthPayload(envelope.payload));
 
         const currentConnRef = deps.peerLocator.getByConnId(connection.socket.data.connId);
@@ -602,6 +660,10 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     connection: ConnectionState,
     envelope: Envelope<unknown>
   ): Promise<void> {
+    if (shuttingDown) {
+      throw createDrainingError(envelope.msgId);
+    }
+
     const auth = ensureAuthenticated(connection.auth);
     const isValid = await deps.authService.isAuthContextValid(auth);
     if (!isValid) {
@@ -641,7 +703,14 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   }
 
   return {
+    beginShutdown,
     open(socket: ConnectionState["socket"]) {
+      if (shuttingDown) {
+        metrics.increment("ws.shutdown_rejected");
+        socket.close(1001, "server shutting down");
+        return;
+      }
+
       if (
         deps.maxConnections !== undefined &&
         connections.size >= deps.maxConnections
@@ -756,6 +825,17 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       ack: AckMode;
       targets: ConnRef[];
     }): Promise<ConnRef[]> {
+      if (shuttingDown && payload.envelope.kind === "biz") {
+        metrics.increment("ws.shutdown_rejected");
+        deps.logger.info("cluster websocket delivery skipped during shutdown", {
+          msgId: payload.envelope.msgId,
+          traceId: payload.envelope.traceId,
+          senderNodeId: payload.sender.nodeId,
+          targetCount: payload.targets.length
+        });
+        return [];
+      }
+
       const currentTime = now();
       pruneRecentClusterDeliveries(currentTime);
       const duplicateUntil = recentClusterDeliveryByMsgId.get(payload.envelope.msgId);
@@ -817,6 +897,10 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     },
     dispose() {
       clearIntervalFn(heartbeatTimer);
+      if (shutdownTimer !== undefined) {
+        clearTimeoutFn(shutdownTimer);
+        shutdownTimer = undefined;
+      }
     }
   };
 }

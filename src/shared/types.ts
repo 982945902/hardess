@@ -1,4 +1,4 @@
-import type { ErrorCode } from "./codes.ts";
+import type { ErrorCode, SdkErrorCode } from "./codes.ts";
 
 export interface AuthContext {
   peerId: string;
@@ -102,6 +102,17 @@ export interface ClientTransportErrorInfo {
   message?: string;
 }
 
+export interface HardessSdkErrorShape {
+  code: SdkErrorCode;
+  source: "client" | "remote";
+  retryable: boolean;
+  message: string;
+  traceId?: string;
+  refMsgId?: string;
+  detail?: unknown;
+  close?: ClientCloseInfo;
+}
+
 export interface ClientProtocolErrorInfo {
   layer: "envelope" | "system" | "business";
   message: string;
@@ -120,6 +131,7 @@ export type ClientDeliveryStage =
   | "handleAck"
   | "recvAckTimeout"
   | "handleAckTimeout"
+  | "transportClosed"
   | "error"
   | "protocolError";
 
@@ -142,6 +154,8 @@ export interface ClientDeliveryEvent {
   protocol?: string;
   version?: string;
   action?: string;
+  close?: ClientCloseInfo;
+  sdkError?: HardessSdkErrorShape;
   route?: SysRoutePayload;
   recvAck?: SysRecvAckPayload;
   handleAck?: SysHandleAckPayload;

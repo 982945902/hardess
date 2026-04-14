@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
+import { CLIENT_ERROR_CODES, ERROR_CODES, type HardessSdkErrorShape } from "../../shared/index.ts";
 import { HardessClient } from "./client.ts";
 import type { WebSocketLike, WebSocketLikeEvent } from "../transport/ws.ts";
 
@@ -29,6 +30,25 @@ class FakeSocket implements WebSocketLike {
       listener(event);
     }
   }
+}
+
+function emitAuthOk(socket: FakeSocket, peerId = "alice"): void {
+  socket.emit("message", {
+    data: serializeEnvelope(
+      createEnvelope({
+        kind: "system",
+        src: { peerId: "hardess.system", connId: "system" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth.ok",
+        payload: {
+          peerId,
+          capabilities: [],
+          expiresAt: Date.now() + 60_000
+        }
+      })
+    )
+  });
 }
 
 function createManualTimers() {
@@ -145,6 +165,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     socket?.emit("message", {
       data: serializeEnvelope(
         createEnvelope({
@@ -188,6 +211,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     socket?.emit("message", {
       data: serializeEnvelope(
         createEnvelope({
@@ -477,6 +503,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -570,6 +599,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -647,6 +679,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -678,7 +713,211 @@ describe("HardessClient", () => {
       )
     });
 
-    await expect(handleAckPromise).rejects.toThrow("No recipients resolved");
+    await expect(handleAckPromise).rejects.toMatchObject({
+      code: ERROR_CODES.ROUTE_NO_RECIPIENT,
+      source: "remote",
+      retryable: false,
+      message: "No recipients resolved"
+    } satisfies Partial<HardessSdkErrorShape>);
+  });
+
+  it("fails pending tracked sends immediately when the transport closes", async () => {
+    let socket: FakeSocket | undefined;
+    const events: Array<{
+      stage: string;
+      code?: number;
+      reason?: string;
+      protocol?: string;
+      action?: string;
+    }> = [];
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      systemHandlers: {
+        onDeliveryEvent(event) {
+          events.push({
+            stage: event.stage,
+            code: event.close?.code,
+            reason: event.close?.reason,
+            protocol: event.protocol,
+            action: event.action
+          });
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
+    const tracker = client.emitTracked({
+      protocol: "demo",
+      version: "1.0",
+      action: "send",
+      payload: {
+        toPeerId: "bob",
+        content: "hello"
+      }
+    });
+
+    const handleAckPromise = tracker.waitForHandleAck();
+
+    socket?.emit("close", {
+      code: 1001,
+      reason: "server shutting down",
+      wasClean: true
+    });
+
+    await expect(handleAckPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+      source: "client",
+      retryable: true,
+      message: "Transport closed before delivery completed (code 1001, reason server shutting down)"
+    } satisfies Partial<HardessSdkErrorShape>);
+    expect(events).toEqual([
+      {
+        stage: "transportClosed",
+        code: 1001,
+        reason: "server shutting down",
+        protocol: "demo",
+        action: "send"
+      }
+    ]);
+  });
+
+  it("keeps recvAck settled when transport closes before handleAck", async () => {
+    let socket: FakeSocket | undefined;
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
+    const tracker = client.emitTracked({
+      protocol: "demo",
+      version: "1.0",
+      action: "send",
+      payload: {
+        toPeerId: "bob",
+        content: "hello"
+      }
+    });
+
+    socket?.emit("message", {
+      data: serializeEnvelope(
+        createEnvelope({
+          kind: "system",
+          src: { peerId: "hardess.system", connId: "system" },
+          protocol: "sys",
+          version: "1.0",
+          action: "recvAck",
+          traceId: tracker.msgId,
+          payload: {
+            ackFor: tracker.msgId,
+            acceptedAt: Date.now()
+          }
+        })
+      )
+    });
+
+    const recvAckPromise = tracker.waitForRecvAck();
+    const handleAckPromise = tracker.waitForHandleAck();
+
+    socket?.emit("close", {
+      code: 1001,
+      reason: "server shutting down",
+      wasClean: true
+    });
+
+    await expect(recvAckPromise).resolves.toMatchObject({
+      stage: "recvAck",
+      msgId: tracker.msgId
+    });
+    await expect(handleAckPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+      source: "client",
+      retryable: true,
+      message: "Transport closed before delivery completed (code 1001, reason server shutting down)"
+    } satisfies Partial<HardessSdkErrorShape>);
+  });
+
+  it("fails waitForResult when the transport closes before handleAck", async () => {
+    let socket: FakeSocket | undefined;
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
+    const tracker = client.emitTracked({
+      protocol: "demo",
+      version: "1.0",
+      action: "send",
+      payload: {
+        toPeerId: "bob",
+        content: "hello"
+      }
+    });
+
+    const resultPromise = tracker.waitForResult();
+
+    socket?.emit("close", {
+      code: 1001,
+      reason: "server shutting down",
+      wasClean: true
+    });
+
+    await expect(resultPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED,
+      source: "client",
+      retryable: true,
+      message: "Transport closed before delivery completed (code 1001, reason server shutting down)"
+    } satisfies Partial<HardessSdkErrorShape>);
   });
 
   it("emits timeout stages and rejects tracked waits when delivery exceeds policy", async () => {
@@ -718,6 +957,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
 
     const tracker = client.emitTracked({
       protocol: "demo",
@@ -733,10 +975,20 @@ describe("HardessClient", () => {
     const handleAckPromise = tracker.waitForHandleAck();
 
     manualTimers.runTimeout(5);
-    await expect(recvAckPromise).rejects.toThrow("Timed out waiting for recvAck after 5ms");
+    await expect(recvAckPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_DELIVERY_TIMEOUT,
+      source: "client",
+      retryable: true,
+      message: "Timed out waiting for recvAck after 5ms"
+    } satisfies Partial<HardessSdkErrorShape>);
 
     manualTimers.runTimeout(10);
-    await expect(handleAckPromise).rejects.toThrow("Timed out waiting for handleAck after 10ms");
+    await expect(handleAckPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_DELIVERY_TIMEOUT,
+      source: "client",
+      retryable: true,
+      message: "Timed out waiting for handleAck after 10ms"
+    } satisfies Partial<HardessSdkErrorShape>);
 
     expect(events).toEqual([
       {
@@ -789,6 +1041,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     client.emit({
       protocol: "demo",
       version: "1.0",
@@ -831,6 +1086,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -909,6 +1167,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -983,6 +1244,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -1043,6 +1307,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
     const tracker = client.emitTracked({
       protocol: "demo",
       version: "1.0",
@@ -1057,7 +1324,12 @@ describe("HardessClient", () => {
 
     manualTimers.runTimeout(5);
 
-    await expect(resultPromise).rejects.toThrow("Timed out waiting for recvAck after 5ms");
+    await expect(resultPromise).rejects.toMatchObject({
+      code: CLIENT_ERROR_CODES.CLIENT_DELIVERY_TIMEOUT,
+      source: "client",
+      retryable: true,
+      message: "Timed out waiting for recvAck after 5ms"
+    } satisfies Partial<HardessSdkErrorShape>);
   });
 
   it("provides a high-level client.send convenience", async () => {
@@ -1081,6 +1353,9 @@ describe("HardessClient", () => {
 
     client.connect("demo:alice");
     socket?.emit("open");
+    if (socket) {
+      emitAuthOk(socket);
+    }
 
     const resultPromise = client.send({
       protocol: "demo",
@@ -1136,5 +1411,117 @@ describe("HardessClient", () => {
       action: "send",
       msgId: outboundMsgId
     });
+  });
+
+  it("fails fast when sending before auth.ok", () => {
+    let socket: FakeSocket | undefined;
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    socket?.emit("open");
+
+    expect(() =>
+      client.emitTracked({
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    ).toThrow("Client is not ready; wait for auth.ok before sending (state: authenticating)");
+
+    try {
+      client.emitTracked({
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      });
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: CLIENT_ERROR_CODES.CLIENT_NOT_READY,
+        source: "client",
+        retryable: true
+      } satisfies Partial<HardessSdkErrorShape>);
+    }
+  });
+
+  it("waitUntilReady resolves on auth.ok and tracks readiness across reconnects", async () => {
+    const sockets: FakeSocket[] = [];
+    const reconnectTimers: Array<() => void> = [];
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: {
+          enabled: true,
+          initialDelayMs: 5,
+          maxDelayMs: 5
+        },
+        webSocketFactory() {
+          const socket = new FakeSocket();
+          sockets.push(socket);
+          return socket;
+        },
+        setTimeoutFn(handler) {
+          reconnectTimers.push(handler as () => void);
+          return reconnectTimers.length as unknown as ReturnType<typeof setTimeout>;
+        },
+        clearTimeoutFn() {}
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {},
+        setTimeout(handler, delay) {
+          reconnectTimers.push(handler as () => void);
+          return reconnectTimers.length as unknown as ReturnType<typeof setTimeout>;
+        },
+        clearTimeout() {}
+      }
+    });
+
+    client.connect("demo:alice");
+    expect(client.isReady()).toBe(false);
+
+    const firstReadyPromise = client.waitUntilReady();
+    sockets[0]?.emit("open");
+    emitAuthOk(sockets[0] as FakeSocket);
+    await expect(firstReadyPromise).resolves.toBeUndefined();
+    expect(client.isReady()).toBe(true);
+
+    sockets[0]?.emit("close", {
+      code: 1001,
+      reason: "server shutting down",
+      wasClean: true
+    });
+    expect(client.isReady()).toBe(false);
+
+    const secondReadyPromise = client.waitUntilReady();
+    reconnectTimers.shift()?.();
+    sockets[1]?.emit("open");
+    emitAuthOk(sockets[1] as FakeSocket);
+    await expect(secondReadyPromise).resolves.toBeUndefined();
+    expect(client.isReady()).toBe(true);
   });
 });

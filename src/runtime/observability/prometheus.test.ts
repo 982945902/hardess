@@ -10,6 +10,9 @@ describe("renderPrometheusMetrics", () => {
         },
         timings: {
           "http.request_ms": [10, 20, 30]
+        },
+        timingCounts: {
+          "http.request_ms": 3
         }
       },
       {

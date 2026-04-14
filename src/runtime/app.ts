@@ -52,11 +52,16 @@ export interface RuntimeAppOptions {
       maxSocketBufferBytes?: number;
       backpressureRetryMs?: number;
     };
+    shutdownGraceMs?: number;
   };
 }
 
 export interface UpgradeServerRef {
   upgrade(request: Request, options?: { data?: unknown }): boolean;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isMetricsSnapshotProvider(metrics: Metrics): metrics is MetricsSnapshotProvider {
@@ -131,7 +136,8 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     maxConnections: options.websocket?.maxConnections,
     maxConnectionsPerPeer: options.websocket?.maxConnectionsPerPeer,
     rateLimit: options.websocket?.rateLimit,
-    outbound: options.websocket?.outbound
+    outbound: options.websocket?.outbound,
+    shutdownGraceMs: options.websocket?.shutdownGraceMs
   });
   clusterNetwork.setServerHandlers({
     deliver(payload) {
@@ -200,8 +206,37 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     registry,
     configStore,
     websocket: runtimeWebsocket,
+    runtimeState,
     beginShutdown() {
       shuttingDown = true;
+      websocket.beginShutdown();
+    },
+    async waitForHttpDrain(options: {
+      timeoutMs?: number;
+      pollIntervalMs?: number;
+    } = {}): Promise<boolean> {
+      const timeoutMs = options.timeoutMs ?? 0;
+      const pollIntervalMs = options.pollIntervalMs ?? 25;
+
+      if (inFlightHttpRequests === 0) {
+        return true;
+      }
+
+      if (timeoutMs <= 0) {
+        return false;
+      }
+
+      const deadline = Date.now() + timeoutMs;
+      while (inFlightHttpRequests > 0) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          return false;
+        }
+
+        await sleep(Math.min(pollIntervalMs, remainingMs));
+      }
+
+      return true;
     },
     dispose() {
       shuttingDown = true;

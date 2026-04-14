@@ -18,6 +18,9 @@ describe("InMemoryMetrics", () => {
       },
       timings: {
         "http.request_ms": [12, 18]
+      },
+      timingCounts: {
+        "http.request_ms": 2
       }
     });
   });
@@ -33,6 +36,9 @@ describe("InMemoryMetrics", () => {
       counters: {},
       timings: {
         "http.request_ms": [20, 30]
+      },
+      timingCounts: {
+        "http.request_ms": 3
       }
     });
   });
@@ -51,6 +57,9 @@ describe("InMemoryMetrics", () => {
       },
       timings: {
         "http.request_ms": [12]
+      },
+      timingCounts: {
+        "http.request_ms": 1
       }
     });
     expect(right.snapshot()).toEqual(left.snapshot());

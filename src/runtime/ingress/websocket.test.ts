@@ -1085,4 +1085,192 @@ describe("createWebSocketHandlers", () => {
     expect(alice.closed?.reason).toBe("BACKPRESSURE_OVERFLOW");
     handlers.dispose();
   });
+
+  it("rejects new business messages but still allows handleAck during shutdown drain", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      shutdownGraceMs: 1_000
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, token] of [
+      [alice, "demo:alice"],
+      [bob, "demo:bob"]
+    ] as const) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `auth-${socket.data.connId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: token
+          }
+        })
+      );
+    }
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "pre-drain-send",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "before drain"
+        }
+      })
+    );
+
+    handlers.beginShutdown();
+
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "pre-drain-handle",
+        kind: "system",
+        src: { peerId: "bob", connId: "conn-bob" },
+        protocol: "sys",
+        version: "1.0",
+        action: "handleAck",
+        ts: Date.now(),
+        payload: {
+          ackFor: "pre-drain-send"
+        }
+      })
+    );
+
+    const aliceHandleAck = lastEnvelope(alice);
+    expect(aliceHandleAck?.action).toBe("handleAck");
+    expect((aliceHandleAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("pre-drain-send");
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "post-drain-send",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "after drain"
+        }
+      })
+    );
+
+    expect(lastEnvelope(alice)?.action).toBe("err");
+    expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("SERVER_DRAINING");
+    expect(alice.closed).toBeUndefined();
+    expect(
+      bob.sent.some((raw) => {
+        const envelope = parseEnvelope(raw);
+        return envelope?.kind === "biz" && envelope.msgId === "post-drain-send";
+      })
+    ).toBe(false);
+    handlers.dispose();
+  });
+
+  it("stops accepting cluster biz deliveries and closes remaining sockets after shutdown grace", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    const timeouts: Array<() => void> = [];
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "node-b",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      shutdownGraceMs: 5,
+      setTimeoutFn(callback) {
+        timeouts.push(callback);
+        return timeouts.length as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn() {}
+    });
+
+    const bob = createSocket("conn-bob");
+    handlers.open(bob);
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "auth-bob",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob"
+        }
+      })
+    );
+
+    handlers.beginShutdown();
+
+    const delivered = await handlers.deliverCluster({
+      sender: { nodeId: "node-a", connId: "conn-alice", peerId: "alice" },
+      envelope: {
+        msgId: "cluster-drain-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "chat",
+        version: "1.0",
+        action: "message",
+        ts: Date.now(),
+        payload: {
+          fromPeerId: "alice",
+          content: "hello"
+        }
+      },
+      ack: "handle",
+      targets: [{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }]
+    });
+
+    expect(delivered).toEqual([]);
+    expect(
+      bob.sent.some((raw) => {
+        const envelope = parseEnvelope(raw);
+        return envelope?.kind === "biz" && envelope.msgId === "cluster-drain-1";
+      })
+    ).toBe(false);
+
+    timeouts.shift()?.();
+    expect(bob.closed?.code).toBe(1001);
+    expect(bob.closed?.reason).toBe("server shutting down");
+    handlers.dispose();
+  });
 });

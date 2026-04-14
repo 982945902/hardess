@@ -6,6 +6,7 @@ export interface Metrics {
 export interface MetricsSnapshot {
   counters: Record<string, number>;
   timings: Record<string, number[]>;
+  timingCounts: Record<string, number>;
 }
 
 export interface MetricsSnapshotProvider extends Metrics {
@@ -45,6 +46,9 @@ export class InMemoryMetrics implements MetricsSnapshotProvider {
       counters: Object.fromEntries(this.counters),
       timings: Object.fromEntries(
         Array.from(this.timingsByName.entries()).map(([name, values]) => [name, [...values]])
+      ),
+      timingCounts: Object.fromEntries(
+        Array.from(this.timingsByName.entries()).map(([name, values]) => [name, values.length])
       )
     };
   }
@@ -58,6 +62,7 @@ export class InMemoryMetrics implements MetricsSnapshotProvider {
 export class WindowedMetrics implements MetricsSnapshotProvider {
   private readonly counters = new Map<string, number>();
   private readonly timingsByName = new Map<string, number[]>();
+  private readonly timingCounts = new Map<string, number>();
 
   constructor(private readonly maxTimingsPerMetric = 1024) {}
 
@@ -68,6 +73,7 @@ export class WindowedMetrics implements MetricsSnapshotProvider {
   timing(name: string, valueMs: number): void {
     const values = this.timingsByName.get(name) ?? [];
     values.push(valueMs);
+    this.timingCounts.set(name, (this.timingCounts.get(name) ?? 0) + 1);
     if (values.length > this.maxTimingsPerMetric) {
       values.splice(0, values.length - this.maxTimingsPerMetric);
     }
@@ -79,7 +85,8 @@ export class WindowedMetrics implements MetricsSnapshotProvider {
       counters: Object.fromEntries(this.counters),
       timings: Object.fromEntries(
         Array.from(this.timingsByName.entries()).map(([name, values]) => [name, [...values]])
-      )
+      ),
+      timingCounts: Object.fromEntries(this.timingCounts)
     };
   }
 }

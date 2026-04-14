@@ -21,11 +21,13 @@ export interface NumericSeriesSummary {
 export interface MetricsSnapshot {
   counters?: Record<string, number>;
   timings?: Record<string, number[]>;
+  timingCounts?: Record<string, number>;
 }
 
 const metricsSnapshotSchema = z.object({
   counters: z.record(z.string(), z.number()).optional(),
-  timings: z.record(z.string(), z.array(z.number())).optional()
+  timings: z.record(z.string(), z.array(z.number())).optional(),
+  timingCounts: z.record(z.string(), z.number()).optional()
 });
 
 const adminMetricsResponseSchema = z.object({
@@ -209,10 +211,17 @@ export function diffMetricsSnapshot(
       ])
     ),
     timings: Object.fromEntries(
-      Array.from(timingNames).map((name) => [
-        name,
-        (after.timings?.[name] ?? []).slice((before.timings?.[name] ?? []).length)
-      ])
+      Array.from(timingNames).map((name) => {
+        const afterValues = after.timings?.[name] ?? [];
+        const afterCount = after.timingCounts?.[name] ?? afterValues.length;
+        const beforeCount = before.timingCounts?.[name] ?? (before.timings?.[name] ?? []).length;
+        const appendedCount = afterCount - beforeCount;
+
+        return [name, appendedCount <= 0 ? [] : afterValues.slice(Math.max(0, afterValues.length - appendedCount))];
+      })
+    ),
+    timingCounts: Object.fromEntries(
+      Array.from(timingNames).map((name) => [name, after.timingCounts?.[name] ?? (after.timings?.[name] ?? []).length])
     )
   };
 }
