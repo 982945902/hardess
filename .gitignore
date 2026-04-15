@@ -1,3 +1,4 @@
 node_modules/
 config/.*.hardess-config-*.ts
 workers/.*.hardess-worker-*.ts
+experiment/**/target/

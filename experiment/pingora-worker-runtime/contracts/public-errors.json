@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "errors": [
+    {
+      "code": "bad_request",
+      "category": "bad_request",
+      "status": 400,
+      "retryable": false,
+      "public": true,
+      "description": "Request shape or normalization is invalid."
+    },
+    {
+      "code": "unauthorized",
+      "category": "unauthorized",
+      "status": 401,
+      "retryable": false,
+      "public": true,
+      "description": "Authentication is required or invalid."
+    },
+    {
+      "code": "forbidden",
+      "category": "forbidden",
+      "status": 403,
+      "retryable": false,
+      "public": true,
+      "description": "Caller is authenticated but not permitted."
+    },
+    {
+      "code": "not_found",
+      "category": "not_found",
+      "status": 404,
+      "retryable": false,
+      "public": true,
+      "description": "Requested resource or route does not exist."
+    },
+    {
+      "code": "conflict",
+      "category": "conflict",
+      "status": 409,
+      "retryable": false,
+      "public": true,
+      "description": "Request conflicts with current state."
+    },
+    {
+      "code": "rate_limited",
+      "category": "rate_limited",
+      "status": 429,
+      "retryable": true,
+      "public": true,
+      "description": "Generic rate limiting or quota protection."
+    },
+    {
+      "code": "tenant_over_quota",
+      "category": "rate_limited",
+      "status": 429,
+      "retryable": true,
+      "public": true,
+      "description": "Tenant-specific quota has been exceeded."
+    },
+    {
+      "code": "upstream_timeout",
+      "category": "upstream_timeout",
+      "status": 504,
+      "retryable": true,
+      "public": true,
+      "description": "An upstream dependency timed out."
+    },
+    {
+      "code": "execution_timeout",
+      "category": "execution_timeout",
+      "status": 504,
+      "retryable": false,
+      "public": true,
+      "description": "Worker execution exceeded its deadline."
+    },
+    {
+      "code": "temporarily_unavailable",
+      "category": "temporarily_unavailable",
+      "status": 503,
+      "retryable": true,
+      "public": true,
+      "description": "Service is temporarily unavailable or overloaded."
+    },
+    {
+      "code": "shutdown_draining",
+      "category": "shutdown_draining",
+      "status": 503,
+      "retryable": true,
+      "public": true,
+      "description": "Server is draining in-flight traffic for shutdown."
+    },
+    {
+      "code": "internal_error",
+      "category": "internal_error",
+      "status": 500,
+      "retryable": false,
+      "public": true,
+      "description": "Unknown or unclassified internal failure."
+    },
+    {
+      "code": "network_lost",
+      "category": "network_lost",
+      "status": 503,
+      "retryable": true,
+      "public": true,
+      "description": "Connection was lost before normal completion."
+    }
+  ]
+}

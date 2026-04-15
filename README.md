@@ -133,6 +133,8 @@ SDK behavior notes:
 - [Operator guide](docs/operator-guide.md)
 - [Grafana dashboard template](docs/grafana-hardess-overview.dashboard.json)
 - [Architecture design and current status](docs/hardess-architecture.md)
+- [Pingora / workerd as Hardess v2 research](docs/research-pingora-for-hardess-v2.md)
+- [Experimental Pingora + Rust + TS runtime workspace](experiment/README.md)
 
 ## Still Not Done
 

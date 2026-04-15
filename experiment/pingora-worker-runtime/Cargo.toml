@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "crates/gateway-host",
+  "crates/worker-abi",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.metadata]
+name = "hardess-pingora-worker-runtime-experiment"
+purpose = "Explore Pingora + Rust + a Workers-style TypeScript runtime host for a possible Hardess v2."
