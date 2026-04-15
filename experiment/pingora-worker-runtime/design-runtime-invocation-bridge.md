@@ -12,6 +12,12 @@ Short version:
 
 `Import once. Resolve handler once. Cache one invoke function. Pass request data as V8 values.`
 
+This design now assumes exactly one handler contract:
+
+- `fetch(request, env, ctx)`
+
+No alternate compatibility handler path remains in scope.
+
 ## Why
 
 Per-request script generation has the wrong shape for this host.
@@ -35,18 +41,19 @@ Each runtime slot initializes in this order:
 
 1. create `JsRuntime`
 2. bootstrap minimal Web runtime helpers
-3. inject `HardessPublicErrors`
-4. import the worker entry module
-5. resolve either `fetch(request, env, ctx)` or `fetchCompat(request, env, ctx)`
-6. build one async JS trampoline
-7. store that trampoline as `v8::Global<v8::Function>`
+3. import the worker entry module
+4. resolve `fetch(request, env, ctx)`
+5. build one async JS trampoline
+6. store that trampoline as `v8::Global<v8::Function>`
 
 After that, each request:
 
-1. is normalized on the Rust side
-2. is serialized into V8 values with `serde_v8`
-3. calls the cached trampoline through `call_with_args_and_await(...)`
-4. deserializes the normalized response back into Rust
+1. is normalized on the Rust side into `WorkerRequest`
+2. creates a gateway-local lazy body bridge when a request body is expected
+3. is wrapped into a native `cppgc` host object inside V8
+4. is materialized into a minimal Web `Request` facade by the cached trampoline
+5. calls the cached trampoline through `call_with_args_and_await(...)`
+6. deserializes the normalized response back into Rust
 
 ## Trampoline responsibilities
 
@@ -54,8 +61,8 @@ The cached trampoline is intentionally small.
 
 Its job is only to:
 
-- construct a minimal Web `Request` when using the Web fetch path
-- pass compat structs through unchanged for the `v1` compatibility path
+- construct a minimal Web `Request` facade over a Rust-backed request object
+- expose lazy request-body reads back into ingress on demand
 - provide `ctx.waitUntil(...)`
 - await the worker result
 - normalize the result into the Rust-facing response shape
@@ -63,6 +70,34 @@ Its job is only to:
 Business logic stays in TypeScript.
 
 Rust is not taking over request semantics.
+
+Rust also does not expose Pingora's Rust request struct directly to TS in the
+current design.
+
+Current boundary choice:
+
+- Pingora request remains an ingress/internal Rust object
+- `WorkerRequest` is the host transport shape
+- a gateway-local request body bridge connects runtime body reads back to ingress
+- a Rust-backed `WorkerRequestHandle`-style host object is the V8 bridge shape
+- Web `Request` is the TS-facing business shape
+
+This avoids the earlier JSON-shaped request serialization step without exposing
+Pingora internals directly into the TS surface.
+
+It also keeps the TS API stable while allowing lazy inbound body reads now,
+while still leaving room for later lower-copy header/body access.
+
+The important ownership rule is:
+
+- the JS-visible backing object is runtime-scoped and strongly owned for the duration of the invocation
+- this is intentionally not modeled as a `WeakRef`
+
+Reason:
+
+- a weak reference does not solve cross-boundary ownership
+- it only makes request field access fail later and less predictably
+- the safer first cut is a GC-managed host object with explicit runtime-scoped lifetime
 
 ## Warmup implications
 
@@ -79,6 +114,51 @@ discovery.
 
 It is not yet full request-path warmup, because there is still no safe generic
 synthetic request hook that can run arbitrary business workers before cutover.
+
+## Request Body Strategy
+
+Inbound request bodies are now lazy.
+
+That means:
+
+- ingress does not pre-read the body before worker execution
+- runtime body reads send explicit "next chunk" requests back to ingress
+- if worker code never touches `request.body`, `text()`, `json()`, or `arrayBuffer()`, the body is never read
+
+This directly helps:
+
+- auth / quota / routing rejection before body consumption
+- proxy-style workers that may decide whether to forward before opening the body
+- large request bodies that should not become one eager string allocation
+
+Current completion policy after worker response:
+
+- if the body was fully consumed, do nothing
+- if the body was not consumed and the request is small with a known `Content-Length`, drain it
+- otherwise disable keepalive instead of forcing a blind drain
+
+This is a conservative first cut that favors correctness and predictable
+ownership over maximum connection reuse.
+
+## Response Body Strategy
+
+Outbound response bodies are now also able to stream.
+
+That means:
+
+- the worker may return `new Response(asyncIterableBody, init)`
+- runtime normalizes the response head first
+- ingress receives status/header metadata before the full response body is buffered
+- downstream body writes pull the next worker chunk on demand
+
+Current boundary choice:
+
+- buffered/direct call sites can still collapse the response into `WorkerResponse`
+- Pingora ingress uses an internal gateway response bridge instead of `Response<Vec<u8>>`
+- the runtime slot stays occupied until the response stream finishes or the ingress side drops it
+
+This keeps the public TS surface stable while removing the earlier
+"worker body must be fully materialized before Pingora can respond" limitation.
 
 ## Relation to worker generations
 
@@ -102,12 +182,13 @@ No runtime performs an in-place code mutation after it is serving traffic.
 ## Non-goals
 
 - no zero-copy request/response body path yet
-- no streaming body bridge yet
 - no direct use of Pingora request structs inside the TS API surface yet
 - no full Fetch standard compatibility yet
+- no second protocol/compatibility invocation path
 
 ## Next steps
 
 1. keep this cached trampoline model as the only request invocation path
 2. add package-management support on top of it with `deno.json`, `jsr:`, and `npm:`
 3. later evaluate lower-copy body transport without changing the TS business surface
+4. later decide whether headers/body should stay op-backed or move to a deeper native Web object implementation

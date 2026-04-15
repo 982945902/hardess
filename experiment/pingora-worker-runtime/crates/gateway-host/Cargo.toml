@@ -3,7 +3,6 @@ name = "gateway-host"
 version = "0.1.0"
 edition = "2021"
 publish = false
-default-run = "gateway-host"
 
 [dependencies]
 anyhow = "1"
@@ -19,5 +18,4 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time", "signal"] }
 ureq = "2"
-url = "2"
 worker-abi = { path = "../worker-abi" }

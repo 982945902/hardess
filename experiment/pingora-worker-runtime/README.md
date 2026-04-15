@@ -2,19 +2,23 @@
 
 Status: exploratory, runnable
 
+Current fixed direction:
+
+- one worker entry contract: `fetch(request, env, ctx)`
+- one TS request model: minimal Web `Request` / `Response`
+- no `v1` compatibility layer in this experiment
+
 Related docs:
 
 - [TS runtime selection note](./design-ts-runtime-selection.md)
 - [Package management design note](./design-package-management.md)
 - [Public error contract design note](./design-public-error-contract.md)
 - [Runtime invocation bridge design note](./design-runtime-invocation-bridge.md)
+- [Low-copy response bridge note](./design-low-copy-response-bridge.md)
 - [Control Plane / Runtime Separation note](./design-control-plane-runtime-separation.md)
 - [Worker generation rollout design note](./design-worker-generation-rollout.md)
+- [Breadth-first TODO note](./TODO-breadth-first.md)
 - [WebSocket runtime design note](./design-websocket-runtime.md)
-- [V1 to V2 compatibility design note](./design-v1-v2-compatibility.md)
-- [V1 compatibility adapter design note](./design-v1-compat-adapter.md)
-- [V1 compatibility contract design note](./design-v1-compat-contract.md)
-- [SDK compatibility design note](./design-sdk-compatibility.md)
 
 ## Question
 
@@ -63,16 +67,16 @@ Phase 3:
 - no attempt to reach production-grade isolation or sandboxing
 - no attempt to finalize the TS runtime choice before the host contract is clear
 
-## Open technical choices
+## Locked decisions
 
-The TS runtime is intentionally not locked yet. Real options include:
+The following are now fixed for this experiment track:
 
-- embed a JS engine directly in Rust
-- use a runtime like `deno_core`
-- run a separate worker runtime process and talk over RPC
-- compile workers to another portable form and host that
+- the TS handler shape is `fetch(request, env, ctx)`
+- the runtime exposes a Web-style request surface to TS
+- `v1` compatibility is out of scope and removed from this workspace
+- Pingora request handling is normalized into the host ABI and then exposed to TS through a Rust-backed Web `Request` facade
 
-This experiment should compare those options after the Rust host contract is clear.
+The main open runtime choice that remains is implementation depth, not external contract shape.
 
 ## Initial workspace layout
 
@@ -99,12 +103,30 @@ This repository now contains a real minimal prototype:
 - remote `http:` / `https:` modules can be integrity-checked against `deno.lock`
 - remote modules are cached under a worker-local prepare cache directory and reused by later prepares
 - prepare cache snapshots now expose `entry_count` and `total_bytes`
+- worker project snapshots now expose a local `artifact_id` marker as `local-sha256:<hex>`
 - direct `jsr:` specifiers are rewritten to `https://jsr.io/...`
 - direct `npm:` specifiers are rewritten to `https://esm.sh/...` for the experiment
 - the host returns a Rust `WorkerResponse`
 
-The current prototype intentionally uses a JSON-shaped bridge for
-`request/env/ctx/response` at the Rust <-> V8 value boundary.
+The current prototype now uses a mixed bridge:
+
+- request metadata crosses the Rust <-> V8 boundary as a native Rust-backed host object
+- inbound request body is now lazy and ingress-driven instead of being pre-read into a string
+- `env` and `ctx` still cross via `serde_v8`
+- response head is normalized first, and response body can now stream back through an internal gateway bridge
+
+Current request path:
+
+1. Pingora reads the incoming HTTP request
+2. Rust normalizes it into the internal host ABI `WorkerRequest`
+3. Rust creates an internal gateway request bridge for the body when a request body is expected
+4. Rust wraps the request metadata plus body bridge as a `cppgc` host object inside V8
+5. the cached JS trampoline materializes a minimal Web `Request` facade over that backing object
+6. TS business logic runs only against `fetch(request, env, ctx)`
+
+The experiment now keeps only one invocation path:
+
+- `fetch(request: Request, env, ctx)`
 
 It no longer builds per-request JavaScript source strings to invoke the
 worker.
@@ -113,19 +135,25 @@ Instead, each runtime slot now:
 
 - bootstraps minimal Web runtime helpers once
 - imports the worker module once
-- resolves either `fetch(...)` or `fetchCompat(...)` once
+- resolves `fetch(...)` once
 - caches one async invocation trampoline function in V8
 
-Each request is then passed as V8 values into that cached trampoline.
+Each request is then passed into that cached trampoline as native V8 values.
+
+When worker code consumes the request body, the runtime asks ingress for the
+next chunk on demand. If worker code never touches the body, ingress never
+reads it.
 
 That means this is still proving the host/runtime contract first, not the
 final zero-copy or Web-standards-complete runtime shape, but the request path
-is now materially closer to the target architecture.
+is now materially closer to the target architecture than the earlier
+JSON-shaped request bridge.
 
-The host now supports two TS invocation styles:
+This workspace no longer contains a second protocol path.
+
+The host now supports one TS invocation style:
 
 - `fetch(request: Request, env, ctx)` for the Workers-style Web path
-- `fetchCompat(request: ParsedV1Request, env: CompatEnv, ctx: CompatContext)` for the `v1` compatibility path
 
 For package resolution, the current experiment supports:
 
@@ -138,32 +166,11 @@ For package resolution, the current experiment supports:
 This is enough to prove the package-management direction, but it is not yet a
 full Deno CLI-compatible graph / cache / lockfile implementation.
 
+It is also not yet the final low-copy ingress path. Today the host still
+normalizes Pingora input into the internal ABI before creating the Web
+`Request` seen by TS.
+
 ## Run It
-
-From this directory:
-
-```bash
-cargo run -p gateway-host -- workers/hello/mod.ts
-```
-
-With explicit request fields:
-
-```bash
-cargo run -p gateway-host -- \
-  workers/hello/mod.ts \
-  --method POST \
-  --url http://localhost/demo \
-  --body hello \
-  --worker-id demo-worker
-```
-
-Expected output is a JSON response printed by the Rust host.
-
-Run the `v1 compat` sample worker:
-
-```bash
-cargo run -p gateway-host -- workers/compat_v1/mod.ts --method POST --url 'http://localhost/compat?x=1&x=2' --body ping
-```
 
 Run the Pingora ingress:
 
@@ -211,10 +218,47 @@ Inspect worker generations:
 curl 'http://127.0.0.1:6190/_hardess/generations'
 ```
 
+The generation snapshot now includes:
+
+- `desired_artifact_id`
+- `prepared_artifact_id`
+- `active_artifact_id`
+- `failed_artifact_id`
+- `desired_declared_artifact_id`
+- `desired_declared_version`
+- `prepared_declared_artifact_id`
+- `prepared_declared_version`
+- `active_declared_artifact_id`
+- `active_declared_version`
+- `failed_declared_artifact_id`
+- `failed_declared_version`
+
+For the current experiment, these are local runtime-visible markers derived from
+the worker project files. They are not yet control-plane-issued version ids, but
+they are stable enough to answer "which local artifact did this generation load?"
+
+The `declared_*` fields are different: they are optional control-plane-facing
+markers copied from the desired-worker payload, so status APIs can show both:
+
+- what the node actually loaded locally
+- what artifact / version the control plane said it should be loading
+
 Reload the configured worker entry as a new generation:
 
 ```bash
 curl -X POST 'http://127.0.0.1:6190/_hardess/reload-worker'
+```
+
+Apply a debug desired-worker payload that simulates future control-plane input:
+
+```bash
+curl -X POST 'http://127.0.0.1:6190/_hardess/apply-worker' \
+  -H 'content-type: application/json' \
+  --data '{
+    "worker_entry": "workers/hello/mod.ts",
+    "declared_artifact_id": "cp-artifact-42",
+    "declared_version": "worker-v2"
+  }'
 ```
 
 Force a prepare-cache cleanup pass for the active worker project:
@@ -234,25 +278,21 @@ cargo test
 
 The current Rust-side prototype ABI is intentionally small:
 
-- `WorkerRequest`: `method`, `url`, `headers`, `body`
+- `WorkerRequest`: `method`, `url`, `headers`, optional buffered `body` for direct/internal call sites
 - `WorkerEnv`: `worker_id`, `vars`
 - `WorkerContext`: metadata plus injected `waitUntil(...)`
 - `WorkerResponse`: `status`, `headers`, `body`
+
+For Pingora ingress specifically, the host now wraps `WorkerRequest` in an
+internal gateway request type so the request body can stay lazy and stream on
+demand.
 
 The host injects a `ctx.waitUntil(...)` function and waits for all registered
 promises with `Promise.allSettled(...)` before finishing the invocation. This
 is good enough for a phase-0 experiment, but it is not the final production
 semantics.
 
-For the `v1 compat` worker path, the host additionally:
-
-- parses the incoming `WorkerRequest` into `ParsedV1Request`
-- builds `CompatEnv` and `CompatContext` from the Rust-side request metadata
-- returns public compat errors as JSON responses when request normalization fails
-- normalizes `ParsedV1Response.error` into the same public compat JSON error surface
-- injects `globalThis.HardessPublicErrors` from `contracts/public-errors.json` so TS can read the shared public error contract at runtime
-
-Inside the worker runtime, the host now bootstraps a small compatibility layer:
+Inside the worker runtime, the host now bootstraps a small Web runtime layer:
 
 - `Headers`
 - `Request`
@@ -260,12 +300,14 @@ Inside the worker runtime, the host now bootstraps a small compatibility layer:
 
 This layer is intentionally small. It currently focuses on:
 
-- request method / url / headers / text body
-- response status / headers / text body
-- `text()`, `json()`, `clone()`
+- request method / url / headers / lazy request body
+- response status / headers / buffered or async-iterable body
+- `request.body` async iteration
+- `text()`, `json()`, `arrayBuffer()`
 
-It does not yet try to implement streaming bodies or the broader Fetch/Web
-platform surface.
+It still does not try to implement the broader Fetch/Web platform surface, and
+`Request.clone()` with a streaming body is intentionally unsupported in this
+experiment.
 
 For Pingora integration, the current implementation now uses a small runtime
 thread pool:
@@ -273,6 +315,8 @@ thread pool:
 - each runtime thread owns one initialized `deno_core` runtime
 - each runtime slot imports the worker and caches an invocation trampoline during initialization
 - Pingora request handling forwards work into that pool
+- Pingora request bodies are now read lazily only when the worker asks for the next chunk
+- Pingora response bodies can now be streamed back chunk-by-chunk from the worker runtime
 - requests are distributed round-robin across runtime threads
 - each runtime thread has a bounded queue
 - when all runtime queues are full, Pingora returns `503 Service Unavailable`
@@ -285,21 +329,35 @@ thread pool:
 - while draining, new requests are rejected with `503 Service Unavailable`
 - existing in-flight requests are allowed to finish until `--shutdown-drain-timeout-ms`
 - after app-level draining finishes, Pingora shutdown proceeds without adding another fixed grace-period sleep
-- ingress-side `bad_request`, `overloaded`, `execution_timeout`, `temporarily_unavailable`, and `shutdown_draining` now use the same public compat JSON error surface
+- ingress-side `bad_request`, `overloaded`, `execution_timeout`, `temporarily_unavailable`, and `shutdown_draining` now use the same public JSON error surface
 - a JSON metrics endpoint is exposed at `/_hardess/runtime-pool`
 - a JSON module-cache endpoint is exposed at `/_hardess/module-cache`
 - a JSON ingress-state endpoint is exposed at `/_hardess/ingress-state`
 - a JSON generation snapshot endpoint is exposed at `/_hardess/generations`
 - a cache-cleanup control endpoint is exposed at `POST /_hardess/cleanup-cache`
+- a debug desired-worker apply endpoint is exposed at `POST /_hardess/apply-worker`
 - a reload control endpoint is exposed at `POST /_hardess/reload-worker`
-- the local `reload-worker` path is now a debug-only wrapper around an internal apply-state transition
+- the local `reload-worker` path is now a debug-only wrapper around an internal desired-worker apply path
 - worker reload is generation-based: warm next pool, switch active generation, then drain the old one
 - generation snapshots now include worker project prepare metadata such as `deno.json`, `deno.lock`, and frozen-lock status
 - generation snapshots now include `module_cache_dir`, so the prepare cache location is visible from the control surface
 - generation snapshots now include `module_cache.entry_count` and `module_cache.total_bytes`
 - generation manager snapshots now include `version_state` with `desired`, `prepared`, `active`, and `failed` generation tracking
+- `version_state` and `last_prepare` now include timestamps, and failure paths carry an experiment-level `error_kind`
+- generation and prepare snapshots now carry optional control-plane-facing markers such as `declared_artifact_id` and `declared_version`
+- `version_state` now also carries declared markers, so control-plane polling does not need to reconstruct desired/active status from nested generation entries
 - generation manager snapshots now include `last_prepare` so a failed reload attempt is still visible even if traffic stays on the old generation
-- generation/project snapshots are refreshed from disk when queried, so cache stats reflect the current on-node state
+- generation snapshots pin the project metadata that was actually loaded for that generation
+- the module-cache endpoint still inspects the current on-node worker project state
+
+The minimal desired-worker payload shape is now:
+
+- `worker_entry`: local worker entry path on the node
+- `declared_artifact_id`: optional control-plane artifact marker
+- `declared_version`: optional control-plane version marker
+
+In this experiment the runtime still prepares from a local `worker_entry`, but the
+apply path no longer depends on the old `reload current config` assumption.
 
 This is still an experiment-level execution model, but it is materially closer
 to the target architecture than creating a fresh runtime per request.
@@ -332,10 +390,10 @@ The ingress-state snapshot includes:
 This first runnable version still does not do the following:
 
 - no production-grade Pingora integration yet
-- no streaming request / response bodies yet
 - no `deno.lock` writes or additive updates yet
 - no lock coverage for the full future `jsr:` / `npm:` package graph yet
 - no full Deno package graph semantics yet
+- no zero-copy response handoff into Pingora yet
 - no sandbox or isolate pooling yet
 - no zero-copy body pipeline yet
 - no business-safe request-path warmup hook yet; current warmup is structural

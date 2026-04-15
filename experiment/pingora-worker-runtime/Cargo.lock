@@ -1043,7 +1043,6 @@ dependencies = [
  "sha2",
  "tokio",
  "ureq",
- "url",
  "worker-abi",
 ]
 

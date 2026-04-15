@@ -57,6 +57,8 @@ Owns:
 Owns:
 
 - receiving the desired worker artifact or version reference
+- exposing one stable execution contract to worker code:
+  - `fetch(request, env, ctx)`
 - resolving `deno.json` / `deno.lock`
 - preparing dependencies and local cache
 - warming the next generation
@@ -129,13 +131,56 @@ Prefer low-coupling, broad-value steps first.
 
 - mark local write endpoints as debug-only in docs and code comments
 - add a neutral runtime state-machine concept such as `desired_version` / `prepared_version` / `active_version`
+- expose a runtime-local artifact marker even before the real control-plane version exists
 - keep strengthening read-only observability for generations, prepare state, and cache state
+
+The experiment now exposes a local `artifact_id` on worker project snapshots and
+generation state.
+
+Current semantics:
+
+- format: `local-sha256:<hex>`
+- source: hash of the local worker project files under the discovered root
+- purpose: runtime-local observability and correlation
+- non-goal: this is not a globally assigned control-plane version id
 
 ### Tier 2: control-plane handoff shape
 
 - define the minimal desired-artifact payload the runtime consumes
 - define runtime status reporting fields for `preparing`, `ready`, `active`, `failed`
 - make local apply logic reusable from a future control-plane adapter
+
+The experiment now has a concrete minimal desired-worker payload:
+
+- `worker_entry`
+- `declared_artifact_id` optional
+- `declared_version` optional
+
+Current intent:
+
+- `worker_entry` tells the runtime what local artifact entry to prepare
+- `declared_artifact_id` lets the control plane correlate a node-local prepare with a published artifact
+- `declared_version` lets operators and status APIs keep a human-meaningful rollout token
+
+The local `POST /_hardess/apply-worker` endpoint is debug-only, but it now exercises
+the same internal apply path that a future control-plane adapter should call.
+
+The runtime status surface now preserves both classes of identifiers:
+
+- local runtime-derived identifiers such as `desired_artifact_id` / `active_artifact_id`
+- control-plane-declared identifiers such as `desired_declared_artifact_id` / `active_declared_version`
+
+That split is important:
+
+- the local artifact id answers "what bytes did this node actually prepare?"
+- the declared id/version answers "what rollout unit did the control plane intend?"
+
+This experiment no longer carries a separate compatibility protocol path.
+
+Current assumption:
+
+- the control plane delivers a worker artifact whose TS entry exports `fetch(request, env, ctx)`
+- the runtime node is not responsible for adapting legacy business protocols inside this workspace
 
 ### Tier 3: production convergence
 

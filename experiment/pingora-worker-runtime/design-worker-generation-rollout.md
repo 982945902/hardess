@@ -78,7 +78,7 @@ Required before cutover:
 - create `JsRuntime`
 - bootstrap runtime helpers
 - load worker module
-- detect invocation mode
+- resolve the single `fetch(request, env, ctx)` handler
 
 ### Request-path warmup
 
@@ -105,13 +105,14 @@ That requires old generations not to be destroyed immediately at cutover time.
 
 ## Control surface
 
-The experiment currently exposes an explicit reload control:
+The experiment currently exposes explicit local write controls:
 
+- `POST /_hardess/apply-worker`
 - `POST /_hardess/reload-worker`
 
 In the experiment, that endpoint should:
 
-- build the next generation using the configured worker entry
+- build the next generation using the desired worker entry
 - switch traffic only after the next generation is ready
 - return a generation snapshot
 
@@ -147,6 +148,6 @@ That makes cutovers debuggable.
 
 ## Recommended next steps
 
-1. replace local reload semantics with a control-plane-driven desired-version apply flow
+1. converge local reload semantics onto the desired-worker apply flow
 2. add rollback policy and retention window for previous generations
 3. keep local write endpoints as debug-only surfaces while preserving read-only observability

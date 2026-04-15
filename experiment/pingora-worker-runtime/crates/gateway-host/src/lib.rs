@@ -1,9 +1,10 @@
-mod compat_v1;
+mod public_error;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,11 +26,14 @@ use base64::Engine;
 use deno_ast::MediaType;
 use deno_ast::ParseParams;
 use deno_ast::SourceMapOption;
+use deno_core::convert::Uint8Array;
 use deno_core::error::ModuleLoaderError;
+use deno_core::op2;
 use deno_core::resolve_import;
 use deno_core::resolve_path;
 use deno_core::serde_v8;
 use deno_core::v8;
+use deno_core::GarbageCollected;
 use deno_core::JsRuntime;
 use deno_core::ModuleLoadOptions;
 use deno_core::ModuleLoadReferrer;
@@ -42,6 +46,7 @@ use deno_core::ModuleType;
 use deno_core::ResolutionKind;
 use deno_core::RuntimeOptions;
 use deno_error::JsErrorBox;
+use pingora::protocols::http::ServerSession;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -56,26 +61,12 @@ use worker_abi::WorkerRequest;
 use worker_abi::WorkerResponse;
 use worker_abi::WorkerRuntime;
 
-pub use compat_v1::bad_request_public_error;
-pub use compat_v1::build_compat_context;
-pub use compat_v1::build_compat_env;
-pub use compat_v1::build_host_execution_envelope;
-pub use compat_v1::build_host_execution_envelope_from_context;
-pub use compat_v1::internal_public_error;
-pub use compat_v1::parse_v1_request;
-pub use compat_v1::parse_v1_response;
-pub use compat_v1::parsed_v1_response_to_worker_response;
-pub use compat_v1::public_error_response;
-pub use compat_v1::shutdown_draining_public_error;
-pub use compat_v1::CompatContext;
-pub use compat_v1::CompatEnv;
-pub use compat_v1::CompatInvocationRecord;
-pub use compat_v1::CompatMetadata;
-pub use compat_v1::CompatPublicError;
-pub use compat_v1::CompatPublicErrorCategory;
-pub use compat_v1::HostExecutionEnvelope;
-pub use compat_v1::ParsedV1Request;
-pub use compat_v1::ParsedV1Response;
+pub use public_error::bad_request_public_error;
+pub use public_error::internal_public_error;
+pub use public_error::public_error_response;
+pub use public_error::shutdown_draining_public_error;
+pub use public_error::PublicError;
+pub use public_error::PublicErrorCategory;
 
 type SourceMapStore = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 const REMOTE_CACHE_MAX_ENTRIES: usize = 128;
@@ -85,6 +76,7 @@ const REMOTE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 struct WorkerProjectConfig {
     #[allow(dead_code)]
     root_dir: PathBuf,
+    worker_entry: PathBuf,
     config_path: Option<PathBuf>,
     cache_dir: PathBuf,
     config_specifier: ModuleSpecifier,
@@ -95,6 +87,7 @@ struct WorkerProjectConfig {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkerProjectSnapshot {
     pub root_dir: String,
+    pub artifact_id: String,
     pub deno_json_path: Option<String>,
     pub module_cache_dir: String,
     pub module_cache: WorkerModuleCacheSnapshot,
@@ -167,12 +160,15 @@ impl WorkerProjectConfig {
                 worker_entry.display()
             )
         })?;
-        let start_dir = canonical_entry.parent().with_context(|| {
-            format!(
-                "worker entry {} must have a parent directory",
-                canonical_entry.display()
-            )
-        })?;
+        let start_dir = canonical_entry
+            .parent()
+            .with_context(|| {
+                format!(
+                    "worker entry {} must have a parent directory",
+                    canonical_entry.display()
+                )
+            })?
+            .to_path_buf();
 
         for candidate_dir in start_dir.ancestors() {
             let deno_json_path = candidate_dir.join("deno.json");
@@ -195,6 +191,7 @@ impl WorkerProjectConfig {
 
             return Ok(Self {
                 root_dir: candidate_dir.to_path_buf(),
+                worker_entry: canonical_entry.clone(),
                 config_path: Some(deno_json_path),
                 cache_dir,
                 config_specifier,
@@ -203,7 +200,7 @@ impl WorkerProjectConfig {
             });
         }
 
-        let root_dir = start_dir.to_path_buf();
+        let root_dir = start_dir.clone();
         let config_specifier = resolve_path(
             root_dir
                 .join("__hardess_virtual_deno_json__")
@@ -214,6 +211,7 @@ impl WorkerProjectConfig {
 
         Ok(Self {
             root_dir,
+            worker_entry: canonical_entry,
             config_path: None,
             cache_dir: start_dir.join(".hardess-cache").join("remote_modules"),
             config_specifier,
@@ -226,9 +224,11 @@ impl WorkerProjectConfig {
         let mut imports = self.imports.keys().cloned().collect::<Vec<_>>();
         imports.sort();
         let module_cache = self.prune_and_inventory_cache()?;
+        let artifact_id = self.compute_artifact_id()?;
 
         Ok(WorkerProjectSnapshot {
             root_dir: self.root_dir.display().to_string(),
+            artifact_id,
             deno_json_path: self
                 .config_path
                 .as_ref()
@@ -535,6 +535,56 @@ impl WorkerProjectConfig {
                 .sum(),
         })
     }
+
+    fn compute_artifact_id(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        let files = self.collect_artifact_files(&self.root_dir)?;
+        for path in files {
+            let relative = path
+                .strip_prefix(&self.root_dir)
+                .unwrap_or(&path)
+                .to_string_lossy();
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("unable to read artifact file {}", path.display()))?;
+            hasher.update(&bytes);
+            hasher.update([0xff]);
+        }
+        hasher.update(self.worker_entry.to_string_lossy().as_bytes());
+        Ok(format!("local-sha256:{}", hex_digest(&hasher.finalize())))
+    }
+
+    fn collect_artifact_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        self.collect_artifact_files_into(dir, &mut files)?;
+        files.sort();
+        Ok(files)
+    }
+
+    fn collect_artifact_files_into(&self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(dir).map_err(anyhow::Error::from)? {
+            let entry = entry.map_err(anyhow::Error::from)?;
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+
+            if path.is_dir() {
+                if matches!(file_name, ".hardess-cache" | ".git" | "target") {
+                    continue;
+                }
+                self.collect_artifact_files_into(&path, files)?;
+                continue;
+            }
+
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn resolve_lockfile(
@@ -714,7 +764,557 @@ fn media_type_from_remote(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GatewayRequest {
+    request: WorkerRequest,
+    body: Option<RequestBodySource>,
+}
+
+impl GatewayRequest {
+    pub fn buffered(mut request: WorkerRequest) -> Self {
+        let body = request
+            .body
+            .take()
+            .map(|body| RequestBodySource::buffered(body.into_bytes()));
+        Self { request, body }
+    }
+
+    pub fn streaming(request: WorkerRequest) -> (Self, IngressRequestBody) {
+        let (body, ingress_body) = RequestBodySource::streaming();
+        (
+            Self {
+                request,
+                body: Some(body),
+            },
+            ingress_body,
+        )
+    }
+
+    pub fn completion_policy(&self) -> RequestBodyCompletionPolicy {
+        if self.body.is_none() {
+            return RequestBodyCompletionPolicy::AlreadyComplete;
+        }
+
+        let headers = &self.request.headers;
+        if let Some(content_length) = headers.get("content-length") {
+            if let Ok(length) = content_length.trim().parse::<u64>() {
+                if length == 0 {
+                    return RequestBodyCompletionPolicy::AlreadyComplete;
+                }
+                if length <= 64 * 1024 {
+                    return RequestBodyCompletionPolicy::Drain;
+                }
+            }
+        }
+
+        if headers.contains_key("transfer-encoding") {
+            return RequestBodyCompletionPolicy::DisableKeepalive;
+        }
+
+        RequestBodyCompletionPolicy::DisableKeepalive
+    }
+
+    fn into_js_request(self) -> JsWorkerRequest {
+        JsWorkerRequest {
+            method: self.request.method,
+            url: self.request.url,
+            headers: self.request.headers.into_iter().collect(),
+            body: self.body,
+        }
+    }
+
+    fn is_retry_safe(&self) -> bool {
+        self.body
+            .as_ref()
+            .map_or(true, RequestBodySource::is_retry_safe)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyCompletionPolicy {
+    AlreadyComplete,
+    Drain,
+    DisableKeepalive,
+}
+
+#[derive(Debug, Clone)]
+struct RequestBodySource {
+    state: Arc<Mutex<RequestBodyState>>,
+}
+
+#[derive(Debug)]
+enum RequestBodyState {
+    Buffered {
+        bytes: Option<Vec<u8>>,
+    },
+    Streaming {
+        command_tx: tokio_mpsc::UnboundedSender<RequestBodyCommand>,
+        started: bool,
+        completed: bool,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+enum RequestBodyCommand {
+    ReadNext {
+        response_tx: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+}
+
+#[derive(Debug)]
+pub struct IngressRequestBody {
+    command_rx: tokio_mpsc::UnboundedReceiver<RequestBodyCommand>,
+    finished: bool,
+}
+
+#[derive(Debug)]
+pub struct GatewayResponse {
+    status: u16,
+    headers: std::collections::BTreeMap<String, String>,
+    body: GatewayResponseBody,
+}
+
+#[derive(Debug)]
+pub enum GatewayResponseBody {
+    Empty,
+    Buffered(Vec<u8>),
+    Streaming(IngressResponseBody),
+}
+
+#[derive(Debug)]
+pub struct IngressResponseBody {
+    command_tx: tokio_mpsc::UnboundedSender<ResponseBodyCommand>,
+    finished: bool,
+}
+
+#[derive(Debug)]
+enum ResponseBodyCommand {
+    ReadNext {
+        response_tx: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+}
+
+struct RuntimeResponseBody {
+    command_rx: tokio_mpsc::UnboundedReceiver<ResponseBodyCommand>,
+    reader: JsResponseChunkReader,
+    finished: bool,
+}
+
+impl GatewayResponse {
+    pub fn empty(status: u16, headers: std::collections::BTreeMap<String, String>) -> Self {
+        Self {
+            status,
+            headers,
+            body: GatewayResponseBody::Empty,
+        }
+    }
+
+    pub fn buffered(
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+        body: Vec<u8>,
+    ) -> Self {
+        if body.is_empty() {
+            return Self::empty(status, headers);
+        }
+
+        Self {
+            status,
+            headers,
+            body: GatewayResponseBody::Buffered(body),
+        }
+    }
+
+    fn streaming(
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+        reader: JsResponseChunkReader,
+    ) -> (Self, RuntimeResponseBody) {
+        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+        (
+            Self {
+                status,
+                headers,
+                body: GatewayResponseBody::Streaming(IngressResponseBody {
+                    command_tx,
+                    finished: false,
+                }),
+            },
+            RuntimeResponseBody {
+                command_rx,
+                reader,
+                finished: false,
+            },
+        )
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn headers(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.headers
+    }
+
+    pub fn take_body(&mut self) -> GatewayResponseBody {
+        mem::replace(&mut self.body, GatewayResponseBody::Empty)
+    }
+
+    pub async fn into_worker_response(mut self) -> Result<WorkerResponse, String> {
+        let body_bytes = match self.take_body() {
+            GatewayResponseBody::Empty => Vec::new(),
+            GatewayResponseBody::Buffered(bytes) => bytes,
+            GatewayResponseBody::Streaming(mut body) => {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = body.read_next_chunk().await? {
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes
+            }
+        };
+
+        let body = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(body_bytes).map_err(|error| error.to_string())?)
+        };
+
+        Ok(WorkerResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+        })
+    }
+}
+
+impl GatewayResponseBody {
+    pub async fn read_next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            GatewayResponseBody::Empty => Ok(None),
+            GatewayResponseBody::Buffered(bytes) => Ok(Some(mem::take(bytes))),
+            GatewayResponseBody::Streaming(body) => body.read_next_chunk().await,
+        }
+    }
+}
+
+impl RequestBodySource {
+    fn buffered(bytes: Vec<u8>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RequestBodyState::Buffered {
+                bytes: Some(bytes),
+            })),
+        }
+    }
+
+    fn streaming() -> (Self, IngressRequestBody) {
+        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+        (
+            Self {
+                state: Arc::new(Mutex::new(RequestBodyState::Streaming {
+                    command_tx,
+                    started: false,
+                    completed: false,
+                    error: None,
+                })),
+            },
+            IngressRequestBody {
+                command_rx,
+                finished: false,
+            },
+        )
+    }
+
+    fn is_retry_safe(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("request body state mutex should not be poisoned");
+        match &*state {
+            RequestBodyState::Buffered { .. } => true,
+            RequestBodyState::Streaming { started, .. } => !started,
+        }
+    }
+
+    async fn read_next_chunk(&self) -> Result<Option<Vec<u8>>, String> {
+        let command_tx = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("request body state mutex should not be poisoned");
+            match &mut *state {
+                RequestBodyState::Buffered { bytes } => return Ok(bytes.take()),
+                RequestBodyState::Streaming {
+                    command_tx,
+                    started,
+                    completed,
+                    error,
+                } => {
+                    if *completed {
+                        if let Some(error) = error.as_ref() {
+                            return Err(error.clone());
+                        }
+                        return Ok(None);
+                    }
+                    *started = true;
+                    command_tx.clone()
+                }
+            }
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        command_tx
+            .send(RequestBodyCommand::ReadNext { response_tx })
+            .map_err(|_| "request body bridge is not available".to_string())?;
+
+        let result = response_rx
+            .await
+            .map_err(|_| "request body bridge dropped response channel".to_string())?;
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("request body state mutex should not be poisoned");
+        if let RequestBodyState::Streaming {
+            completed, error, ..
+        } = &mut *state
+        {
+            match &result {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    *completed = true;
+                }
+                Err(body_error) => {
+                    *completed = true;
+                    *error = Some(body_error.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn read_all_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.read_next_chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+}
+
+impl IngressRequestBody {
+    pub async fn service_next(&mut self, http_stream: &mut ServerSession) -> bool {
+        let Some(command) = self.command_rx.recv().await else {
+            return false;
+        };
+
+        match command {
+            RequestBodyCommand::ReadNext { response_tx } => {
+                let result = if self.finished {
+                    Ok(None)
+                } else {
+                    match http_stream.read_request_body().await {
+                        Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+                        Ok(None) => {
+                            self.finished = true;
+                            Ok(None)
+                        }
+                        Err(error) => {
+                            self.finished = true;
+                            Err(error.to_string())
+                        }
+                    }
+                };
+                let _ = response_tx.send(result);
+                true
+            }
+        }
+    }
+
+    pub async fn finish(
+        &mut self,
+        http_stream: &mut ServerSession,
+        policy: RequestBodyCompletionPolicy,
+    ) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+
+        match policy {
+            RequestBodyCompletionPolicy::AlreadyComplete => {}
+            RequestBodyCompletionPolicy::Drain => {
+                http_stream
+                    .drain_request_body()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            RequestBodyCompletionPolicy::DisableKeepalive => {
+                http_stream.set_keepalive(None);
+            }
+        }
+
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl IngressResponseBody {
+    pub async fn read_next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ResponseBodyCommand::ReadNext { response_tx })
+            .map_err(|_| "response body bridge is not available".to_string())?;
+
+        let result = response_rx
+            .await
+            .map_err(|_| "response body bridge dropped response channel".to_string())?;
+        if !matches!(result, Ok(Some(_))) {
+            self.finished = true;
+        }
+        result
+    }
+}
+
+impl RuntimeResponseBody {
+    async fn service_next(&mut self, runtime: &mut DenoWorkerRuntime) -> bool {
+        let Some(command) = self.command_rx.recv().await else {
+            return false;
+        };
+
+        match command {
+            ResponseBodyCommand::ReadNext { response_tx } => {
+                let result = if self.finished {
+                    Ok(None)
+                } else {
+                    runtime.read_next_response_chunk(&self.reader).await
+                };
+                if !matches!(result, Ok(Some(_))) {
+                    self.finished = true;
+                }
+                let _ = response_tx.send(result);
+                true
+            }
+        }
+    }
+
+    async fn finish(&mut self, runtime: &mut DenoWorkerRuntime) {
+        while self.service_next(runtime).await {}
+    }
+}
+
+#[derive(Debug)]
+struct JsWorkerRequest {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<RequestBodySource>,
+}
+
+unsafe impl GarbageCollected for JsWorkerRequest {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static std::ffi::CStr {
+        c"WorkerRequestHandle"
+    }
+}
+
+#[op2(fast)]
+fn op_worker_request_is_backing(#[cppgc] request: Option<&JsWorkerRequest>) -> bool {
+    request.is_some()
+}
+
+#[op2]
+#[string]
+fn op_worker_request_get_method(#[cppgc] request: &JsWorkerRequest) -> String {
+    request.method.clone()
+}
+
+#[op2]
+#[string]
+fn op_worker_request_get_url(#[cppgc] request: &JsWorkerRequest) -> String {
+    request.url.clone()
+}
+
+#[op2]
+#[serde]
+fn op_worker_request_get_headers(#[cppgc] request: &JsWorkerRequest) -> Vec<(String, String)> {
+    request.headers.clone()
+}
+
+#[op2(fast)]
+fn op_worker_request_has_body(#[cppgc] request: &JsWorkerRequest) -> bool {
+    request.body.is_some()
+}
+
+#[op2]
+async fn op_worker_request_read_next_chunk(
+    #[cppgc] request: &JsWorkerRequest,
+) -> Result<Option<Uint8Array>, JsErrorBox> {
+    let Some(body) = request.body.as_ref() else {
+        return Ok(None);
+    };
+    body.read_next_chunk()
+        .await
+        .map(|chunk| chunk.map(Into::into))
+        .map_err(JsErrorBox::generic)
+}
+
+#[op2]
+async fn op_worker_request_read_all_bytes(
+    #[cppgc] request: &JsWorkerRequest,
+) -> Result<Uint8Array, JsErrorBox> {
+    let Some(body) = request.body.as_ref() else {
+        return Ok(Vec::<u8>::new().into());
+    };
+    body.read_all_bytes()
+        .await
+        .map(Into::into)
+        .map_err(JsErrorBox::generic)
+}
+
+deno_core::extension!(
+    hardess_runtime_bridge,
+    ops = [
+        op_worker_request_is_backing,
+        op_worker_request_get_method,
+        op_worker_request_get_url,
+        op_worker_request_get_headers,
+        op_worker_request_has_body,
+        op_worker_request_read_next_chunk,
+        op_worker_request_read_all_bytes,
+    ]
+);
+
 const WEB_RUNTIME_BOOTSTRAP: &str = r#"
+const workerRequestOps = {
+  isBacking(value) {
+    return Deno.core.ops.op_worker_request_is_backing(value);
+  },
+  method(value) {
+    return Deno.core.ops.op_worker_request_get_method(value);
+  },
+  url(value) {
+    return Deno.core.ops.op_worker_request_get_url(value);
+  },
+  headers(value) {
+    return Deno.core.ops.op_worker_request_get_headers(value);
+  },
+  hasBody(value) {
+    return Deno.core.ops.op_worker_request_has_body(value);
+  },
+  async readNextChunk(value) {
+    return await Deno.core.ops.op_worker_request_read_next_chunk(value);
+  },
+  async readAllBytes(value) {
+    return await Deno.core.ops.op_worker_request_read_all_bytes(value);
+  },
+};
+
 class Headers {
   constructor(init = undefined) {
     this._map = new Map();
@@ -801,35 +1401,176 @@ class Headers {
   }
 }
 
+class RequestBody {
+  constructor(owner) {
+    this._owner = owner;
+  }
+
+  async nextChunk() {
+    return await this._owner._readNextChunkForBody();
+  }
+
+  async *[Symbol.asyncIterator]() {
+    while (true) {
+      const chunk = await this.nextChunk();
+      if (chunk === null) {
+        return;
+      }
+      yield chunk;
+    }
+  }
+}
+
 class Request {
   constructor(input, init = undefined) {
+    this._backing = null;
+    this._streamingBody = null;
+    this._bodyBytes = undefined;
+
     if (input instanceof Request) {
+      if (
+        input._streamingBody !== null &&
+        input._bodyBytes === undefined &&
+        input._bodyText === undefined
+      ) {
+        throw new TypeError(
+          "Request.clone() with a streaming body is not supported in this experiment",
+        );
+      }
+      this._backing = input._backing;
       this.method = init?.method ?? input.method;
       this.url = init?.url ?? input.url;
       this.headers = new Headers(init?.headers ?? input.headers);
-      this._bodyText = init?.body ?? input._bodyText;
+      this._streamingBody = null;
+      this._bodyBytes = input._bodyBytes;
+      this._bodyText =
+        init && Object.hasOwn(init, "body") ? init.body : input._bodyText;
+    } else if (workerRequestOps.isBacking(input)) {
+      this._backing = input;
+      this.method = init?.method ?? workerRequestOps.method(input);
+      this.url = init?.url ?? workerRequestOps.url(input);
+      this.headers = new Headers(init?.headers ?? workerRequestOps.headers(input));
+      this._streamingBody =
+        init && Object.hasOwn(init, "body")
+          ? null
+          : workerRequestOps.hasBody(input)
+            ? input
+            : null;
+      this._bodyText =
+        init && Object.hasOwn(init, "body") ? init.body : undefined;
     } else {
       this.method = init?.method ?? "GET";
       this.url = String(input);
       this.headers = new Headers(init?.headers);
-      this._bodyText = init?.body ?? null;
+      this._bodyText =
+        init && Object.hasOwn(init, "body") ? init.body : undefined;
     }
 
     this.method = String(this.method).toUpperCase();
     this.bodyUsed = false;
+    this.body = this._streamingBody !== null ? new RequestBody(this) : null;
+  }
+
+  async _readNextChunkForBody() {
+    if (this._bodyBytes !== undefined || this._bodyText !== undefined) {
+      return null;
+    }
+
+    if (this._streamingBody === null) {
+      this.body = null;
+      return null;
+    }
+
+    this.bodyUsed = true;
+    const chunk = await workerRequestOps.readNextChunk(this._streamingBody);
+    if (chunk === null) {
+      this._streamingBody = null;
+      this.body = null;
+    }
+    return chunk;
+  }
+
+  async _readAllBytes() {
+    if (this.bodyUsed && this._bodyBytes === undefined && this._bodyText === undefined) {
+      throw new TypeError("Body already used");
+    }
+
+    if (this._bodyBytes !== undefined) {
+      return this._bodyBytes.slice();
+    }
+
+    if (this._bodyText !== undefined) {
+      this._bodyBytes = Deno.core.encode(this._bodyText);
+      this.body = null;
+      return this._bodyBytes.slice();
+    }
+
+    this.bodyUsed = true;
+    if (this._streamingBody === null) {
+      this._bodyBytes = new Uint8Array(0);
+      this.body = null;
+      return this._bodyBytes.slice();
+    }
+
+    this._bodyBytes = await workerRequestOps.readAllBytes(this._streamingBody);
+    this._streamingBody = null;
+    this.body = null;
+    return this._bodyBytes.slice();
   }
 
   async text() {
+    if (this._bodyText === undefined) {
+      this._bodyText = Deno.core.decode(await this._readAllBytes());
+    }
     this.bodyUsed = true;
-    return this._bodyText ?? "";
+    return this._bodyText;
   }
 
   async json() {
     return JSON.parse(await this.text());
   }
 
+  async arrayBuffer() {
+    const bytes = await this._readAllBytes();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+
   clone() {
     return new Request(this);
+  }
+}
+
+function cloneBytes(bytes) {
+  return bytes.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+function toBodyBytes(value) {
+  if (value instanceof Uint8Array) {
+    return cloneBytes(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value.slice(0));
+  }
+  return Deno.core.encode(String(value));
+}
+
+class ResponseBody {
+  constructor(owner) {
+    this._owner = owner;
+  }
+
+  async nextChunk() {
+    return await this._owner._readNextChunkForBody();
+  }
+
+  async *[Symbol.asyncIterator]() {
+    while (true) {
+      const chunk = await this.nextChunk();
+      if (chunk === null) {
+        return;
+      }
+      yield chunk;
+    }
   }
 }
 
@@ -838,20 +1579,146 @@ class Response {
     this.status = Math.trunc(init?.status ?? 200);
     this.statusText = String(init?.statusText ?? "");
     this.headers = new Headers(init?.headers);
-    this._bodyText = body == null ? null : String(body);
+    this._streamingBody = null;
+    this._bodyBytes = undefined;
+    this._bodyText = undefined;
+
+    if (body == null) {
+      this._bodyBytes = new Uint8Array(0);
+    } else if (typeof body === "string") {
+      this._bodyText = body;
+    } else if (body instanceof Uint8Array) {
+      this._bodyBytes = cloneBytes(body);
+    } else if (body instanceof ArrayBuffer) {
+      this._bodyBytes = new Uint8Array(body.slice(0));
+    } else if (typeof body[Symbol.asyncIterator] === "function") {
+      this._streamingBody = body[Symbol.asyncIterator]();
+    } else {
+      this._bodyText = String(body);
+    }
+
     this.bodyUsed = false;
+    this.body = this._streamingBody !== null ? new ResponseBody(this) : null;
+  }
+
+  async _readNextChunkForBody() {
+    if (this._bodyBytes !== undefined) {
+      const bytes = this._bodyBytes;
+      this._bodyBytes = new Uint8Array(0);
+      this.body = null;
+      this.bodyUsed = true;
+      return bytes.byteLength === 0 ? null : cloneBytes(bytes);
+    }
+
+    if (this._bodyText !== undefined) {
+      const bytes = Deno.core.encode(this._bodyText);
+      this._bodyText = "";
+      this.body = null;
+      this.bodyUsed = true;
+      return bytes.byteLength === 0 ? null : bytes;
+    }
+
+    if (this._streamingBody === null) {
+      this.body = null;
+      return null;
+    }
+
+    this.bodyUsed = true;
+    const next = await this._streamingBody.next();
+    if (next.done) {
+      this._streamingBody = null;
+      this.body = null;
+      return null;
+    }
+
+    return toBodyBytes(next.value);
+  }
+
+  async _readAllBytes() {
+    if (this.bodyUsed && this._streamingBody !== null) {
+      throw new TypeError("Body already used");
+    }
+
+    if (this._bodyBytes !== undefined) {
+      this.bodyUsed = true;
+      this.body = null;
+      return cloneBytes(this._bodyBytes);
+    }
+
+    if (this._bodyText !== undefined) {
+      this.bodyUsed = true;
+      this.body = null;
+      return Deno.core.encode(this._bodyText);
+    }
+
+    let total = 0;
+    const chunks = [];
+    while (true) {
+      const chunk = await this._readNextChunkForBody();
+      if (chunk === null) {
+        break;
+      }
+      total += chunk.byteLength;
+      chunks.push(chunk);
+    }
+
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    this._bodyBytes = merged;
+    return cloneBytes(merged);
+  }
+
+  _bridgeCanStreamBody() {
+    return this._streamingBody !== null;
+  }
+
+  _bridgeBufferedBytes() {
+    if (this._streamingBody !== null) {
+      throw new TypeError("Streaming response body must be consumed through bodyChunkReader");
+    }
+
+    if (this._bodyBytes !== undefined) {
+      return cloneBytes(this._bodyBytes);
+    }
+
+    if (this._bodyText !== undefined) {
+      return Deno.core.encode(this._bodyText);
+    }
+
+    return new Uint8Array(0);
+  }
+
+  async _bridgeReadNextChunk() {
+    return await this._readNextChunkForBody();
   }
 
   async text() {
+    if (this._bodyText === undefined) {
+      this._bodyText = Deno.core.decode(await this._readAllBytes());
+    }
     this.bodyUsed = true;
-    return this._bodyText ?? "";
+    return this._bodyText;
   }
 
   async json() {
     return JSON.parse(await this.text());
   }
 
+  async arrayBuffer() {
+    const bytes = await this._readAllBytes();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+
   clone() {
+    if (this._streamingBody !== null) {
+      throw new TypeError(
+        "Response.clone() with a streaming body is not supported in this experiment",
+      );
+    }
     return new Response(this._bodyText, {
       status: this.status,
       statusText: this.statusText,
@@ -864,43 +1731,6 @@ globalThis.Headers = Headers;
 globalThis.Request = Request;
 globalThis.Response = Response;
 "#;
-
-fn build_public_error_runtime_bootstrap_script() -> Result<String> {
-    let contract_json = serde_json::to_string(compat_v1::public_error_contract_json())?;
-
-    Ok(format!(
-        r#"(function () {{
-  const contract = JSON.parse({contract_json});
-  const byCode = Object.freeze(Object.fromEntries(
-    contract.errors
-      .filter((spec) => spec.public === true)
-      .map((spec) => [
-        spec.code,
-        Object.freeze({{
-          code: spec.code,
-          category: spec.category,
-          status: spec.status,
-          retryable: spec.retryable,
-        }}),
-      ]),
-  ));
-
-  globalThis.HardessPublicErrors = Object.freeze({{
-    version: contract.version,
-    list: Object.freeze(Object.values(byCode)),
-    codes() {{
-      return Object.keys(byCode);
-    }},
-    has(code) {{
-      return Object.prototype.hasOwnProperty.call(byCode, String(code));
-    }},
-    get(code) {{
-      return byCode[String(code)] ?? null;
-    }},
-  }});
-}})()"#
-    ))
-}
 
 struct TypescriptModuleLoader {
     source_maps: SourceMapStore,
@@ -1045,21 +1875,63 @@ impl TypescriptModuleLoader {
 
 pub struct DenoWorkerRuntime {
     js_runtime: JsRuntime,
-    invocation_mode: WorkerInvocationMode,
     invoke_bridge: v8::Global<v8::Function>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerInvocationMode {
-    WebFetch,
-    CompatV1,
+struct JsResponseChunkReader {
+    next_chunk: v8::Global<v8::Function>,
+}
+
+struct PendingGatewayResponse {
+    response: GatewayResponse,
+    runtime_body: Option<RuntimeResponseBody>,
+}
+
+impl PendingGatewayResponse {
+    async fn into_worker_response(
+        mut self,
+        runtime: &mut DenoWorkerRuntime,
+    ) -> Result<WorkerResponse, String> {
+        let body_bytes = match self.response.take_body() {
+            GatewayResponseBody::Empty => Vec::new(),
+            GatewayResponseBody::Buffered(bytes) => bytes,
+            GatewayResponseBody::Streaming(_) => {
+                let mut body = Vec::new();
+                let runtime_body = self.runtime_body.as_mut().ok_or_else(|| {
+                    "streaming response bridge is missing runtime body".to_string()
+                })?;
+                loop {
+                    let Some(chunk) = runtime
+                        .read_next_response_chunk(&runtime_body.reader)
+                        .await?
+                    else {
+                        break;
+                    };
+                    body.extend_from_slice(&chunk);
+                }
+                body
+            }
+        };
+
+        let body = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(body_bytes).map_err(|error| error.to_string())?)
+        };
+
+        Ok(WorkerResponse {
+            status: self.response.status,
+            headers: self.response.headers,
+            body,
+        })
+    }
 }
 
 struct RuntimeThreadMessage {
-    request: WorkerRequest,
+    request: GatewayRequest,
     env: WorkerEnv,
     ctx: WorkerContext,
-    response_tx: oneshot::Sender<Result<WorkerResponse, RuntimePoolError>>,
+    response_tx: oneshot::Sender<Result<GatewayResponse, RuntimePoolError>>,
 }
 
 struct RuntimeThreadInstance {
@@ -1225,6 +2097,12 @@ impl WorkerRuntimeSlot {
                     let mut should_exit = false;
 
                     while let Some(message) = receiver.recv().await {
+                        let RuntimeThreadMessage {
+                            request,
+                            env,
+                            ctx,
+                            response_tx,
+                        } = message;
                         thread_metrics_for_thread
                             .queue_depth
                             .fetch_sub(1, Ordering::Relaxed);
@@ -1242,8 +2120,27 @@ impl WorkerRuntimeSlot {
                         let _ = watchdog_tx.send(WatchdogCommand::Arm { request_id });
                         let started_at = Instant::now();
                         let worker_result = worker_runtime
-                            .fetch(message.request, message.env, message.ctx)
+                            .start_gateway_response(request, env, ctx)
                             .await;
+                        let mut response_tx = Some(response_tx);
+                        let result = if timed_out_request_id.load(Ordering::Relaxed) == request_id {
+                            Err(RuntimePoolError::TimedOut(exec_timeout.as_millis() as u64))
+                        } else {
+                            match worker_result {
+                                Ok(mut pending_response) => {
+                                    if let Some(response_tx) = response_tx.take() {
+                                        let _ = response_tx.send(Ok(pending_response.response));
+                                    }
+                                    if let Some(runtime_body) =
+                                        pending_response.runtime_body.as_mut()
+                                    {
+                                        runtime_body.finish(&mut worker_runtime).await;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(RuntimePoolError::Worker(error)),
+                            }
+                        };
                         let elapsed = started_at.elapsed().as_nanos() as u64;
                         let timed_out = timed_out_request_id.load(Ordering::Relaxed) == request_id;
                         let _ = watchdog_tx.send(WatchdogCommand::Disarm { request_id });
@@ -1262,11 +2159,6 @@ impl WorkerRuntimeSlot {
                         pool_metrics_for_thread
                             .exec_count
                             .fetch_add(1, Ordering::Relaxed);
-                        let result = if timed_out {
-                            Err(RuntimePoolError::TimedOut(exec_timeout.as_millis() as u64))
-                        } else {
-                            worker_result.map_err(RuntimePoolError::Worker)
-                        };
                         match &result {
                             Ok(_) => {
                                 thread_metrics_for_thread
@@ -1303,7 +2195,14 @@ impl WorkerRuntimeSlot {
                                     .fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        let _ = message.response_tx.send(result);
+                        if let Some(response_tx) = response_tx.take() {
+                            let _ = response_tx.send(match result {
+                                Ok(()) => Err(RuntimePoolError::Unavailable(
+                                    "worker runtime completed without a response".to_string(),
+                                )),
+                                Err(error) => Err(error),
+                            });
+                        }
                         if should_exit {
                             break;
                         }
@@ -1351,10 +2250,10 @@ impl WorkerRuntimeSlot {
 
     async fn execute(
         &self,
-        request: WorkerRequest,
+        request: GatewayRequest,
         env: WorkerEnv,
         ctx: WorkerContext,
-    ) -> Result<WorkerResponse, RuntimePoolError> {
+    ) -> Result<GatewayResponse, RuntimePoolError> {
         let (generation, sender) = {
             let state = self
                 .state
@@ -1496,6 +2395,19 @@ impl WorkerRuntimePool {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<WorkerResponse, RuntimePoolError> {
+        self.execute_gateway(GatewayRequest::buffered(request), env, ctx)
+            .await?
+            .into_worker_response()
+            .await
+            .map_err(RuntimePoolError::Worker)
+    }
+
+    pub async fn execute_gateway(
+        &self,
+        request: GatewayRequest,
+        env: WorkerEnv,
+        ctx: WorkerContext,
+    ) -> Result<GatewayResponse, RuntimePoolError> {
         let start_index = self.next.fetch_add(1, Ordering::Relaxed) % self.handles.len();
         self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
         let mut last_error = None::<RuntimePoolError>;
@@ -1514,6 +2426,9 @@ impl WorkerRuntimePool {
                         last_error = Some(RuntimePoolError::Overloaded);
                     }
                     Err(error) if error.is_retryable_transient() => {
+                        if !request.is_retry_safe() {
+                            return Err(error);
+                        }
                         saw_retryable_transient = true;
                         last_error = Some(error);
                     }
@@ -1790,18 +2705,12 @@ impl DenoWorkerRuntime {
                 source_maps: source_map_store,
                 project_config,
             })),
+            extensions: vec![hardess_runtime_bridge::init()],
             ..Default::default()
         });
         js_runtime
             .execute_script("<web-runtime-bootstrap>", WEB_RUNTIME_BOOTSTRAP)
             .context("unable to bootstrap minimal web runtime")?;
-        js_runtime
-            .execute_script(
-                "<public-error-contract-bootstrap>",
-                build_public_error_runtime_bootstrap_script()
-                    .context("unable to build public error contract bootstrap script")?,
-            )
-            .context("unable to bootstrap public error contract runtime helper")?;
 
         let worker_specifier = resolve_path(
             worker_entry
@@ -1814,12 +2723,11 @@ impl DenoWorkerRuntime {
         let evaluation = js_runtime.mod_evaluate(module_id);
         js_runtime.run_event_loop(Default::default()).await?;
         evaluation.await?;
-        let (invocation_mode, invoke_bridge) =
+        let invoke_bridge =
             Self::initialize_invocation_bridge(&mut js_runtime, &worker_specifier).await?;
 
         Ok(Self {
             js_runtime,
-            invocation_mode,
             invoke_bridge,
         })
     }
@@ -1827,7 +2735,7 @@ impl DenoWorkerRuntime {
     async fn initialize_invocation_bridge(
         js_runtime: &mut JsRuntime,
         worker_specifier: &ModuleSpecifier,
-    ) -> Result<(WorkerInvocationMode, v8::Global<v8::Function>)> {
+    ) -> Result<v8::Global<v8::Function>> {
         let worker_specifier = serde_json::to_string(worker_specifier.as_str())?;
         let bridge_bootstrap_script = format!(
             r#"(async () => {{
@@ -1845,11 +2753,22 @@ impl DenoWorkerRuntime {
 
   const normalizeWebResponse = async (rawResponse) => {{
     if (rawResponse instanceof Response) {{
+      if (rawResponse._bridgeCanStreamBody()) {{
+        return {{
+          status:
+            typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
+          headers: normalizeHeaders(rawResponse.headers),
+          streamBody: true,
+          bodyChunkReader: async () => await rawResponse._bridgeReadNextChunk(),
+        }};
+      }}
+
       return {{
         status:
           typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
         headers: normalizeHeaders(rawResponse.headers),
-        body: await rawResponse.text(),
+        streamBody: false,
+        bodyBytes: rawResponse._bridgeBufferedBytes(),
       }};
     }}
 
@@ -1866,36 +2785,9 @@ impl DenoWorkerRuntime {
       status:
         typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
       headers: normalizeHeaders(rawResponse.headers),
-      body: normalizedBody,
-    }};
-  }};
-
-  const normalizeCompatResponse = async (rawResponse) => {{
-    if (rawResponse instanceof Response) {{
-      return {{
-        status:
-          typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
-        headers: normalizeHeaders(rawResponse.headers),
-        body_text: await rawResponse.text(),
-        error: null,
-      }};
-    }}
-
-    if (rawResponse == null || typeof rawResponse !== "object") {{
-      throw new Error("worker fetchCompat() must resolve to an object response");
-    }}
-
-    let normalizedBody = rawResponse.body_text ?? rawResponse.body ?? null;
-    if (normalizedBody !== null && typeof normalizedBody !== "string") {{
-      normalizedBody = JSON.stringify(normalizedBody);
-    }}
-
-    return {{
-      status:
-        typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
-      headers: normalizeHeaders(rawResponse.headers),
-      body_text: normalizedBody,
-      error: rawResponse.error ?? null,
+      streamBody: false,
+      bodyBytes:
+        normalizedBody === null ? new Uint8Array(0) : Deno.core.encode(normalizedBody),
     }};
   }};
 
@@ -1906,19 +2798,8 @@ impl DenoWorkerRuntime {
       : typeof workerModule.default?.fetch === "function"
         ? workerModule.default.fetch
         : null;
-  const compatCandidate =
-    typeof workerModule.fetchCompat === "function"
-      ? workerModule.fetchCompat
-      : typeof workerModule.default?.fetchCompat === "function"
-        ? workerModule.default.fetchCompat
-        : null;
-
-  const invokeWeb = async (requestInit, env, ctxBase) => {{
-    const request = new Request(requestInit.url, {{
-      method: requestInit.method,
-      headers: requestInit.headers,
-      body: requestInit.body ?? null,
-    }});
+  const invokeWeb = async (requestBacking, env, ctxBase) => {{
+    const request = new Request(requestBacking);
     const waitUntilPromises = [];
     const ctx = {{
       ...ctxBase,
@@ -1932,31 +2813,11 @@ impl DenoWorkerRuntime {
     return await normalizeWebResponse(rawResponse);
   }};
 
-  const invokeCompat = async (request, env, ctxBase) => {{
-    const waitUntilPromises = [];
-    const ctx = {{
-      ...ctxBase,
-      waitUntil(value) {{
-        waitUntilPromises.push(Promise.resolve(value));
-      }},
-    }};
-
-    const rawResponse = await compatCandidate(request, env, ctx);
-    await Promise.allSettled(waitUntilPromises);
-    return await normalizeCompatResponse(rawResponse);
-  }};
-
-  if (typeof compatCandidate === "function") {{
-    return ["compat_v1", invokeCompat];
-  }}
-
   if (typeof webCandidate === "function") {{
-    return ["web_fetch", invokeWeb];
+    return invokeWeb;
   }}
 
-  throw new Error(
-    "worker module must export fetch(request, env, ctx) or fetchCompat(request, env, ctx)",
-  );
+  throw new Error("worker module must export fetch(request, env, ctx)");
 }})()"#
         );
         let value = js_runtime.execute_script(
@@ -1966,55 +2827,172 @@ impl DenoWorkerRuntime {
         #[allow(deprecated, reason = "good enough for experiment bootstrap")]
         let resolved = js_runtime.resolve_value(value).await?;
 
-        let (mode, invoke_bridge) = {
+        let invoke_bridge = {
             deno_core::scope!(scope, js_runtime);
             let local = v8::Local::new(scope, resolved);
-            let bridge_tuple = v8::Local::<v8::Array>::try_from(local).map_err(|_| {
-                anyhow::anyhow!("worker invocation bridge bootstrap must return [mode, invokeFn]")
-            })?;
-            let mode_value = bridge_tuple
-                .get_index(scope, 0)
-                .ok_or_else(|| anyhow::anyhow!("worker invocation bridge mode is missing"))?;
-            let invoke_value = bridge_tuple
-                .get_index(scope, 1)
-                .ok_or_else(|| anyhow::anyhow!("worker invocation bridge function is missing"))?;
-            let mode = serde_v8::from_v8::<String>(scope, mode_value)?;
-            let invoke_bridge = v8::Local::<v8::Function>::try_from(invoke_value)
+            let invoke_bridge = v8::Local::<v8::Function>::try_from(local)
                 .map_err(|_| anyhow::anyhow!("worker invocation bridge must return a function"))?;
 
-            (mode, v8::Global::new(scope, invoke_bridge))
+            v8::Global::new(scope, invoke_bridge)
         };
-
-        match mode.as_str() {
-            "web_fetch" => Ok((WorkerInvocationMode::WebFetch, invoke_bridge)),
-            "compat_v1" => Ok((WorkerInvocationMode::CompatV1, invoke_bridge)),
-            other => bail!("unknown worker invocation mode `{other}`"),
-        }
+        Ok(invoke_bridge)
     }
 
     fn thread_safe_handle(&mut self) -> v8::IsolateHandle {
         self.js_runtime.v8_isolate().thread_safe_handle()
     }
 
+    fn object_property<'s, 'i>(
+        scope: &mut v8::PinScope<'s, 'i>,
+        object: v8::Local<'s, v8::Object>,
+        name: &str,
+    ) -> Result<v8::Local<'s, v8::Value>, String> {
+        let key = v8::String::new(scope, name)
+            .ok_or_else(|| format!("unable to allocate V8 string for `{name}`"))?;
+        object
+            .get(scope, key.into())
+            .ok_or_else(|| format!("worker response is missing `{name}`"))
+    }
+
+    fn bytes_from_v8_value(value: v8::Local<v8::Value>) -> Result<Vec<u8>, String> {
+        if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+            let len = view.byte_length();
+            let mut bytes = vec![0_u8; len];
+            let copied = view.copy_contents(&mut bytes);
+            bytes.truncate(copied);
+            return Ok(bytes);
+        }
+
+        if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+            let len = buffer.byte_length();
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+
+            let Some(ptr) = buffer.data() else {
+                return Ok(Vec::new());
+            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), len) }.to_vec();
+            return Ok(bytes);
+        }
+
+        Err("worker response body must be ArrayBuffer or ArrayBufferView".to_string())
+    }
+
     fn serialize_invocation_args(
         &mut self,
-        arg0: &impl Serialize,
-        arg1: &impl Serialize,
-        arg2: &impl Serialize,
+        request: GatewayRequest,
+        env: &impl Serialize,
+        ctx: &impl Serialize,
     ) -> Result<Vec<v8::Global<v8::Value>>> {
         let runtime = &mut self.js_runtime;
         deno_core::scope!(scope, runtime);
 
+        let request = v8::Local::<v8::Value>::from(deno_core::cppgc::make_cppgc_object(
+            scope,
+            request.into_js_request(),
+        ));
         let values = [
-            serde_v8::to_v8(scope, arg0)?,
-            serde_v8::to_v8(scope, arg1)?,
-            serde_v8::to_v8(scope, arg2)?,
+            request,
+            serde_v8::to_v8(scope, env)?,
+            serde_v8::to_v8(scope, ctx)?,
         ];
 
         Ok(values
             .into_iter()
             .map(|value| v8::Global::new(scope, value))
             .collect())
+    }
+
+    async fn read_next_response_chunk(
+        &mut self,
+        reader: &JsResponseChunkReader,
+    ) -> Result<Option<Vec<u8>>, String> {
+        #[allow(
+            deprecated,
+            reason = "good enough while migrating off the script bridge"
+        )]
+        let resolved = self
+            .js_runtime
+            .call_with_args_and_await(&reader.next_chunk, &[])
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let runtime = &mut self.js_runtime;
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, resolved);
+        if local.is_null_or_undefined() {
+            return Ok(None);
+        }
+
+        Self::bytes_from_v8_value(local).map(Some)
+    }
+
+    async fn start_gateway_response(
+        &mut self,
+        request: GatewayRequest,
+        env: WorkerEnv,
+        ctx: WorkerContext,
+    ) -> Result<PendingGatewayResponse, String> {
+        let args = self
+            .serialize_invocation_args(request, &env, &ctx)
+            .map_err(|error| error.to_string())?;
+        #[allow(
+            deprecated,
+            reason = "good enough while migrating off the script bridge"
+        )]
+        let resolved = self
+            .js_runtime
+            .call_with_args_and_await(&self.invoke_bridge, &args)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let runtime = &mut self.js_runtime;
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, resolved);
+        let response_object = v8::Local::<v8::Object>::try_from(local)
+            .map_err(|_| "worker response bridge must resolve to an object".to_string())?;
+
+        let status_value = Self::object_property(scope, response_object, "status")?;
+        let status =
+            serde_v8::from_v8::<u16>(scope, status_value).map_err(|error| error.to_string())?;
+        let headers_value = Self::object_property(scope, response_object, "headers")?;
+        let headers =
+            serde_v8::from_v8::<std::collections::BTreeMap<String, String>>(scope, headers_value)
+                .map_err(|error| error.to_string())?;
+        let stream_body_value = Self::object_property(scope, response_object, "streamBody")?;
+        let stream_body = serde_v8::from_v8::<bool>(scope, stream_body_value)
+            .map_err(|error| error.to_string())?;
+
+        if stream_body {
+            let reader_value = Self::object_property(scope, response_object, "bodyChunkReader")?;
+            let reader_function = v8::Local::<v8::Function>::try_from(reader_value)
+                .map_err(|_| "worker response bodyChunkReader must be a function".to_string())?;
+            let (response, runtime_body) = GatewayResponse::streaming(
+                status,
+                headers,
+                JsResponseChunkReader {
+                    next_chunk: v8::Global::new(scope, reader_function),
+                },
+            );
+            return Ok(PendingGatewayResponse {
+                response,
+                runtime_body: Some(runtime_body),
+            });
+        }
+
+        let body_value = Self::object_property(scope, response_object, "bodyBytes")?;
+        let body = if body_value.is_null_or_undefined() {
+            Vec::new()
+        } else {
+            Self::bytes_from_v8_value(body_value)?
+        };
+
+        Ok(PendingGatewayResponse {
+            response: GatewayResponse::buffered(status, headers, body),
+            runtime_body: None,
+        })
     }
 }
 
@@ -2029,95 +3007,20 @@ impl WorkerRuntime for DenoWorkerRuntime {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<WorkerResponse, String> {
-        let args = match self.invocation_mode {
-            WorkerInvocationMode::WebFetch => self
-                .serialize_invocation_args(&request, &env, &ctx)
-                .map_err(|error| error.to_string())?,
-            WorkerInvocationMode::CompatV1 => {
-                let parsed_request = match parse_v1_request(&request) {
-                    Ok(request) => request,
-                    Err(error) => return Ok(public_error_response(error)),
-                };
-                let envelope = build_host_execution_envelope_from_context(&ctx);
-                let compat_env = build_compat_env(&env, envelope.shadow_mode);
-                let compat_ctx = build_compat_context(&ctx, &envelope);
-
-                match self.serialize_invocation_args(&parsed_request, &compat_env, &compat_ctx) {
-                    Ok(args) => args,
-                    Err(error) => {
-                        return Ok(public_error_response(internal_public_error(
-                            error.to_string(),
-                        )))
-                    }
-                }
-            }
-        };
-        #[allow(
-            deprecated,
-            reason = "good enough while migrating off the script bridge"
-        )]
-        let resolved = self
-            .js_runtime
-            .call_with_args_and_await(&self.invoke_bridge, &args)
+        self.fetch_gateway(GatewayRequest::buffered(request), env, ctx)
             .await
-            .map_err(|error| error.to_string())?;
-
-        let runtime = &mut self.js_runtime;
-        deno_core::scope!(scope, runtime);
-        let local = v8::Local::new(scope, resolved);
-        match self.invocation_mode {
-            WorkerInvocationMode::WebFetch => {
-                serde_v8::from_v8::<WorkerResponse>(scope, local).map_err(|error| error.to_string())
-            }
-            WorkerInvocationMode::CompatV1 => serde_v8::from_v8::<ParsedV1Response>(scope, local)
-                .map(parsed_v1_response_to_worker_response)
-                .map_err(|error| error.to_string()),
-        }
     }
 }
 
-pub struct CliArgs {
-    pub worker_entry: PathBuf,
-    pub method: String,
-    pub url: String,
-    pub body: Option<String>,
-    pub worker_id: String,
-}
-
-impl CliArgs {
-    pub fn parse() -> Result<Self> {
-        let mut args = std::env::args().skip(1);
-        let worker_entry = args.next().map(PathBuf::from).context(
-            "usage: cargo run -p gateway-host -- <path-to-worker> [--method METHOD] [--url URL] [--body TEXT] [--worker-id ID]",
-        )?;
-
-        let mut parsed = Self {
-            worker_entry,
-            method: "GET".to_string(),
-            url: "http://localhost/experimental".to_string(),
-            body: None,
-            worker_id: "example".to_string(),
-        };
-
-        while let Some(flag) = args.next() {
-            match flag.as_str() {
-                "--method" => {
-                    parsed.method = args.next().context("--method requires a value")?;
-                }
-                "--url" => {
-                    parsed.url = args.next().context("--url requires a value")?;
-                }
-                "--body" => {
-                    parsed.body = Some(args.next().context("--body requires a value")?);
-                }
-                "--worker-id" => {
-                    parsed.worker_id = args.next().context("--worker-id requires a value")?;
-                }
-                other => bail!("unknown argument: {other}"),
-            }
-        }
-
-        Ok(parsed)
+impl DenoWorkerRuntime {
+    async fn fetch_gateway(
+        &mut self,
+        request: GatewayRequest,
+        env: WorkerEnv,
+        ctx: WorkerContext,
+    ) -> Result<WorkerResponse, String> {
+        let pending = self.start_gateway_response(request, env, ctx).await?;
+        pending.into_worker_response(self).await
     }
 }
 
@@ -2145,14 +3048,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workers/flaky/mod.ts")
     }
 
-    fn compat_worker_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workers/compat_v1/mod.ts")
-    }
-
-    fn compat_error_worker_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workers/compat_v1_error/mod.ts")
-    }
-
     fn import_map_worker_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workers/import_map/mod.ts")
     }
@@ -2175,6 +3070,30 @@ mod tests {
             std::fs::create_dir_all(parent).expect("parent dir should exist");
         }
         std::fs::write(path, contents).expect("file should be written");
+    }
+
+    fn temp_worker_path(name: &str, source: &str) -> PathBuf {
+        let worker_dir = unique_temp_dir(name);
+        let worker_path = worker_dir.join("mod.ts");
+        write_file(&worker_path, source);
+        worker_path
+    }
+
+    async fn drive_ingress_chunks(mut ingress_body: IngressRequestBody, chunks: Vec<Vec<u8>>) {
+        let mut chunks = chunks.into_iter();
+        while let Some(command) = ingress_body.command_rx.recv().await {
+            match command {
+                RequestBodyCommand::ReadNext { response_tx } => {
+                    if let Some(chunk) = chunks.next() {
+                        let _ = response_tx.send(Ok(Some(chunk)));
+                    } else {
+                        ingress_body.finished = true;
+                        let _ = response_tx.send(Ok(None));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn sha256_integrity(contents: &str) -> String {
@@ -2371,6 +3290,161 @@ export function fetch(_request: Request, env: {{ worker_id: string }}) {{
             response.body.as_deref(),
             Some("worker=hello-worker method=POST url=http://localhost/hello body=ping")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_streaming_request_body_across_multiple_chunks() {
+        let worker_path = temp_worker_path(
+            "streaming-body-text",
+            r#"
+export async function fetch(request: Request) {
+  return new Response(await request.text());
+}
+"#,
+        );
+        let mut runtime = DenoWorkerRuntime::new(&worker_path)
+            .await
+            .expect("streaming worker runtime should bootstrap");
+        let (request, ingress_body) = GatewayRequest::streaming(WorkerRequest {
+            method: "POST".to_string(),
+            url: "http://localhost/stream".to_string(),
+            headers: [("content-length".to_string(), "10".to_string())]
+                .into_iter()
+                .collect(),
+            body: None,
+        });
+        let ingress_driver = tokio::spawn(drive_ingress_chunks(
+            ingress_body,
+            vec![b"abc".to_vec(), b"defg".to_vec(), b"hij".to_vec()],
+        ));
+
+        let response = runtime
+            .fetch_gateway(
+                request,
+                WorkerEnv {
+                    worker_id: "streaming-worker".to_string(),
+                    vars: Default::default(),
+                },
+                WorkerContext::default(),
+            )
+            .await
+            .expect("streaming worker fetch should succeed");
+        ingress_driver
+            .await
+            .expect("ingress body driver should complete");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.as_deref(), Some("abcdefghij"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_can_return_without_consuming_streaming_request_body() {
+        let worker_path = temp_worker_path(
+            "streaming-body-unused",
+            r#"
+export async function fetch(_request: Request) {
+  return new Response("ok");
+}
+"#,
+        );
+        let mut runtime = DenoWorkerRuntime::new(&worker_path)
+            .await
+            .expect("streaming worker runtime should bootstrap");
+        let (request, mut ingress_body) = GatewayRequest::streaming(WorkerRequest {
+            method: "POST".to_string(),
+            url: "http://localhost/unused".to_string(),
+            headers: [("content-length".to_string(), "4096".to_string())]
+                .into_iter()
+                .collect(),
+            body: None,
+        });
+
+        let response = runtime
+            .fetch_gateway(
+                request,
+                WorkerEnv {
+                    worker_id: "unused-body-worker".to_string(),
+                    vars: Default::default(),
+                },
+                WorkerContext::default(),
+            )
+            .await
+            .expect("worker should succeed without consuming body");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.as_deref(), Some("ok"));
+        assert!(matches!(
+            ingress_body.command_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_pool_execute_gateway_streams_response_body() {
+        let worker_path = temp_worker_path(
+            "streaming-response-body",
+            r#"
+export async function fetch() {
+  async function* body() {
+    yield "alpha-";
+    yield "beta-";
+    yield "gamma";
+  }
+
+  return new Response(body(), {
+    status: 202,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "x-streaming": "yes",
+    },
+  });
+}
+"#,
+        );
+        let pool = WorkerRuntimePool::new(worker_path, 1, 4, Duration::from_secs(5))
+            .expect("runtime pool should initialize");
+
+        let mut response = pool
+            .execute_gateway(
+                GatewayRequest::buffered(WorkerRequest {
+                    method: "GET".to_string(),
+                    url: "http://localhost/streaming-response".to_string(),
+                    headers: Default::default(),
+                    body: None,
+                }),
+                WorkerEnv {
+                    worker_id: "streaming-response-worker".to_string(),
+                    vars: Default::default(),
+                },
+                WorkerContext::default(),
+            )
+            .await
+            .expect("gateway response should stream successfully");
+
+        assert_eq!(response.status(), 202);
+        assert_eq!(
+            response.headers().get("x-streaming"),
+            Some(&"yes".to_string())
+        );
+
+        let mut body = match response.take_body() {
+            GatewayResponseBody::Streaming(body) => body,
+            other => panic!("expected streaming body, got {:?}", other),
+        };
+
+        assert_eq!(
+            body.read_next_chunk().await.unwrap(),
+            Some(b"alpha-".to_vec())
+        );
+        assert_eq!(
+            body.read_next_chunk().await.unwrap(),
+            Some(b"beta-".to_vec())
+        );
+        assert_eq!(
+            body.read_next_chunk().await.unwrap(),
+            Some(b"gamma".to_vec())
+        );
+        assert_eq!(body.read_next_chunk().await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2575,6 +3649,7 @@ export function fetch(_request: Request, env: {{ worker_id: string }}) {{
         );
         let snapshot = inspect_worker_project(&worker_path)
             .expect("worker project snapshot should inspect cache");
+        assert!(snapshot.artifact_id.starts_with("local-sha256:"));
         assert_eq!(snapshot.module_cache.entry_count, 1);
         assert!(snapshot.module_cache.total_bytes > 0);
     }
@@ -2619,6 +3694,30 @@ export function fetch(_request: Request, env: {{ worker_id: string }}) {{
         assert_eq!(snapshot.module_cache.entry_count, 0);
         assert!(!stale_body_path.exists());
         assert!(!stale_meta_path.exists());
+    }
+
+    #[test]
+    fn inspect_worker_project_artifact_id_changes_when_worker_source_changes() {
+        let worker_dir = unique_temp_dir("artifact-id");
+        let worker_path = worker_dir.join("mod.ts");
+        write_file(
+            &worker_path,
+            "export function fetch() { return new Response('v1'); }\n",
+        );
+
+        let first_snapshot =
+            inspect_worker_project(&worker_path).expect("first worker snapshot should succeed");
+        assert!(first_snapshot.artifact_id.starts_with("local-sha256:"));
+
+        write_file(
+            &worker_path,
+            "export function fetch() { return new Response('v2'); }\n",
+        );
+
+        let second_snapshot =
+            inspect_worker_project(&worker_path).expect("second worker snapshot should succeed");
+        assert!(second_snapshot.artifact_id.starts_with("local-sha256:"));
+        assert_ne!(first_snapshot.artifact_id, second_snapshot.artifact_id);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2702,152 +3801,6 @@ export function fetch(_request: Request, env: {{ worker_id: string }}) {{
             .expect("test remote module server should join");
 
         assert!(error.to_string().contains("Integrity check failed"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn runs_a_v1_compat_worker() {
-        let mut runtime = DenoWorkerRuntime::new(&compat_worker_path())
-            .await
-            .expect("compat worker runtime should bootstrap");
-        let response = runtime
-            .fetch(
-                WorkerRequest {
-                    method: "POST".to_string(),
-                    url: "http://localhost/compat?x=1&x=2".to_string(),
-                    headers: [("x-test".to_string(), "1".to_string())]
-                        .into_iter()
-                        .collect(),
-                    body: Some("ping".to_string()),
-                },
-                WorkerEnv {
-                    worker_id: "compat-worker".to_string(),
-                    vars: [("feature".to_string(), "beta".to_string())]
-                        .into_iter()
-                        .collect(),
-                },
-                WorkerContext {
-                    metadata: [
-                        ("request_id".to_string(), "req-compat-1".to_string()),
-                        ("trace_id".to_string(), "trace-compat-7".to_string()),
-                        ("shadow_mode".to_string(), "true".to_string()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                },
-            )
-            .await
-            .expect("compat worker fetch should succeed");
-
-        assert_eq!(response.status, 202);
-        assert_eq!(
-            response.headers.get("x-compat-mode"),
-            Some(&"v2-compat-v1".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-request-id"),
-            Some(&"req-compat-1".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-shadow-mode"),
-            Some(&"true".to_string())
-        );
-        assert_eq!(response.headers.get("x-query-x"), Some(&"1|2".to_string()));
-        assert_eq!(
-            response.body.as_deref(),
-            Some(
-                "worker=compat-worker protocol=v1 path=/compat body=ping trace=trace-compat-7 feature=beta",
-            )
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn compat_worker_returns_public_bad_request_for_invalid_v1_url() {
-        let mut runtime = DenoWorkerRuntime::new(&compat_worker_path())
-            .await
-            .expect("compat worker runtime should bootstrap");
-        let response = runtime
-            .fetch(
-                WorkerRequest {
-                    method: "GET".to_string(),
-                    url: "not-a-valid-url".to_string(),
-                    headers: Default::default(),
-                    body: None,
-                },
-                WorkerEnv {
-                    worker_id: "compat-worker".to_string(),
-                    vars: Default::default(),
-                },
-                WorkerContext::default(),
-            )
-            .await
-            .expect("compat worker should map bad input into public response");
-
-        assert_eq!(response.status, 400);
-        assert_eq!(
-            response.headers.get("content-type"),
-            Some(&"application/json; charset=utf-8".to_string())
-        );
-        assert!(response
-            .body
-            .as_deref()
-            .expect("compat bad-request response should have body")
-            .contains("\"code\":\"bad_request\""));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn compat_worker_error_field_is_normalized_to_public_error_response() {
-        let mut runtime = DenoWorkerRuntime::new(&compat_error_worker_path())
-            .await
-            .expect("compat error worker runtime should bootstrap");
-        let response = runtime
-            .fetch(
-                WorkerRequest {
-                    method: "GET".to_string(),
-                    url: "http://localhost/limited".to_string(),
-                    headers: Default::default(),
-                    body: None,
-                },
-                WorkerEnv {
-                    worker_id: "compat-error-worker".to_string(),
-                    vars: Default::default(),
-                },
-                WorkerContext {
-                    metadata: [("request_id".to_string(), "req-error-1".to_string())]
-                        .into_iter()
-                        .collect(),
-                },
-            )
-            .await
-            .expect("compat worker error response should normalize");
-
-        assert_eq!(response.status, 429);
-        assert_eq!(
-            response.headers.get("content-type"),
-            Some(&"application/json; charset=utf-8".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-worker-id"),
-            Some(&"compat-error-worker".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-request-id"),
-            Some(&"req-error-1".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-path"),
-            Some(&"/limited".to_string())
-        );
-        assert_eq!(
-            response.headers.get("x-error-contract-version"),
-            Some(&"1".to_string())
-        );
-        let body = response
-            .body
-            .as_deref()
-            .expect("compat error response should have body");
-        assert!(body.contains("\"category\":\"rate_limited\""));
-        assert!(body.contains("\"code\":\"tenant_over_quota\""));
-        assert!(!body.contains("ignored"));
     }
 
     #[tokio::test(flavor = "current_thread")]

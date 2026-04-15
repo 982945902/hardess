@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -13,8 +15,13 @@ use gateway_host::inspect_worker_project;
 use gateway_host::internal_public_error;
 use gateway_host::public_error_response;
 use gateway_host::shutdown_draining_public_error;
-use gateway_host::CompatPublicError;
 use gateway_host::DrainSnapshot;
+use gateway_host::GatewayRequest;
+use gateway_host::GatewayResponse;
+use gateway_host::GatewayResponseBody;
+use gateway_host::IngressRequestBody;
+use gateway_host::PublicError;
+use gateway_host::RequestBodyCompletionPolicy;
 use gateway_host::RequestDrainController;
 use gateway_host::RuntimePoolError;
 use gateway_host::RuntimePoolSnapshot;
@@ -22,8 +29,10 @@ use gateway_host::WorkerProjectSnapshot;
 use gateway_host::WorkerRuntimePool;
 use http::Response;
 use http::StatusCode;
-use pingora::apps::http_app::HttpServer;
-use pingora::apps::http_app::ServeHttp;
+use pingora::apps::HttpPersistentSettings;
+use pingora::apps::HttpServerApp;
+use pingora::apps::ReusedHttpStream;
+use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
 use pingora::server::configuration::Opt as PingoraOpt;
 use pingora::server::configuration::ServerConf;
@@ -34,6 +43,7 @@ use pingora::server::ShutdownSignal;
 #[cfg(unix)]
 use pingora::server::ShutdownSignalWatch;
 use pingora::services::listening::Service;
+use serde::Deserialize;
 use serde::Serialize;
 #[cfg(unix)]
 use tokio::signal::unix;
@@ -134,9 +144,33 @@ struct IngressSnapshot {
     generations: RuntimeGenerationManagerSnapshot,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DesiredWorkerSpec {
+    worker_entry: PathBuf,
+    #[serde(default)]
+    declared_artifact_id: Option<String>,
+    #[serde(default)]
+    declared_version: Option<String>,
+}
+
+impl DesiredWorkerSpec {
+    fn local_path(worker_entry: PathBuf) -> Self {
+        Self {
+            worker_entry,
+            declared_artifact_id: None,
+            declared_version: None,
+        }
+    }
+
+    fn worker_entry_display(&self) -> String {
+        self.worker_entry.display().to_string()
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeGeneration {
     generation_id: u64,
+    desired: DesiredWorkerSpec,
     worker_entry: PathBuf,
     project: WorkerProjectSnapshot,
     runtime_pool: Arc<WorkerRuntimePool>,
@@ -148,6 +182,8 @@ struct RuntimeGenerationSnapshot {
     generation_id: u64,
     active: bool,
     worker_entry: String,
+    declared_artifact_id: Option<String>,
+    declared_version: Option<String>,
     prepare_status: String,
     project: WorkerProjectSnapshot,
     drain: DrainSnapshot,
@@ -166,19 +202,43 @@ struct RuntimeGenerationManagerSnapshot {
 struct RuntimeVersionStateSnapshot {
     desired_worker_entry: String,
     desired_generation_id: u64,
+    desired_artifact_id: String,
+    desired_declared_artifact_id: Option<String>,
+    desired_declared_version: Option<String>,
+    desired_updated_at_unix_ms: u64,
     prepared_generation_id: Option<u64>,
+    prepared_artifact_id: Option<String>,
+    prepared_declared_artifact_id: Option<String>,
+    prepared_declared_version: Option<String>,
+    prepared_at_unix_ms: Option<u64>,
     active_generation_id: u64,
+    active_artifact_id: String,
+    active_declared_artifact_id: Option<String>,
+    active_declared_version: Option<String>,
+    active_at_unix_ms: u64,
     failed_generation_id: Option<u64>,
+    failed_artifact_id: Option<String>,
+    failed_declared_artifact_id: Option<String>,
+    failed_declared_version: Option<String>,
+    failed_at_unix_ms: Option<u64>,
+    failed_error_kind: Option<String>,
     failed_error: Option<String>,
     status: String,
+    status_updated_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct PrepareAttemptSnapshot {
     target_generation_id: u64,
     worker_entry: String,
+    artifact_id: Option<String>,
+    declared_artifact_id: Option<String>,
+    declared_version: Option<String>,
     status: String,
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: Option<u64>,
     project: Option<WorkerProjectSnapshot>,
+    error_kind: Option<String>,
     error: Option<String>,
 }
 
@@ -202,43 +262,102 @@ struct RuntimeGenerationManager {
 
 impl RuntimeGeneration {
     fn snapshot(&self, active: bool) -> RuntimeGenerationSnapshot {
-        let project = inspect_worker_project(&self.worker_entry).unwrap_or_else(|error| {
-            eprintln!(
-                "failed to refresh worker project snapshot for {}: {}",
-                self.worker_entry.display(),
-                error
-            );
-            self.project.clone()
-        });
         RuntimeGenerationSnapshot {
             generation_id: self.generation_id,
             active,
             worker_entry: self.worker_entry.display().to_string(),
+            declared_artifact_id: self.desired.declared_artifact_id.clone(),
+            declared_version: self.desired.declared_version.clone(),
             prepare_status: "ready".to_string(),
-            project,
+            project: self.project.clone(),
             drain: self.drain_controller.snapshot(),
             runtime_pool: self.runtime_pool.metrics_snapshot(),
         }
     }
 }
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn classify_prepare_error(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    if message.contains("unable to parse")
+        || message.contains("Expected ")
+        || message.contains("Expression expected")
+        || message.contains("Unsupported module extension")
+    {
+        return "worker_code_invalid".to_string();
+    }
+    if message.contains("deno.lock")
+        || message.contains("lockfile")
+        || message.contains("Integrity check failed")
+        || message.contains("Module not found in frozen lockfile")
+    {
+        return "dependency_validation_failed".to_string();
+    }
+    if message.contains("unable to read")
+        || message.contains("unable to canonicalize")
+        || message.contains("does not exist")
+    {
+        return "artifact_unavailable".to_string();
+    }
+    if message.contains("Unable to resolve")
+        || message.contains("Import resolution")
+        || message.contains("Module loading is not supported")
+    {
+        return "module_resolution_failed".to_string();
+    }
+
+    "prepare_failed".to_string()
+}
+
 impl RuntimeGenerationManager {
     fn new(config: RuntimeGenerationManagerConfig) -> anyhow::Result<Arc<Self>> {
-        let initial_generation = Arc::new(Self::build_generation(&config, 1)?);
+        let now = unix_timestamp_ms();
+        let initial_desired = DesiredWorkerSpec::local_path(config.worker_entry.clone());
+        let initial_generation = Arc::new(Self::build_generation(&config, &initial_desired, 1)?);
         let version_state = RuntimeVersionStateSnapshot {
-            desired_worker_entry: config.worker_entry.display().to_string(),
+            desired_worker_entry: initial_desired.worker_entry_display(),
             desired_generation_id: 1,
+            desired_artifact_id: initial_generation.project.artifact_id.clone(),
+            desired_declared_artifact_id: initial_desired.declared_artifact_id.clone(),
+            desired_declared_version: initial_desired.declared_version.clone(),
+            desired_updated_at_unix_ms: now,
             prepared_generation_id: Some(1),
+            prepared_artifact_id: Some(initial_generation.project.artifact_id.clone()),
+            prepared_declared_artifact_id: initial_desired.declared_artifact_id.clone(),
+            prepared_declared_version: initial_desired.declared_version.clone(),
+            prepared_at_unix_ms: Some(now),
             active_generation_id: 1,
+            active_artifact_id: initial_generation.project.artifact_id.clone(),
+            active_declared_artifact_id: initial_desired.declared_artifact_id.clone(),
+            active_declared_version: initial_desired.declared_version.clone(),
+            active_at_unix_ms: now,
             failed_generation_id: None,
+            failed_artifact_id: None,
+            failed_declared_artifact_id: None,
+            failed_declared_version: None,
+            failed_at_unix_ms: None,
+            failed_error_kind: None,
             failed_error: None,
             status: "active".to_string(),
+            status_updated_at_unix_ms: now,
         };
         let last_prepare = PrepareAttemptSnapshot {
             target_generation_id: 1,
-            worker_entry: config.worker_entry.display().to_string(),
+            worker_entry: initial_desired.worker_entry_display(),
+            artifact_id: Some(initial_generation.project.artifact_id.clone()),
+            declared_artifact_id: initial_desired.declared_artifact_id.clone(),
+            declared_version: initial_desired.declared_version.clone(),
             status: "ready".to_string(),
+            started_at_unix_ms: now,
+            finished_at_unix_ms: Some(now),
             project: Some(initial_generation.project.clone()),
+            error_kind: None,
             error: None,
         };
 
@@ -254,16 +373,16 @@ impl RuntimeGenerationManager {
 
     async fn execute(
         &self,
-        request: WorkerRequest,
+        request: GatewayRequest,
         env: WorkerEnv,
         ctx: WorkerContext,
-    ) -> Result<worker_abi::WorkerResponse, RuntimePoolError> {
+    ) -> Result<GatewayResponse, RuntimePoolError> {
         for _ in 0..4 {
             let generation = self.active_generation();
             if let Some(_guard) = generation.drain_controller.try_acquire() {
                 return generation
                     .runtime_pool
-                    .execute(request.clone(), env.clone(), ctx.clone())
+                    .execute_gateway(request.clone(), env.clone(), ctx.clone())
                     .await;
             }
 
@@ -275,36 +394,99 @@ impl RuntimeGenerationManager {
         ))
     }
 
+    // Debug-only local apply wrapper used by the experiment's mutable endpoints.
+    // Long-term production direction is control-plane-driven desired-version apply.
     async fn apply_configured_worker_debug(
         self: &Arc<Self>,
     ) -> anyhow::Result<RuntimeGenerationManagerSnapshot> {
+        self.apply_desired_worker(DesiredWorkerSpec::local_path(
+            self.config.worker_entry.clone(),
+        ))
+        .await
+    }
+
+    async fn apply_desired_worker(
+        self: &Arc<Self>,
+        desired: DesiredWorkerSpec,
+    ) -> anyhow::Result<RuntimeGenerationManagerSnapshot> {
         let generation_id = self.next_generation_id.fetch_add(1, Ordering::Relaxed);
+        let started_at = unix_timestamp_ms();
+        let target_project = inspect_worker_project(&desired.worker_entry).ok();
+        let target_artifact_id = target_project
+            .as_ref()
+            .map(|project| project.artifact_id.clone());
+        {
+            let preparing = PrepareAttemptSnapshot {
+                target_generation_id: generation_id,
+                worker_entry: desired.worker_entry_display(),
+                artifact_id: target_artifact_id.clone(),
+                declared_artifact_id: desired.declared_artifact_id.clone(),
+                declared_version: desired.declared_version.clone(),
+                status: "preparing".to_string(),
+                started_at_unix_ms: started_at,
+                finished_at_unix_ms: None,
+                project: None,
+                error_kind: None,
+                error: None,
+            };
+            *self
+                .last_prepare
+                .lock()
+                .expect("last prepare mutex should not be poisoned") = preparing;
+        }
         {
             let mut version_state = self
                 .version_state
                 .lock()
                 .expect("version state mutex should not be poisoned");
-            version_state.desired_worker_entry = self.config.worker_entry.display().to_string();
+            version_state.desired_worker_entry = desired.worker_entry_display();
             version_state.desired_generation_id = generation_id;
+            version_state.desired_artifact_id = target_artifact_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            version_state.desired_declared_artifact_id = desired.declared_artifact_id.clone();
+            version_state.desired_declared_version = desired.declared_version.clone();
+            version_state.desired_updated_at_unix_ms = started_at;
             version_state.status = "preparing".to_string();
+            version_state.status_updated_at_unix_ms = started_at;
             version_state.failed_generation_id = None;
+            version_state.failed_artifact_id = None;
+            version_state.failed_declared_artifact_id = None;
+            version_state.failed_declared_version = None;
+            version_state.failed_at_unix_ms = None;
+            version_state.failed_error_kind = None;
             version_state.failed_error = None;
         }
-        let next_generation = match Self::build_generation(&self.config, generation_id) {
+        let next_generation = match Self::build_generation(&self.config, &desired, generation_id) {
             Ok(generation) => {
+                let prepared_at = unix_timestamp_ms();
                 {
                     let mut version_state = self
                         .version_state
                         .lock()
                         .expect("version state mutex should not be poisoned");
+                    version_state.desired_artifact_id = generation.project.artifact_id.clone();
                     version_state.prepared_generation_id = Some(generation_id);
+                    version_state.prepared_artifact_id =
+                        Some(generation.project.artifact_id.clone());
+                    version_state.prepared_declared_artifact_id =
+                        desired.declared_artifact_id.clone();
+                    version_state.prepared_declared_version = desired.declared_version.clone();
+                    version_state.prepared_at_unix_ms = Some(prepared_at);
                     version_state.status = "prepared".to_string();
+                    version_state.status_updated_at_unix_ms = prepared_at;
                 }
                 let prepare = PrepareAttemptSnapshot {
                     target_generation_id: generation_id,
-                    worker_entry: self.config.worker_entry.display().to_string(),
+                    worker_entry: desired.worker_entry_display(),
+                    artifact_id: Some(generation.project.artifact_id.clone()),
+                    declared_artifact_id: desired.declared_artifact_id.clone(),
+                    declared_version: desired.declared_version.clone(),
                     status: "ready".to_string(),
+                    started_at_unix_ms: started_at,
+                    finished_at_unix_ms: Some(prepared_at),
                     project: Some(generation.project.clone()),
+                    error_kind: None,
                     error: None,
                 };
                 *self
@@ -314,20 +496,43 @@ impl RuntimeGenerationManager {
                 Arc::new(generation)
             }
             Err(error) => {
+                let failed_at = unix_timestamp_ms();
+                let error_kind = classify_prepare_error(&error);
+                let failed_project =
+                    target_project.or_else(|| inspect_worker_project(&desired.worker_entry).ok());
+                let failed_artifact_id = failed_project
+                    .as_ref()
+                    .map(|project| project.artifact_id.clone());
                 {
                     let mut version_state = self
                         .version_state
                         .lock()
                         .expect("version state mutex should not be poisoned");
+                    version_state.desired_artifact_id = failed_artifact_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     version_state.failed_generation_id = Some(generation_id);
+                    version_state.failed_artifact_id = failed_artifact_id.clone();
+                    version_state.failed_declared_artifact_id =
+                        desired.declared_artifact_id.clone();
+                    version_state.failed_declared_version = desired.declared_version.clone();
+                    version_state.failed_at_unix_ms = Some(failed_at);
+                    version_state.failed_error_kind = Some(error_kind.clone());
                     version_state.failed_error = Some(error.to_string());
                     version_state.status = "failed".to_string();
+                    version_state.status_updated_at_unix_ms = failed_at;
                 }
                 let prepare = PrepareAttemptSnapshot {
                     target_generation_id: generation_id,
-                    worker_entry: self.config.worker_entry.display().to_string(),
+                    worker_entry: desired.worker_entry_display(),
+                    artifact_id: failed_artifact_id,
+                    declared_artifact_id: desired.declared_artifact_id.clone(),
+                    declared_version: desired.declared_version.clone(),
                     status: "failed".to_string(),
-                    project: None,
+                    started_at_unix_ms: started_at,
+                    finished_at_unix_ms: Some(failed_at),
+                    project: failed_project,
+                    error_kind: Some(error_kind),
                     error: Some(error.to_string()),
                 };
                 *self
@@ -337,6 +542,7 @@ impl RuntimeGenerationManager {
                 return Err(error);
             }
         };
+        let next_artifact_id = next_generation.project.artifact_id.clone();
 
         let previous_generation = {
             let mut active = self
@@ -348,12 +554,18 @@ impl RuntimeGenerationManager {
             previous
         };
         {
+            let active_at = unix_timestamp_ms();
             let mut version_state = self
                 .version_state
                 .lock()
                 .expect("version state mutex should not be poisoned");
             version_state.active_generation_id = generation_id;
+            version_state.active_artifact_id = next_artifact_id;
+            version_state.active_declared_artifact_id = desired.declared_artifact_id.clone();
+            version_state.active_declared_version = desired.declared_version.clone();
+            version_state.active_at_unix_ms = active_at;
             version_state.status = "active".to_string();
+            version_state.status_updated_at_unix_ms = active_at;
         }
 
         previous_generation.drain_controller.start_draining();
@@ -418,7 +630,7 @@ impl RuntimeGenerationManager {
     }
 
     fn active_project_snapshot(&self) -> anyhow::Result<WorkerProjectSnapshot> {
-        inspect_worker_project(&self.config.worker_entry)
+        inspect_worker_project(&self.active_generation().worker_entry)
     }
 
     fn cleanup_cache(&self) -> anyhow::Result<WorkerProjectSnapshot> {
@@ -434,15 +646,17 @@ impl RuntimeGenerationManager {
 
     fn build_generation(
         config: &RuntimeGenerationManagerConfig,
+        desired: &DesiredWorkerSpec,
         generation_id: u64,
     ) -> anyhow::Result<RuntimeGeneration> {
-        let project = inspect_worker_project(&config.worker_entry)?;
+        let project = inspect_worker_project(&desired.worker_entry)?;
         Ok(RuntimeGeneration {
             generation_id,
-            worker_entry: config.worker_entry.clone(),
+            desired: desired.clone(),
+            worker_entry: desired.worker_entry.clone(),
             project,
             runtime_pool: WorkerRuntimePool::new(
-                config.worker_entry.clone(),
+                desired.worker_entry.clone(),
                 config.runtime_threads,
                 config.queue_capacity,
                 config.exec_timeout,
@@ -543,10 +757,54 @@ impl WorkerHttpApp {
         }
     }
 
+    async fn apply_worker_debug_response(
+        &self,
+        http_stream: &mut ServerSession,
+    ) -> Response<Vec<u8>> {
+        let body = match read_full_request_body(http_stream).await {
+            Ok(bytes) if bytes.is_empty() => {
+                return self.public_error_http_response(bad_request_public_error(
+                    "missing JSON body".to_string(),
+                ));
+            }
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return self
+                    .public_error_http_response(bad_request_public_error(error.to_string()));
+            }
+        };
+        let desired: DesiredWorkerSpec = match serde_json::from_slice(&body) {
+            Ok(desired) => desired,
+            Err(error) => {
+                return self.public_error_http_response(bad_request_public_error(format!(
+                    "invalid apply-worker JSON: {error}"
+                )));
+            }
+        };
+
+        match self.runtime_manager.apply_desired_worker(desired).await {
+            Ok(snapshot) => match serde_json::to_vec_pretty(&snapshot) {
+                Ok(body) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/json; charset=utf-8",
+                    )
+                    .header(http::header::CONTENT_LENGTH, body.len())
+                    .body(body)
+                    .expect("apply-worker response should build"),
+                Err(error) => {
+                    self.public_error_http_response(internal_public_error(error.to_string()))
+                }
+            },
+            Err(error) => self.public_error_http_response(internal_public_error(error.to_string())),
+        }
+    }
+
     async fn build_request(
         &self,
         http_stream: &mut ServerSession,
-    ) -> Result<WorkerRequest, String> {
+    ) -> Result<(GatewayRequest, Option<IngressRequestBody>), String> {
         let header = http_stream.req_header();
         let method = header.method.as_str().to_string();
         let uri = header.uri.to_string();
@@ -564,18 +822,19 @@ impl WorkerHttpApp {
             .get("host")
             .map(|host| format!("http://{host}{uri}"))
             .unwrap_or(uri);
-        let body = http_stream
-            .read_request_body()
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-
-        Ok(WorkerRequest {
+        let request = WorkerRequest {
             method,
             url,
             headers,
-            body,
-        })
+            body: None,
+        };
+
+        if request_body_expected(&request) {
+            let (request, ingress_body) = GatewayRequest::streaming(request);
+            Ok((request, Some(ingress_body)))
+        } else {
+            Ok((GatewayRequest::buffered(request), None))
+        }
     }
 
     fn response_from_worker(
@@ -596,12 +855,35 @@ impl WorkerHttpApp {
             })
     }
 
-    fn public_error_http_response(&self, error: CompatPublicError) -> Response<Vec<u8>> {
+    fn gateway_response_from_http_response(&self, response: Response<Vec<u8>>) -> GatewayResponse {
+        let (parts, body) = response.into_parts();
+        let headers = parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        GatewayResponse::buffered(parts.status.as_u16(), headers, body)
+    }
+
+    fn public_error_http_response(&self, error: PublicError) -> Response<Vec<u8>> {
         self.response_from_worker(public_error_response(error))
     }
 
+    fn public_error_gateway_response(&self, error: PublicError) -> GatewayResponse {
+        self.gateway_response_from_http_response(self.public_error_http_response(error))
+    }
+
     fn runtime_pool_error_response(&self, error: RuntimePoolError) -> Response<Vec<u8>> {
-        self.public_error_http_response(error.to_compat_public_error())
+        self.public_error_http_response(error.to_public_error())
+    }
+
+    fn runtime_pool_gateway_response(&self, error: RuntimePoolError) -> GatewayResponse {
+        self.gateway_response_from_http_response(self.runtime_pool_error_response(error))
     }
 
     fn fallback_error_response(&self, status: StatusCode, message: String) -> Response<Vec<u8>> {
@@ -624,76 +906,251 @@ impl WorkerHttpApp {
         );
         response
     }
-}
 
-#[async_trait]
-impl ServeHttp for WorkerHttpApp {
-    async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
+    fn draining_gateway_response(&self) -> GatewayResponse {
+        self.gateway_response_from_http_response(self.draining_response())
+    }
+
+    async fn write_gateway_response(
+        &self,
+        http_stream: &mut ServerSession,
+        mut response: GatewayResponse,
+    ) -> Result<(), String> {
+        let header_pairs = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let has_content_length = response.headers().contains_key("content-length");
+        let mut response_header = ResponseHeader::build(
+            response.status(),
+            Some(header_pairs.len().saturating_add(1)),
+        )
+        .map_err(|error| error.to_string())?;
+        for (name, value) in header_pairs {
+            response_header
+                .insert_header(name, value)
+                .map_err(|error| error.to_string())?;
+        }
+
+        match response.take_body() {
+            GatewayResponseBody::Empty => {
+                if !has_content_length {
+                    response_header
+                        .insert_header(http::header::CONTENT_LENGTH.as_str(), "0")
+                        .map_err(|error| error.to_string())?;
+                }
+                http_stream
+                    .write_response_header(Box::new(response_header))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                http_stream
+                    .write_response_body(Vec::new().into(), true)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            GatewayResponseBody::Buffered(body) => {
+                if !has_content_length {
+                    response_header
+                        .insert_header(
+                            http::header::CONTENT_LENGTH.as_str(),
+                            body.len().to_string(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                http_stream
+                    .write_response_header(Box::new(response_header))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                http_stream
+                    .write_response_body(body.into(), true)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            GatewayResponseBody::Streaming(mut body) => {
+                http_stream
+                    .write_response_header(Box::new(response_header))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                while let Some(chunk) = body.read_next_chunk().await? {
+                    http_stream
+                        .write_response_body(chunk.into(), false)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                http_stream
+                    .write_response_body(Vec::new().into(), true)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    async fn handle_request(&self, http_stream: &mut ServerSession) -> GatewayResponse {
         let header = http_stream.req_header();
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/runtime-pool" {
-            return self.metrics_response();
+            return self.gateway_response_from_http_response(self.metrics_response());
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/module-cache" {
-            return self.module_cache_response();
+            return self.gateway_response_from_http_response(self.module_cache_response());
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/ingress-state" {
-            return self.ingress_state_response();
+            return self.gateway_response_from_http_response(self.ingress_state_response());
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/generations" {
-            return self.generations_response();
+            return self.gateway_response_from_http_response(self.generations_response());
         }
         if header.method == http::Method::POST && header.uri.path() == "/_hardess/cleanup-cache" {
-            return self.cleanup_cache_response();
+            return self.gateway_response_from_http_response(self.cleanup_cache_response());
+        }
+        if header.method == http::Method::POST && header.uri.path() == "/_hardess/apply-worker" {
+            return self.gateway_response_from_http_response(
+                self.apply_worker_debug_response(http_stream).await,
+            );
         }
         if header.method == http::Method::POST && header.uri.path() == "/_hardess/reload-worker" {
-            // Debug-only local wrapper. Production direction is control-plane-driven apply.
-            return match self.runtime_manager.apply_configured_worker_debug().await {
-                Ok(snapshot) => match serde_json::to_vec_pretty(&snapshot) {
-                    Ok(body) => Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            http::header::CONTENT_TYPE,
-                            "application/json; charset=utf-8",
-                        )
-                        .header(http::header::CONTENT_LENGTH, body.len())
-                        .body(body)
-                        .expect("reload response should build"),
+            return self.gateway_response_from_http_response(
+                match self.runtime_manager.apply_configured_worker_debug().await {
+                    Ok(snapshot) => match serde_json::to_vec_pretty(&snapshot) {
+                        Ok(body) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(
+                                http::header::CONTENT_TYPE,
+                                "application/json; charset=utf-8",
+                            )
+                            .header(http::header::CONTENT_LENGTH, body.len())
+                            .body(body)
+                            .expect("reload response should build"),
+                        Err(error) => self
+                            .public_error_http_response(internal_public_error(error.to_string())),
+                    },
                     Err(error) => {
                         self.public_error_http_response(internal_public_error(error.to_string()))
                     }
                 },
-                Err(error) => {
-                    self.public_error_http_response(internal_public_error(error.to_string()))
-                }
-            };
+            );
         }
 
         let _request_guard = match self.drain_controller.try_acquire() {
             Some(guard) => guard,
-            None => return self.draining_response(),
+            None => return self.draining_gateway_response(),
         };
 
-        let request = match self.build_request(http_stream).await {
+        let (request, mut ingress_body) = match self.build_request(http_stream).await {
             Ok(request) => request,
             Err(error) => {
-                return self.public_error_http_response(bad_request_public_error(error));
+                return self.public_error_gateway_response(bad_request_public_error(error));
             }
         };
+        let completion_policy = request.completion_policy();
         let worker_id = self.worker_id.clone();
-        match self
-            .runtime_manager
-            .execute(
-                request,
-                WorkerEnv {
-                    worker_id,
-                    vars: Default::default(),
-                },
-                WorkerContext::default(),
-            )
+        let worker_future = self.runtime_manager.execute(
+            request,
+            WorkerEnv {
+                worker_id,
+                vars: Default::default(),
+            },
+            WorkerContext::default(),
+        );
+        tokio::pin!(worker_future);
+
+        let worker_result = loop {
+            if let Some(body) = ingress_body.as_mut() {
+                tokio::select! {
+                    result = &mut worker_future => break result,
+                    serviced = body.service_next(http_stream) => {
+                        if !serviced {
+                            ingress_body = None;
+                        }
+                    }
+                }
+            } else {
+                break worker_future.await;
+            }
+        };
+
+        if let Some(body) = ingress_body.as_mut() {
+            if let Err(error) = body.finish(http_stream, completion_policy).await {
+                return self.public_error_gateway_response(internal_public_error(error));
+            }
+            if completion_policy == RequestBodyCompletionPolicy::DisableKeepalive {
+                http_stream.set_keepalive(None);
+            }
+        }
+
+        match worker_result {
+            Ok(response) => response,
+            Err(error) => self.runtime_pool_gateway_response(error),
+        }
+    }
+}
+
+fn request_body_expected(request: &WorkerRequest) -> bool {
+    if let Some(content_length) = request.headers.get("content-length") {
+        if let Ok(length) = content_length.trim().parse::<u64>() {
+            if length > 0 {
+                return true;
+            }
+        }
+    }
+
+    request.headers.contains_key("transfer-encoding")
+}
+
+async fn read_full_request_body(http_stream: &mut ServerSession) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    loop {
+        match http_stream
+            .read_request_body()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Some(chunk) => body.extend_from_slice(&chunk),
+            None => return Ok(body),
+        }
+    }
+}
+
+#[async_trait]
+impl HttpServerApp for WorkerHttpApp {
+    async fn process_new_http(
+        self: &Arc<Self>,
+        mut http_stream: ServerSession,
+        shutdown: &pingora::server::ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
+        match http_stream.read_request().await {
+            Ok(false) => return None,
+            Ok(true) => {}
+            Err(error) => {
+                eprintln!("failed to read downstream request header: {error}");
+                return None;
+            }
+        }
+
+        if *shutdown.borrow() {
+            http_stream.set_keepalive(None);
+        } else {
+            http_stream.set_keepalive(Some(60));
+        }
+
+        let response = self.handle_request(&mut http_stream).await;
+        if let Err(error) = self
+            .write_gateway_response(&mut http_stream, response)
             .await
         {
-            Ok(response) => self.response_from_worker(response),
-            Err(error) => self.runtime_pool_error_response(error),
+            eprintln!("failed to write downstream response: {error}");
+            return None;
+        }
+
+        let persistent_settings = HttpPersistentSettings::for_session(&http_stream);
+        match http_stream.finish().await {
+            Ok(connection) => {
+                connection.map(|stream| ReusedHttpStream::new(stream, Some(persistent_settings)))
+            }
+            Err(error) => {
+                eprintln!("failed to finish downstream request: {error}");
+                None
+            }
         }
     }
 }
@@ -797,11 +1254,11 @@ fn main() {
 
     let mut service = Service::new(
         "Hardess Worker Pingora Ingress".to_string(),
-        HttpServer::new_app(WorkerHttpApp {
+        WorkerHttpApp {
             runtime_manager,
             drain_controller: drain_controller.clone(),
             worker_id: cli.worker_id.clone(),
-        }),
+        },
     );
     service.add_tcp(&cli.listen);
 
@@ -966,6 +1423,76 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(1)
         );
+        assert_eq!(
+            body.pointer("/version_state/desired_artifact_id")
+                .and_then(Value::as_str)
+                .map(|artifact_id| artifact_id.starts_with("local-sha256:")),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/version_state/prepared_artifact_id")
+                .and_then(Value::as_str)
+                .map(|artifact_id| artifact_id.starts_with("local-sha256:")),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/version_state/active_artifact_id")
+                .and_then(Value::as_str)
+                .map(|artifact_id| artifact_id.starts_with("local-sha256:")),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/version_state/failed_artifact_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/desired_declared_artifact_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/desired_declared_version"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/prepared_declared_artifact_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/prepared_declared_version"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/active_declared_artifact_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/active_declared_version"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/failed_declared_artifact_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            body.pointer("/version_state/failed_declared_version"),
+            Some(&Value::Null)
+        );
+        assert!(body
+            .pointer("/version_state/desired_updated_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(body
+            .pointer("/version_state/prepared_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(body
+            .pointer("/version_state/active_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(body
+            .pointer("/version_state/status_updated_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some());
     }
 
     #[test]
@@ -1044,10 +1571,44 @@ mod tests {
         assert_eq!(initial.generations.len(), 1);
         assert_eq!(initial.version_state.status, "active");
         assert_eq!(initial.version_state.desired_generation_id, 1);
+        assert_eq!(
+            initial.version_state.desired_artifact_id,
+            initial.generations[0].project.artifact_id
+        );
+        assert_eq!(initial.version_state.desired_declared_artifact_id, None);
+        assert_eq!(initial.version_state.desired_declared_version, None);
+        assert!(initial.version_state.desired_updated_at_unix_ms > 0);
         assert_eq!(initial.version_state.prepared_generation_id, Some(1));
+        assert_eq!(
+            initial.version_state.prepared_artifact_id.as_deref(),
+            Some(initial.generations[0].project.artifact_id.as_str())
+        );
+        assert_eq!(initial.version_state.prepared_declared_artifact_id, None);
+        assert_eq!(initial.version_state.prepared_declared_version, None);
+        assert!(initial.version_state.prepared_at_unix_ms.is_some());
         assert_eq!(initial.version_state.active_generation_id, 1);
+        assert_eq!(
+            initial.version_state.active_artifact_id,
+            initial.generations[0].project.artifact_id
+        );
+        assert_eq!(initial.version_state.active_declared_artifact_id, None);
+        assert_eq!(initial.version_state.active_declared_version, None);
+        assert!(initial.version_state.active_at_unix_ms > 0);
         assert_eq!(initial.version_state.failed_generation_id, None);
+        assert_eq!(initial.version_state.failed_artifact_id, None);
+        assert_eq!(initial.version_state.failed_declared_artifact_id, None);
+        assert_eq!(initial.version_state.failed_declared_version, None);
+        assert_eq!(initial.version_state.failed_at_unix_ms, None);
+        assert_eq!(initial.version_state.failed_error_kind, None);
+        assert!(initial.version_state.status_updated_at_unix_ms > 0);
         assert_eq!(initial.last_prepare.status, "ready");
+        assert_eq!(
+            initial.last_prepare.artifact_id.as_deref(),
+            Some(initial.generations[0].project.artifact_id.as_str())
+        );
+        assert!(initial.last_prepare.started_at_unix_ms > 0);
+        assert!(initial.last_prepare.finished_at_unix_ms.is_some());
+        assert_eq!(initial.last_prepare.error_kind, None);
         assert!(initial.last_prepare.project.is_some());
         assert_eq!(initial.generations[0].prepare_status, "ready");
 
@@ -1059,10 +1620,43 @@ mod tests {
         assert_eq!(reloaded.generations.len(), 2);
         assert_eq!(reloaded.version_state.status, "active");
         assert_eq!(reloaded.version_state.desired_generation_id, 2);
+        assert_eq!(
+            reloaded.version_state.desired_artifact_id,
+            reloaded.generations[0].project.artifact_id
+        );
+        assert_eq!(reloaded.version_state.desired_declared_artifact_id, None);
+        assert_eq!(reloaded.version_state.desired_declared_version, None);
+        assert!(reloaded.version_state.desired_updated_at_unix_ms > 0);
         assert_eq!(reloaded.version_state.prepared_generation_id, Some(2));
+        assert_eq!(
+            reloaded.version_state.prepared_artifact_id.as_deref(),
+            Some(reloaded.generations[0].project.artifact_id.as_str())
+        );
+        assert_eq!(reloaded.version_state.prepared_declared_artifact_id, None);
+        assert_eq!(reloaded.version_state.prepared_declared_version, None);
+        assert!(reloaded.version_state.prepared_at_unix_ms.is_some());
         assert_eq!(reloaded.version_state.active_generation_id, 2);
+        assert_eq!(
+            reloaded.version_state.active_artifact_id,
+            reloaded.generations[0].project.artifact_id
+        );
+        assert_eq!(reloaded.version_state.active_declared_artifact_id, None);
+        assert_eq!(reloaded.version_state.active_declared_version, None);
+        assert!(reloaded.version_state.active_at_unix_ms > 0);
         assert_eq!(reloaded.version_state.failed_generation_id, None);
+        assert_eq!(reloaded.version_state.failed_artifact_id, None);
+        assert_eq!(reloaded.version_state.failed_declared_artifact_id, None);
+        assert_eq!(reloaded.version_state.failed_declared_version, None);
+        assert_eq!(reloaded.version_state.failed_at_unix_ms, None);
+        assert_eq!(reloaded.version_state.failed_error_kind, None);
         assert_eq!(reloaded.last_prepare.status, "ready");
+        assert_eq!(
+            reloaded.last_prepare.artifact_id.as_deref(),
+            Some(reloaded.generations[0].project.artifact_id.as_str())
+        );
+        assert!(reloaded.last_prepare.started_at_unix_ms > 0);
+        assert!(reloaded.last_prepare.finished_at_unix_ms.is_some());
+        assert_eq!(reloaded.last_prepare.error_kind, None);
         assert_eq!(reloaded.last_prepare.target_generation_id, 2);
         assert!(reloaded.last_prepare.project.is_some());
         assert_eq!(
@@ -1090,6 +1684,7 @@ mod tests {
         assert_eq!(settled.generations[0].generation_id, 2);
         assert_eq!(settled.version_state.status, "active");
         assert_eq!(settled.version_state.active_generation_id, 2);
+        assert!(settled.version_state.status_updated_at_unix_ms > 0);
         assert_eq!(settled.last_prepare.status, "ready");
     }
 
@@ -1122,9 +1717,40 @@ mod tests {
         assert_eq!(snapshot.generations.len(), 1);
         assert_eq!(snapshot.version_state.status, "failed");
         assert_eq!(snapshot.version_state.desired_generation_id, 2);
+        assert_ne!(
+            snapshot.version_state.desired_artifact_id,
+            snapshot.version_state.active_artifact_id
+        );
+        assert_eq!(snapshot.version_state.desired_declared_artifact_id, None);
+        assert_eq!(snapshot.version_state.desired_declared_version, None);
+        assert!(snapshot.version_state.desired_updated_at_unix_ms > 0);
         assert_eq!(snapshot.version_state.prepared_generation_id, Some(1));
+        assert_eq!(
+            snapshot.version_state.prepared_artifact_id.as_deref(),
+            Some(snapshot.generations[0].project.artifact_id.as_str())
+        );
+        assert_eq!(snapshot.version_state.prepared_declared_artifact_id, None);
+        assert_eq!(snapshot.version_state.prepared_declared_version, None);
+        assert!(snapshot.version_state.prepared_at_unix_ms.is_some());
         assert_eq!(snapshot.version_state.active_generation_id, 1);
+        assert_eq!(
+            snapshot.version_state.active_artifact_id,
+            snapshot.generations[0].project.artifact_id
+        );
+        assert_eq!(snapshot.version_state.active_declared_artifact_id, None);
+        assert_eq!(snapshot.version_state.active_declared_version, None);
         assert_eq!(snapshot.version_state.failed_generation_id, Some(2));
+        assert_eq!(
+            snapshot.version_state.failed_artifact_id.as_deref(),
+            Some(snapshot.version_state.desired_artifact_id.as_str())
+        );
+        assert_eq!(snapshot.version_state.failed_declared_artifact_id, None);
+        assert_eq!(snapshot.version_state.failed_declared_version, None);
+        assert!(snapshot.version_state.failed_at_unix_ms.is_some());
+        assert_eq!(
+            snapshot.version_state.failed_error_kind.as_deref(),
+            Some("worker_code_invalid")
+        );
         assert!(snapshot
             .version_state
             .failed_error
@@ -1132,13 +1758,120 @@ mod tests {
             .expect("failed version state should keep error")
             .contains("Expected ident"));
         assert_eq!(snapshot.last_prepare.status, "failed");
+        assert!(snapshot.last_prepare.started_at_unix_ms > 0);
+        assert!(snapshot.last_prepare.finished_at_unix_ms.is_some());
+        assert_eq!(
+            snapshot.last_prepare.artifact_id.as_deref(),
+            Some(snapshot.version_state.desired_artifact_id.as_str())
+        );
+        assert_eq!(
+            snapshot.last_prepare.error_kind.as_deref(),
+            Some("worker_code_invalid")
+        );
         assert_eq!(snapshot.last_prepare.target_generation_id, 2);
-        assert!(snapshot.last_prepare.project.is_none());
+        assert_eq!(
+            snapshot
+                .last_prepare
+                .project
+                .as_ref()
+                .map(|project| project.artifact_id.as_str()),
+            Some(snapshot.version_state.desired_artifact_id.as_str())
+        );
         assert!(snapshot
             .last_prepare
             .error
             .as_deref()
             .expect("failed prepare should keep error")
             .contains("Expected ident"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_desired_worker_can_switch_to_another_worker_entry() {
+        let manager = RuntimeGenerationManager::new(RuntimeGenerationManagerConfig {
+            worker_entry: sample_worker_path(),
+            runtime_threads: 1,
+            queue_capacity: 4,
+            exec_timeout: Duration::from_secs(5),
+            generation_drain_timeout: Duration::from_millis(10),
+        })
+        .expect("runtime manager should initialize");
+        let next_worker = temp_worker_path(
+            "apply-desired-worker",
+            "export function fetch() { return new Response('switched'); }\n",
+        );
+
+        let updated = manager
+            .apply_desired_worker(DesiredWorkerSpec {
+                worker_entry: next_worker.clone(),
+                declared_artifact_id: Some("cp-artifact-42".to_string()),
+                declared_version: Some("worker-v2".to_string()),
+            })
+            .await
+            .expect("apply desired worker should succeed");
+
+        assert_eq!(updated.active_generation_id, 2);
+        assert_eq!(
+            updated.version_state.desired_worker_entry,
+            next_worker.display().to_string()
+        );
+        assert_eq!(
+            updated
+                .version_state
+                .desired_declared_artifact_id
+                .as_deref(),
+            Some("cp-artifact-42")
+        );
+        assert_eq!(
+            updated.version_state.desired_declared_version.as_deref(),
+            Some("worker-v2")
+        );
+        assert_eq!(
+            updated
+                .version_state
+                .prepared_declared_artifact_id
+                .as_deref(),
+            Some("cp-artifact-42")
+        );
+        assert_eq!(
+            updated.version_state.prepared_declared_version.as_deref(),
+            Some("worker-v2")
+        );
+        assert_eq!(
+            updated.version_state.active_declared_artifact_id.as_deref(),
+            Some("cp-artifact-42")
+        );
+        assert_eq!(
+            updated.version_state.active_declared_version.as_deref(),
+            Some("worker-v2")
+        );
+        assert_eq!(updated.version_state.failed_declared_artifact_id, None);
+        assert_eq!(updated.version_state.failed_declared_version, None);
+        assert_eq!(
+            updated.generations[0].worker_entry,
+            next_worker.display().to_string()
+        );
+        assert_eq!(
+            updated.generations[0].declared_artifact_id.as_deref(),
+            Some("cp-artifact-42")
+        );
+        assert_eq!(
+            updated.generations[0].declared_version.as_deref(),
+            Some("worker-v2")
+        );
+        assert_eq!(
+            updated.last_prepare.declared_artifact_id.as_deref(),
+            Some("cp-artifact-42")
+        );
+        assert_eq!(
+            updated.last_prepare.declared_version.as_deref(),
+            Some("worker-v2")
+        );
+        assert_eq!(
+            manager
+                .active_project_snapshot()
+                .expect("active project snapshot should switch to the new worker")
+                .artifact_id,
+            updated.generations[0].project.artifact_id
+        );
     }
 }

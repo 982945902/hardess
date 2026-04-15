@@ -112,22 +112,18 @@ That allows business-visible errors to stay on the same public taxonomy rather t
 In the experiment runtime:
 
 - Rust host constructors derive public error metadata from `public-errors.json`
-- TS workers can read the same contract through `globalThis.HardessPublicErrors`
 - ingress error responses use the same mapping
-- compat worker `ParsedV1Response.error` is normalized through the same contract
 
 That means:
 
 - ingress errors
 - runtime errors
-- compat worker public errors
 
 all converge onto one source of truth.
 
 ## Non-goals
 
 - no attempt yet to generate SDK code automatically
-- no attempt yet to move the stable `v1` repo onto this contract
 - no attempt yet to model private/internal diagnostic error trees here
 
 ## Recommended next steps
