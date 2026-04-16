@@ -49,6 +49,76 @@ This benchmark should be read as:
 - first compare transport/runtime fixed cost on the same echo workload
 - only then compare richer application semantics
 
+### WebSocket runtime micro-benchmark
+
+Purpose:
+
+- separate runtime-side websocket event invocation cost from Pingora/network/session cost
+- measure the current floor before changing bridge/event materialization again
+
+Harness:
+
+- example target:
+  - `crates/gateway-host/examples/websocket_runtime_micro.rs`
+- command:
+  - `cargo run --release --manifest-path experiment/pingora-worker-runtime/Cargo.toml -p gateway-host --example websocket_runtime_micro`
+- default config:
+  - warmup: `20,000`
+  - measured: `100,000`
+- worker shape:
+  - `onOpen(ctx)` touches `connectionId / workerId / metadata / vars`
+  - `onMessage(message, ctx)` validates `message.kind === "text"` and touches `message.text`
+  - `onClose(event, ctx)` touches `code / reason / remote`
+  - no `ctx.send(...)`
+  - no `ctx.close(...)`
+
+Initial sample on 2026-04-16, average of 3 release reruns:
+
+Event materialization only:
+
+| Event | Avg us/op | Min us/op | Max us/op |
+|---|---:|---:|---:|
+| `open` | `0.281` | `0.275` | `0.285` |
+| `message` | `0.782` | `0.773` | `0.789` |
+| `close` | `0.917` | `0.900` | `0.928` |
+
+Context materialization only:
+
+| Case | Avg us/op | Min us/op | Max us/op |
+|---|---:|---:|---:|
+| `ctx total` | `1.402` | `1.380` | `1.437` |
+| `ctx ids` | `0.469` | `0.455` | `0.479` |
+| `ctx vars` | `0.280` | `0.278` | `0.282` |
+| `ctx metadata` | `0.282` | `0.277` | `0.285` |
+
+Full runtime invocation benchmark on the same harness:
+
+| Event | Avg us/op | Min us/op | Max us/op |
+|---|---:|---:|---:|
+| `open` | `3.011` | `2.974` | `3.034` |
+| `message` | `3.532` | `3.490` | `3.599` |
+| `close` | `3.944` | `3.824` | `4.173` |
+
+Interpretation:
+
+- runtime-only websocket invocation is already in the low-single-digit microsecond range
+- event object construction itself is not the dominant piece:
+  - `open` event materialization is about `0.29 us/op`
+  - `message` event materialization is about `0.83 us/op`
+  - `close` event materialization is about `0.94 us/op`
+- current websocket context materialization is heavier than event materialization at about `1.44 us/op`
+- inside `ctx`, the two id strings are the largest named piece at about `0.47 us/op`
+- `vars` and `metadata` are each only about `0.28 us/op` in the current one-entry sample
+- `ctx total` is still higher than `ids + vars + metadata`, which means the remaining fixed cost includes:
+  - outer object allocation
+  - top-level property sets
+- `message` and `close` invocation remain close to each other and relatively stable
+- `open` invocation still showed more variance in the local sample, so it should not be over-interpreted
+- this supports the earlier end-to-end signal:
+  - the next wins are unlikely to come from more JS wrapper reshaping alone
+  - if we keep pushing lower, `ctx` shape is still a better target than `event` shape
+  - but the first sub-target should be top-level `ctx` construction and id-string handling, not the small `vars/metadata` maps
+
 ### WebSocket baseline sample
 
 Date: 2026-04-16
@@ -106,6 +176,207 @@ Interpretation:
 - Pingora worker WS echo is slower than Bun native, but not by an order of magnitude
 - the next optimization focus should stay on the Rust <-> runtime event bridge and session scheduling path
 - all conclusions above are based on `release` build only; `debug` samples are not comparable
+
+### WebSocket Round 1
+
+- code change:
+  - stop rebuilding a second JS websocket context wrapper on every invocation
+  - let Rust produce a message event shape that can be passed to `onMessage(...)` directly
+  - let Rust produce a close event shape that can be passed to `onClose(...)` directly
+- benchmark shape:
+  - unchanged from the websocket baseline sample
+  - same host
+  - same shared client
+  - warmup `1`
+  - measured `3`
+  - `50` connections
+  - `200` messages per connection
+  - Pingora `release` binary
+- average result:
+  - `pingora-v2-ws`
+    - Msg/s: `59,922`
+    - p50: `0.821 ms`
+    - p90: `1.017 ms`
+    - p99: `1.416 ms`
+- delta vs websocket baseline:
+  - throughput: `+3.1%`
+  - p50: `-0.1%`
+  - p90: `-5.3%`
+  - p99: `-9.1%`
+- release timing sample after this round:
+  - `average_open_runtime_ms`: `0.147`
+  - `average_message_runtime_ms`: `0.304`
+  - `average_message_command_write_ms`: `0.007`
+  - `average_message_total_ms`: `0.312`
+- conclusion:
+  - removing the extra JS wrapper work is directionally correct
+  - the gain is modest but real, especially on tail latency
+  - the next websocket hot path to attack is still runtime-side event/context materialization, not socket write cost
+
+### WebSocket Experiment A
+
+- code change:
+  - try caching websocket `ctx` as a connection-level V8 object inside the runtime slot
+  - clear that cached object on `close`
+- benchmark shape:
+  - unchanged from the websocket baseline sample
+  - same host
+  - same shared client
+  - warmup `1`
+  - measured `3`
+  - `50` connections
+  - `200` messages per connection
+  - Pingora `release` binary
+- average result:
+  - `pingora-v2-ws`
+    - Msg/s: `55,770`
+    - p50: `0.877 ms`
+    - p90: `1.125 ms`
+    - p99: `1.544 ms`
+- delta vs WebSocket Round 1:
+  - throughput: `-6.9%`
+  - p50: `+6.9%`
+  - p90: `+10.6%`
+  - p99: `+9.0%`
+- release timing sample during this experiment:
+  - `average_open_runtime_ms`: `0.328`
+  - `average_message_runtime_ms`: `0.299`
+  - `average_message_command_write_ms`: `0.008`
+  - `average_message_total_ms`: `0.306`
+- conclusion:
+  - this experiment regressed the end-to-end benchmark and is not kept
+  - the likely issue is that retaining/reusing a V8 object here does not pay for its bookkeeping cost on the current path
+  - keep chasing lower-cost event/context materialization, but do not keep this cache shape
+
+### WebSocket Experiment B
+
+- code change:
+  - split websocket runtime dispatch into pre-bound `open / message / close` wrappers during bootstrap
+  - try removing per-event `switch` and `onX` property lookup from the hot path
+- benchmark shape:
+  - unchanged from the websocket baseline sample
+  - same host
+  - same shared client
+  - warmup `1`
+  - measured `3`
+  - `50` connections
+  - `200` messages per connection
+  - Pingora `release` binary
+- average result:
+  - `pingora-v2-ws`
+    - Msg/s: `57,591`
+    - p50: `0.833 ms`
+    - p90: `1.086 ms`
+    - p99: `1.588 ms`
+- delta vs WebSocket Round 1:
+  - throughput: `-3.9%`
+  - p50: `+1.5%`
+  - p90: `+6.8%`
+  - p99: `+12.1%`
+- release timing sample during this experiment:
+  - `average_open_runtime_ms`: `0.154`
+  - `average_message_runtime_ms`: `0.396`
+  - `average_message_command_write_ms`: `0.007`
+  - `average_message_total_ms`: `0.403`
+- conclusion:
+  - this direction also regressed and is not kept
+  - removing the JS-side dispatch branch did not outweigh the wrapper shape changes on the current runtime path
+  - the next useful move should be finer measurement or lower-level event object materialization work, not more JS wrapper reshaping
+
+### WebSocket Round 2
+
+- code change:
+  - cache `connectionId` and `workerId` as V8 strings inside the runtime slot
+  - reuse those strings when constructing websocket `ctx`
+  - clear `connectionId` cache entry after `close`
+- benchmark shape:
+  - unchanged from the websocket baseline sample
+  - same host
+  - same shared client
+  - warmup `1`
+  - measured `3`
+  - `50` connections
+  - `200` messages per connection
+  - Pingora `release` binary
+- average result:
+  - `pingora-v2-ws`
+    - Msg/s: `60,089`
+    - p50: `0.826 ms`
+    - p90: `1.009 ms`
+    - p99: `1.343 ms`
+- delta vs WebSocket Round 1:
+  - throughput: `+0.3%`
+  - p50: `+0.7%`
+  - p90: `-0.8%`
+  - p99: `-5.2%`
+- release timing sample after this round:
+  - `average_open_runtime_ms`: `0.152`
+  - `average_message_runtime_ms`: `0.306`
+  - `average_message_command_write_ms`: `0.007`
+  - `average_message_total_ms`: `0.314`
+- micro-benchmark signal behind this round:
+  - `ctx ids`: `0.469 us/op`
+  - `ctx total`: `1.402 us/op`
+- conclusion:
+  - this is a small but real win worth keeping
+  - the benefit mostly shows up in tail latency, not headline throughput
+  - caching only the id strings is materially safer than caching the whole websocket context object
+
+### WebSocket Experiment C
+
+- code change:
+  - cache fixed websocket V8 property-name strings in the runtime slot:
+    - `type / kind / text / code / reason / remote`
+    - `connectionId / workerId / vars / metadata`
+  - cache fixed websocket V8 value strings in the runtime slot:
+    - `open / message / close / text`
+  - reuse those cached V8 strings during websocket `event` and `ctx` materialization
+- release runtime micro-benchmark sample after this change:
+  - command:
+    - `cargo run --release --manifest-path experiment/pingora-worker-runtime/Cargo.toml -p gateway-host --example websocket_runtime_micro`
+  - single rerun sample on 2026-04-16:
+    - event materialization:
+      - `open`: `0.105 us/op` (`-62.6%` vs initial micro sample)
+      - `message`: `0.291 us/op` (`-62.8%`)
+      - `close`: `0.356 us/op` (`-61.2%`)
+    - context materialization:
+      - `ctx total`: `0.882 us/op` (`-37.1%`)
+      - `ctx ids`: `0.223 us/op` (`-52.4%`)
+      - `ctx vars`: `0.284 us/op` (`+1.6%`)
+      - `ctx metadata`: `0.284 us/op` (`+0.7%`)
+    - full runtime invocation on the same harness:
+      - `open`: `2.259 us/op` (`-25.0%`)
+      - `message`: `2.437 us/op` (`-31.0%`)
+      - `close`: `2.657 us/op` (`-32.6%`)
+- end-to-end websocket sample after this change:
+  - benchmark shape:
+    - same envelope as WebSocket Round 2
+    - fresh server restart
+    - warmup `1`
+    - measured `3`
+    - serial client runs only
+  - measured runs:
+    - run1: `52,881 msg/s`, `p50 0.879 ms`, `p90 1.240 ms`, `p99 1.947 ms`
+    - run2: `54,009 msg/s`, `p50 0.870 ms`, `p90 1.158 ms`, `p99 1.832 ms`
+    - run3: `51,690 msg/s`, `p50 0.850 ms`, `p90 1.216 ms`, `p99 2.400 ms`
+  - average result:
+    - `pingora-v2-ws`
+      - Msg/s: `52,860`
+      - p50: `0.866 ms`
+      - p90: `1.205 ms`
+      - p99: `2.060 ms`
+  - runtime-side timing snapshot from `/_hardess/ingress-state` on the same sample:
+    - `average_open_runtime_ms`: `0.211`
+    - `average_message_runtime_ms`: `0.278`
+    - `average_message_command_write_ms`: `0.007`
+    - `average_message_total_ms`: `0.286`
+    - `runtime_pool.overloaded`: `0`
+  - interpretation:
+    - this change is a clear micro-benchmark win
+    - server-side runtime timing also improved on the message path versus WebSocket Round 2
+    - but the local end-to-end client benchmark did not improve on this machine in the same session
+    - because the micro result and the runtime-side timings disagree with the client-side throughput sample, this experiment should currently be treated as `inconclusive` rather than promoted as a confirmed end-to-end win
+    - keep the code in the working tree for now, but do not record it as a kept production optimization until it is rerun under a cleaner A/B environment
 
 ## Benchmark rule
 

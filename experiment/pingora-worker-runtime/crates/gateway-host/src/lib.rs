@@ -2227,11 +2227,36 @@ impl TypescriptModuleLoader {
 pub struct DenoWorkerRuntime {
     js_runtime: JsRuntime,
     invoke_bridge: WorkerInvocationBridge,
+    websocket_v8_cache: WebSocketV8Cache,
+    websocket_string_cache: WebSocketStringCache,
 }
 
 struct WorkerInvocationBridge {
     fetch: v8::Global<v8::Function>,
     websocket: Option<v8::Global<v8::Function>>,
+}
+
+#[derive(Default)]
+struct WebSocketStringCache {
+    worker_ids: HashMap<String, v8::Global<v8::String>>,
+    connection_ids: HashMap<String, v8::Global<v8::String>>,
+}
+
+struct WebSocketV8Cache {
+    prop_type: v8::Global<v8::String>,
+    prop_kind: v8::Global<v8::String>,
+    prop_text: v8::Global<v8::String>,
+    prop_code: v8::Global<v8::String>,
+    prop_reason: v8::Global<v8::String>,
+    prop_remote: v8::Global<v8::String>,
+    prop_connection_id: v8::Global<v8::String>,
+    prop_worker_id: v8::Global<v8::String>,
+    prop_vars: v8::Global<v8::String>,
+    prop_metadata: v8::Global<v8::String>,
+    value_open: v8::Global<v8::String>,
+    value_message: v8::Global<v8::String>,
+    value_close: v8::Global<v8::String>,
+    value_text: v8::Global<v8::String>,
 }
 
 struct JsResponseChunkReader {
@@ -3396,7 +3421,37 @@ pub struct DrainSnapshot {
     pub inflight_requests: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeMicroBenchmarkSummary {
+    pub iterations: usize,
+    pub elapsed_ms: f64,
+    pub operations_per_second: f64,
+    pub average_us: f64,
+}
+
 impl DenoWorkerRuntime {
+    fn summarize_runtime_micro_benchmark(
+        iterations: usize,
+        started_at: Instant,
+    ) -> RuntimeMicroBenchmarkSummary {
+        let elapsed = started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        RuntimeMicroBenchmarkSummary {
+            iterations,
+            elapsed_ms: elapsed_secs * 1000.0,
+            operations_per_second: if elapsed_secs > 0.0 {
+                iterations as f64 / elapsed_secs
+            } else {
+                0.0
+            },
+            average_us: if iterations > 0 {
+                elapsed_secs * 1_000_000.0 / iterations as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
     pub async fn new(worker_entry: &Path) -> Result<Self> {
         let source_map_store = Rc::new(RefCell::new(HashMap::new()));
         let project_config = Rc::new(WorkerProjectConfig::discover(worker_entry)?);
@@ -3425,11 +3480,242 @@ impl DenoWorkerRuntime {
         evaluation.await?;
         let invoke_bridge =
             Self::initialize_invocation_bridge(&mut js_runtime, &worker_specifier).await?;
+        let websocket_v8_cache = Self::initialize_websocket_v8_cache(&mut js_runtime)?;
 
         Ok(Self {
             js_runtime,
             invoke_bridge,
+            websocket_v8_cache,
+            websocket_string_cache: WebSocketStringCache::default(),
         })
+    }
+
+    fn initialize_websocket_v8_cache(js_runtime: &mut JsRuntime) -> Result<WebSocketV8Cache> {
+        deno_core::scope!(scope, js_runtime);
+
+        let prop_type = Self::v8_global_string(scope, "type")?;
+        let prop_kind = Self::v8_global_string(scope, "kind")?;
+        let prop_text = Self::v8_global_string(scope, "text")?;
+        let prop_code = Self::v8_global_string(scope, "code")?;
+        let prop_reason = Self::v8_global_string(scope, "reason")?;
+        let prop_remote = Self::v8_global_string(scope, "remote")?;
+        let prop_connection_id = Self::v8_global_string(scope, "connectionId")?;
+        let prop_worker_id = Self::v8_global_string(scope, "workerId")?;
+        let prop_vars = Self::v8_global_string(scope, "vars")?;
+        let prop_metadata = Self::v8_global_string(scope, "metadata")?;
+        let value_open = Self::v8_global_string(scope, "open")?;
+        let value_message = Self::v8_global_string(scope, "message")?;
+        let value_close = Self::v8_global_string(scope, "close")?;
+        let value_text = Self::v8_global_string(scope, "text")?;
+
+        Ok(WebSocketV8Cache {
+            prop_type,
+            prop_kind,
+            prop_text,
+            prop_code,
+            prop_reason,
+            prop_remote,
+            prop_connection_id,
+            prop_worker_id,
+            prop_vars,
+            prop_metadata,
+            value_open,
+            value_message,
+            value_close,
+            value_text,
+        })
+    }
+
+    pub fn benchmark_websocket_event_materialization(
+        &mut self,
+        event: &WorkerWebSocketEvent,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        let (runtime, websocket_v8_cache) = (&mut self.js_runtime, &self.websocket_v8_cache);
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            deno_core::scope!(scope, runtime);
+            let value = Self::websocket_event_to_v8(scope, websocket_v8_cache, event)
+                .map_err(|error| error.to_string())?;
+            std::hint::black_box(value);
+        }
+        Ok(Self::summarize_runtime_micro_benchmark(
+            iterations, started_at,
+        ))
+    }
+
+    pub fn benchmark_websocket_context_materialization(
+        &mut self,
+        ctx: &WorkerWebSocketContext,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        let (runtime, websocket_string_cache, websocket_v8_cache) = (
+            &mut self.js_runtime,
+            &mut self.websocket_string_cache,
+            &self.websocket_v8_cache,
+        );
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            deno_core::scope!(scope, runtime);
+            let value = Self::websocket_context_to_v8_cached(
+                scope,
+                websocket_v8_cache,
+                websocket_string_cache,
+                ctx,
+            )
+            .map_err(|error| error.to_string())?;
+            std::hint::black_box(value);
+        }
+        Ok(Self::summarize_runtime_micro_benchmark(
+            iterations, started_at,
+        ))
+    }
+
+    pub fn benchmark_websocket_context_id_materialization(
+        &mut self,
+        ctx: &WorkerWebSocketContext,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        let (runtime, websocket_string_cache, websocket_v8_cache) = (
+            &mut self.js_runtime,
+            &mut self.websocket_string_cache,
+            &self.websocket_v8_cache,
+        );
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            deno_core::scope!(scope, runtime);
+            let object = v8::Object::new(scope);
+            let connection_id = Self::cached_v8_string(
+                scope,
+                &mut websocket_string_cache.connection_ids,
+                &ctx.connection_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Self::set_object_property_cached(
+                scope,
+                object,
+                &websocket_v8_cache.prop_connection_id,
+                connection_id.into(),
+            )
+            .map_err(|error| error.to_string())?;
+            let worker_id = Self::cached_v8_string(
+                scope,
+                &mut websocket_string_cache.worker_ids,
+                &ctx.worker_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Self::set_object_property_cached(
+                scope,
+                object,
+                &websocket_v8_cache.prop_worker_id,
+                worker_id.into(),
+            )
+            .map_err(|error| error.to_string())?;
+            std::hint::black_box(object);
+        }
+        Ok(Self::summarize_runtime_micro_benchmark(
+            iterations, started_at,
+        ))
+    }
+
+    pub fn benchmark_websocket_context_vars_materialization(
+        &mut self,
+        ctx: &WorkerWebSocketContext,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        self.benchmark_string_map_materialization(&ctx.vars, iterations)
+    }
+
+    pub fn benchmark_websocket_context_metadata_materialization(
+        &mut self,
+        ctx: &WorkerWebSocketContext,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        self.benchmark_string_map_materialization(&ctx.metadata, iterations)
+    }
+
+    fn benchmark_string_map_materialization(
+        &mut self,
+        values: &BTreeMap<String, String>,
+        iterations: usize,
+    ) -> Result<RuntimeMicroBenchmarkSummary, String> {
+        let runtime = &mut self.js_runtime;
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            deno_core::scope!(scope, runtime);
+            let object =
+                Self::string_map_to_v8_object(scope, values).map_err(|error| error.to_string())?;
+            std::hint::black_box(object);
+        }
+        Ok(Self::summarize_runtime_micro_benchmark(
+            iterations, started_at,
+        ))
+    }
+
+    fn cached_v8_string<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        cache: &mut HashMap<String, v8::Global<v8::String>>,
+        value: &str,
+    ) -> Result<v8::Local<'s, v8::String>> {
+        if let Some(cached) = cache.get(value) {
+            return Ok(v8::Local::new(scope, cached));
+        }
+
+        let local = Self::v8_string(scope, value)?;
+        cache.insert(value.to_string(), v8::Global::new(scope, local));
+        Ok(local)
+    }
+
+    fn websocket_context_to_v8_cached<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        websocket_v8_cache: &WebSocketV8Cache,
+        websocket_string_cache: &mut WebSocketStringCache,
+        ctx: &WorkerWebSocketContext,
+    ) -> Result<v8::Local<'s, v8::Value>> {
+        let object = v8::Object::new(scope);
+        let connection_id = Self::cached_v8_string(
+            scope,
+            &mut websocket_string_cache.connection_ids,
+            &ctx.connection_id,
+        )?;
+        Self::set_object_property_cached(
+            scope,
+            object,
+            &websocket_v8_cache.prop_connection_id,
+            connection_id.into(),
+        )?;
+        let worker_id = Self::cached_v8_string(
+            scope,
+            &mut websocket_string_cache.worker_ids,
+            &ctx.worker_id,
+        )?;
+        Self::set_object_property_cached(
+            scope,
+            object,
+            &websocket_v8_cache.prop_worker_id,
+            worker_id.into(),
+        )?;
+        let vars = Self::string_map_to_v8_object(scope, &ctx.vars)?;
+        Self::set_object_property_cached(
+            scope,
+            object,
+            &websocket_v8_cache.prop_vars,
+            vars.into(),
+        )?;
+        let metadata = Self::string_map_to_v8_object(scope, &ctx.metadata)?;
+        Self::set_object_property_cached(
+            scope,
+            object,
+            &websocket_v8_cache.prop_metadata,
+            metadata.into(),
+        )?;
+        Ok(object.into())
+    }
+
+    fn clear_websocket_connection_id_cache(&mut self, connection_id: &str) {
+        self.websocket_string_cache
+            .connection_ids
+            .remove(connection_id);
     }
 
     async fn initialize_invocation_bridge(
@@ -3520,34 +3806,35 @@ impl DenoWorkerRuntime {
     return await normalizeWebResponse(rawResponse);
   }};
 
-  const createWebSocketContext = (ctxBase) => ({{
-    connectionId: ctxBase.connectionId,
-    workerId: ctxBase.workerId,
-    vars: ctxBase.vars ?? {{}},
-    metadata: ctxBase.metadata ?? {{}},
-    send(data) {{
-      if (typeof data !== "string") {{
-        throw new Error("websocket ctx.send() currently only supports string payloads");
-      }}
-      Deno.core.ops.op_websocket_ctx_send(data);
-    }},
-    close(code = undefined, reason = undefined) {{
-      if (code != null && (!Number.isInteger(code) || code < 0 || code > 65535)) {{
-        throw new Error("websocket ctx.close() code must be an unsigned 16-bit integer");
-      }}
-      if (reason != null && typeof reason !== "string") {{
-        reason = String(reason);
-      }}
-      Deno.core.ops.op_websocket_ctx_close(code ?? null, reason ?? null);
-    }},
-  }});
+  function websocketSend(data) {{
+    if (typeof data !== "string") {{
+      throw new Error("websocket ctx.send() currently only supports string payloads");
+    }}
+    Deno.core.ops.op_websocket_ctx_send(data);
+  }}
+
+  function websocketClose(code = undefined, reason = undefined) {{
+    if (code != null && (!Number.isInteger(code) || code < 0 || code > 65535)) {{
+      throw new Error("websocket ctx.close() code must be an unsigned 16-bit integer");
+    }}
+    if (reason != null && typeof reason !== "string") {{
+      reason = String(reason);
+    }}
+    Deno.core.ops.op_websocket_ctx_close(code ?? null, reason ?? null);
+  }}
+
+  const decorateWebSocketContext = (ctxBase) => {{
+    ctxBase.send = websocketSend;
+    ctxBase.close = websocketClose;
+    return ctxBase;
+  }};
 
   const invokeWebSocket = async (event, ctxBase) => {{
     if (!websocketCandidate) {{
       throw new Error("worker module does not export websocket handlers");
     }}
 
-    const ctx = createWebSocketContext(ctxBase);
+    const ctx = decorateWebSocketContext(ctxBase);
     switch (event?.type) {{
       case "open":
         if (typeof websocketCandidate.onOpen === "function") {{
@@ -3556,19 +3843,12 @@ impl DenoWorkerRuntime {
         return;
       case "message":
         if (typeof websocketCandidate.onMessage === "function") {{
-          await websocketCandidate.onMessage({{ kind: "text", text: event.text }}, ctx);
+          await websocketCandidate.onMessage(event, ctx);
         }}
         return;
       case "close":
         if (typeof websocketCandidate.onClose === "function") {{
-          await websocketCandidate.onClose(
-            {{
-              code: event.code ?? undefined,
-              reason: event.reason ?? undefined,
-              remote: Boolean(event.remote),
-            }},
-            ctx,
-          );
+          await websocketCandidate.onClose(event, ctx);
         }}
         return;
       default:
@@ -3676,6 +3956,14 @@ impl DenoWorkerRuntime {
         v8::String::new(scope, value).context(format!("unable to allocate V8 string for `{value}`"))
     }
 
+    fn v8_global_string(
+        scope: &mut v8::PinScope<'_, '_>,
+        value: &str,
+    ) -> Result<v8::Global<v8::String>> {
+        let local = Self::v8_string(scope, value)?;
+        Ok(v8::Global::new(scope, local))
+    }
+
     fn set_object_property<'s>(
         scope: &mut v8::PinScope<'s, '_>,
         object: v8::Local<'s, v8::Object>,
@@ -3686,6 +3974,18 @@ impl DenoWorkerRuntime {
         object
             .set(scope, key.into(), value)
             .context(format!("unable to set V8 object property `{name}`"))?;
+        Ok(())
+    }
+
+    fn set_object_property_cached<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        key: &v8::Global<v8::String>,
+        value: v8::Local<'s, v8::Value>,
+    ) -> Result<()> {
+        object
+            .set(scope, v8::Local::new(scope, key).into(), value)
+            .context("unable to set cached V8 object property")?;
         Ok(())
     }
 
@@ -3723,55 +4023,78 @@ impl DenoWorkerRuntime {
         Ok(object.into())
     }
 
-    fn websocket_context_to_v8<'s>(
-        scope: &mut v8::PinScope<'s, '_>,
-        ctx: &WorkerWebSocketContext,
-    ) -> Result<v8::Local<'s, v8::Value>> {
-        let object = v8::Object::new(scope);
-        let connection_id = Self::v8_string(scope, &ctx.connection_id)?;
-        Self::set_object_property(scope, object, "connectionId", connection_id.into())?;
-        let worker_id = Self::v8_string(scope, &ctx.worker_id)?;
-        Self::set_object_property(scope, object, "workerId", worker_id.into())?;
-        let vars = Self::string_map_to_v8_object(scope, &ctx.vars)?;
-        Self::set_object_property(scope, object, "vars", vars.into())?;
-        let metadata = Self::string_map_to_v8_object(scope, &ctx.metadata)?;
-        Self::set_object_property(scope, object, "metadata", metadata.into())?;
-        Ok(object.into())
-    }
-
     fn websocket_event_to_v8<'s>(
         scope: &mut v8::PinScope<'s, '_>,
+        websocket_v8_cache: &WebSocketV8Cache,
         event: &WorkerWebSocketEvent,
     ) -> Result<v8::Local<'s, v8::Value>> {
         let object = v8::Object::new(scope);
         match event {
             WorkerWebSocketEvent::Open => {
-                let event_type = Self::v8_string(scope, "open")?;
-                Self::set_object_property(scope, object, "type", event_type.into())?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_type,
+                    v8::Local::new(scope, &websocket_v8_cache.value_open).into(),
+                )?;
             }
             WorkerWebSocketEvent::Message { text } => {
-                let event_type = Self::v8_string(scope, "message")?;
-                Self::set_object_property(scope, object, "type", event_type.into())?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_type,
+                    v8::Local::new(scope, &websocket_v8_cache.value_message).into(),
+                )?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_kind,
+                    v8::Local::new(scope, &websocket_v8_cache.value_text).into(),
+                )?;
                 let text = Self::v8_string(scope, text)?;
-                Self::set_object_property(scope, object, "text", text.into())?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_text,
+                    text.into(),
+                )?;
             }
             WorkerWebSocketEvent::Close(event) => {
-                let event_type = Self::v8_string(scope, "close")?;
-                Self::set_object_property(scope, object, "type", event_type.into())?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_type,
+                    v8::Local::new(scope, &websocket_v8_cache.value_close).into(),
+                )?;
                 let code_value = event
                     .code
                     .map(|code| v8::Integer::new_from_unsigned(scope, code as u32).into())
-                    .unwrap_or_else(|| v8::null(scope).into());
-                Self::set_object_property(scope, object, "code", code_value)?;
+                    .unwrap_or_else(|| v8::undefined(scope).into());
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_code,
+                    code_value,
+                )?;
                 let reason_value = event
                     .reason
                     .as_deref()
                     .map(|reason| Self::v8_string(scope, reason).map(Into::into))
                     .transpose()?
-                    .unwrap_or_else(|| v8::null(scope).into());
-                Self::set_object_property(scope, object, "reason", reason_value)?;
+                    .unwrap_or_else(|| v8::undefined(scope).into());
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_reason,
+                    reason_value,
+                )?;
                 let remote = v8::Boolean::new(scope, event.remote);
-                Self::set_object_property(scope, object, "remote", remote.into())?;
+                Self::set_object_property_cached(
+                    scope,
+                    object,
+                    &websocket_v8_cache.prop_remote,
+                    remote.into(),
+                )?;
             }
         }
 
@@ -3805,11 +4128,20 @@ impl DenoWorkerRuntime {
         event: &WorkerWebSocketEvent,
         ctx: &WorkerWebSocketContext,
     ) -> Result<[v8::Global<v8::Value>; 2]> {
-        let runtime = &mut self.js_runtime;
+        let (runtime, websocket_v8_cache, websocket_string_cache) = (
+            &mut self.js_runtime,
+            &self.websocket_v8_cache,
+            &mut self.websocket_string_cache,
+        );
         deno_core::scope!(scope, runtime);
         let values = [
-            Self::websocket_event_to_v8(scope, event)?,
-            Self::websocket_context_to_v8(scope, ctx)?,
+            Self::websocket_event_to_v8(scope, websocket_v8_cache, event)?,
+            Self::websocket_context_to_v8_cached(
+                scope,
+                websocket_v8_cache,
+                websocket_string_cache,
+                ctx,
+            )?,
         ];
         Ok(values.map(|value| v8::Global::new(scope, value)))
     }
@@ -3952,6 +4284,8 @@ impl DenoWorkerRuntime {
         event: &WorkerWebSocketEvent,
         ctx: &WorkerWebSocketContext,
     ) -> Result<Vec<WorkerWebSocketCommand>, String> {
+        let clear_connection_id_cache_after_invoke =
+            matches!(event, WorkerWebSocketEvent::Close(_));
         let websocket_bridge = self
             .invoke_bridge
             .websocket
@@ -3987,6 +4321,9 @@ impl DenoWorkerRuntime {
                 .finish_invocation()?
         };
 
+        if clear_connection_id_cache_after_invoke {
+            self.clear_websocket_connection_id_cache(&ctx.connection_id);
+        }
         result.map_err(|error| error.to_string())?;
         Ok(commands)
     }
@@ -4386,6 +4723,121 @@ export const websocket = {
             error.contains("does not export websocket handlers"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_materialization_benchmarks_run() {
+        let worker_path = temp_worker_path(
+            "websocket-materialization-benchmark",
+            r#"
+export function fetch() {
+  return new Response("ok");
+}
+
+export const websocket = {
+  onOpen() {},
+};
+"#,
+        );
+        let mut runtime = DenoWorkerRuntime::new(&worker_path)
+            .await
+            .expect("worker runtime should bootstrap");
+        let ctx = WorkerWebSocketContext {
+            connection_id: "bench-conn".to_string(),
+            worker_id: "bench-worker".to_string(),
+            vars: [("region".to_string(), "hz".to_string())]
+                .into_iter()
+                .collect(),
+            metadata: [("stage".to_string(), "test".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let event_summary = runtime
+            .benchmark_websocket_event_materialization(&WorkerWebSocketEvent::Open, 10)
+            .expect("event materialization benchmark should succeed");
+        assert_eq!(event_summary.iterations, 10);
+        assert!(event_summary.elapsed_ms >= 0.0);
+
+        let ctx_summary = runtime
+            .benchmark_websocket_context_materialization(&ctx, 10)
+            .expect("context materialization benchmark should succeed");
+        assert_eq!(ctx_summary.iterations, 10);
+        assert!(ctx_summary.elapsed_ms >= 0.0);
+
+        let ctx_id_summary = runtime
+            .benchmark_websocket_context_id_materialization(&ctx, 10)
+            .expect("context id materialization benchmark should succeed");
+        assert_eq!(ctx_id_summary.iterations, 10);
+
+        let ctx_vars_summary = runtime
+            .benchmark_websocket_context_vars_materialization(&ctx, 10)
+            .expect("context vars materialization benchmark should succeed");
+        assert_eq!(ctx_vars_summary.iterations, 10);
+
+        let ctx_metadata_summary = runtime
+            .benchmark_websocket_context_metadata_materialization(&ctx, 10)
+            .expect("context metadata materialization benchmark should succeed");
+        assert_eq!(ctx_metadata_summary.iterations, 10);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_connection_id_string_cache_is_cleared_after_close() {
+        let worker_path = temp_worker_path(
+            "websocket-string-cache-clear",
+            r#"
+export function fetch() {
+  return new Response("ok");
+}
+
+export const websocket = {
+  onOpen() {},
+  onClose() {},
+};
+"#,
+        );
+        let mut runtime = DenoWorkerRuntime::new(&worker_path)
+            .await
+            .expect("worker runtime should bootstrap");
+        let ctx = WorkerWebSocketContext {
+            connection_id: "conn-7".to_string(),
+            worker_id: "ws-worker".to_string(),
+            vars: Default::default(),
+            metadata: Default::default(),
+        };
+
+        runtime
+            .invoke_websocket(&WorkerWebSocketEvent::Open, &ctx)
+            .await
+            .expect("websocket open should succeed");
+        assert!(runtime
+            .websocket_string_cache
+            .connection_ids
+            .contains_key("conn-7"));
+        assert!(runtime
+            .websocket_string_cache
+            .worker_ids
+            .contains_key("ws-worker"));
+
+        runtime
+            .invoke_websocket(
+                &WorkerWebSocketEvent::Close(WorkerWebSocketCloseEvent {
+                    code: Some(1000),
+                    reason: Some("done".to_string()),
+                    remote: false,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("websocket close should succeed");
+        assert!(!runtime
+            .websocket_string_cache
+            .connection_ids
+            .contains_key("conn-7"));
+        assert!(runtime
+            .websocket_string_cache
+            .worker_ids
+            .contains_key("ws-worker"));
     }
 
     #[tokio::test(flavor = "current_thread")]

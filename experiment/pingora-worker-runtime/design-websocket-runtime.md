@@ -11,6 +11,9 @@ Update: 2026-04-16
   - `websocket.onClose(event, ctx)`
 - `ctx.send(string)` and `ctx.close(code?, reason?)` now map to Rust-captured commands
 - Pingora ingress now has a first H1 websocket session path wired to that bridge
+- `/_hardess/ingress-state` now exposes first websocket timing breakdowns:
+  - average open callback runtime / open command write cost
+  - average per-message runtime / command write / total handling cost
 - current transport scope is intentionally narrow:
   - text messages only
   - ping/pong supported

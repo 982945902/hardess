@@ -509,8 +509,13 @@ struct IngressMetrics {
     websocket_peak_connections: AtomicU64,
     websocket_sessions_completed: AtomicU64,
     websocket_total_session_nanos: AtomicU64,
+    websocket_total_open_runtime_nanos: AtomicU64,
+    websocket_total_open_command_write_nanos: AtomicU64,
     websocket_messages_in: AtomicU64,
     websocket_messages_out: AtomicU64,
+    websocket_total_message_runtime_nanos: AtomicU64,
+    websocket_total_message_command_write_nanos: AtomicU64,
+    websocket_total_message_total_nanos: AtomicU64,
     websocket_ping_in: AtomicU64,
     websocket_pong_out: AtomicU64,
     websocket_close_in: AtomicU64,
@@ -536,8 +541,13 @@ impl IngressMetrics {
             websocket_peak_connections: AtomicU64::new(0),
             websocket_sessions_completed: AtomicU64::new(0),
             websocket_total_session_nanos: AtomicU64::new(0),
+            websocket_total_open_runtime_nanos: AtomicU64::new(0),
+            websocket_total_open_command_write_nanos: AtomicU64::new(0),
             websocket_messages_in: AtomicU64::new(0),
             websocket_messages_out: AtomicU64::new(0),
+            websocket_total_message_runtime_nanos: AtomicU64::new(0),
+            websocket_total_message_command_write_nanos: AtomicU64::new(0),
+            websocket_total_message_total_nanos: AtomicU64::new(0),
             websocket_ping_in: AtomicU64::new(0),
             websocket_pong_out: AtomicU64::new(0),
             websocket_close_in: AtomicU64::new(0),
@@ -631,6 +641,31 @@ impl IngressMetrics {
         self.websocket_messages_out.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_websocket_open_runtime(&self, elapsed: Duration) {
+        self.websocket_total_open_runtime_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_websocket_open_command_write(&self, elapsed: Duration) {
+        self.websocket_total_open_command_write_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_websocket_message_runtime(&self, elapsed: Duration) {
+        self.websocket_total_message_runtime_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_websocket_message_command_write(&self, elapsed: Duration) {
+        self.websocket_total_message_command_write_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_websocket_message_total(&self, elapsed: Duration) {
+        self.websocket_total_message_total_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     fn record_websocket_ping_in(&self) {
         self.websocket_ping_in.fetch_add(1, Ordering::Relaxed);
     }
@@ -666,6 +701,15 @@ impl IngressMetrics {
                 (total as f64 / requests as f64) / 1_000_000.0
             }
         };
+        let websocket_upgrade_accepted = self.websocket_upgrade_accepted.load(Ordering::Relaxed);
+        let websocket_messages_in = self.websocket_messages_in.load(Ordering::Relaxed);
+        let websocket_avg = |total: u64, count: u64| {
+            if count == 0 {
+                0.0
+            } else {
+                (total as f64 / count as f64) / 1_000_000.0
+            }
+        };
         IngressMetricsSnapshot {
             requests,
             average_request_read_ms: avg(self.total_request_read_nanos.load(Ordering::Relaxed)),
@@ -678,7 +722,7 @@ impl IngressMetrics {
             average_request_total_ms: avg(self.total_request_nanos.load(Ordering::Relaxed)),
             websocket: WebSocketIngressMetricsSnapshot {
                 upgrade_requests: self.websocket_upgrade_requests.load(Ordering::Relaxed),
-                upgrade_accepted: self.websocket_upgrade_accepted.load(Ordering::Relaxed),
+                upgrade_accepted: websocket_upgrade_accepted,
                 upgrade_rejected: self.websocket_upgrade_rejected.load(Ordering::Relaxed),
                 active_connections: self.websocket_active_connections.load(Ordering::Relaxed),
                 peak_connections: self.websocket_peak_connections.load(Ordering::Relaxed),
@@ -693,8 +737,33 @@ impl IngressMetrics {
                             / 1_000_000.0
                     }
                 },
-                messages_in: self.websocket_messages_in.load(Ordering::Relaxed),
+                average_open_runtime_ms: websocket_avg(
+                    self.websocket_total_open_runtime_nanos
+                        .load(Ordering::Relaxed),
+                    websocket_upgrade_accepted,
+                ),
+                average_open_command_write_ms: websocket_avg(
+                    self.websocket_total_open_command_write_nanos
+                        .load(Ordering::Relaxed),
+                    websocket_upgrade_accepted,
+                ),
+                messages_in: websocket_messages_in,
                 messages_out: self.websocket_messages_out.load(Ordering::Relaxed),
+                average_message_runtime_ms: websocket_avg(
+                    self.websocket_total_message_runtime_nanos
+                        .load(Ordering::Relaxed),
+                    websocket_messages_in,
+                ),
+                average_message_command_write_ms: websocket_avg(
+                    self.websocket_total_message_command_write_nanos
+                        .load(Ordering::Relaxed),
+                    websocket_messages_in,
+                ),
+                average_message_total_ms: websocket_avg(
+                    self.websocket_total_message_total_nanos
+                        .load(Ordering::Relaxed),
+                    websocket_messages_in,
+                ),
                 ping_in: self.websocket_ping_in.load(Ordering::Relaxed),
                 pong_out: self.websocket_pong_out.load(Ordering::Relaxed),
                 close_in: self.websocket_close_in.load(Ordering::Relaxed),
@@ -751,8 +820,13 @@ struct WebSocketIngressMetricsSnapshot {
     peak_connections: u64,
     sessions_completed: u64,
     average_session_ms: f64,
+    average_open_runtime_ms: f64,
+    average_open_command_write_ms: f64,
     messages_in: u64,
     messages_out: u64,
+    average_message_runtime_ms: f64,
+    average_message_command_write_ms: f64,
+    average_message_total_ms: f64,
     ping_in: u64,
     pong_out: u64,
     close_in: u64,
@@ -1559,6 +1633,7 @@ impl WorkerHttpApp {
 
         let connection_id = self.next_request_task_id();
         let ctx = self.build_websocket_context(&http_stream, connection_id);
+        let open_runtime_started_at = std::time::Instant::now();
         let (slot_index, open_commands) =
             match generation.runtime_pool.open_websocket(ctx.clone()).await {
                 Ok(result) => result,
@@ -1582,6 +1657,8 @@ impl WorkerHttpApp {
                     return None;
                 }
             };
+        self.ingress_metrics
+            .record_websocket_open_runtime(open_runtime_started_at.elapsed());
 
         if let Err(error) = self
             .write_websocket_handshake(&mut http_stream, &sec_websocket_key)
@@ -1592,10 +1669,14 @@ impl WorkerHttpApp {
         }
         let session_guard = self.ingress_metrics.start_websocket_session();
 
-        match self
+        let open_command_write_started_at = std::time::Instant::now();
+        let open_command_result = self
             .apply_websocket_commands(&mut http_stream, open_commands)
-            .await
-        {
+            .await;
+        self.ingress_metrics
+            .record_websocket_open_command_write(open_command_write_started_at.elapsed());
+
+        match open_command_result {
             Ok(Some(close_event)) => {
                 self.invoke_websocket_close_callback(&generation, slot_index, close_event, &ctx)
                     .await;
@@ -1636,15 +1717,19 @@ impl WorkerHttpApp {
                 match frame {
                     WebSocketFrame::Text(text) => {
                         self.ingress_metrics.record_websocket_message_in();
-                        let commands = match generation
+                        let message_started_at = std::time::Instant::now();
+                        let runtime_started_at = std::time::Instant::now();
+                        let commands_result = generation
                             .runtime_pool
                             .execute_websocket_on_slot(
                                 slot_index,
                                 WorkerWebSocketEvent::Message { text },
                                 ctx.clone(),
                             )
-                            .await
-                        {
+                            .await;
+                        self.ingress_metrics
+                            .record_websocket_message_runtime(runtime_started_at.elapsed());
+                        let commands = match commands_result {
                             Ok(commands) => commands,
                             Err(error) => {
                                 self.ingress_metrics.record_websocket_runtime_error();
@@ -1671,10 +1756,17 @@ impl WorkerHttpApp {
                             }
                         };
 
-                        match self
+                        let command_write_started_at = std::time::Instant::now();
+                        let command_result = self
                             .apply_websocket_commands(&mut http_stream, commands)
-                            .await
-                        {
+                            .await;
+                        self.ingress_metrics.record_websocket_message_command_write(
+                            command_write_started_at.elapsed(),
+                        );
+                        self.ingress_metrics
+                            .record_websocket_message_total(message_started_at.elapsed());
+
+                        match command_result {
                             Ok(Some(close_event)) => {
                                 self.invoke_websocket_close_callback(
                                     &generation,
@@ -3022,8 +3114,13 @@ export const websocket = {
         metrics.record_websocket_upgrade_rejected();
         {
             let session = metrics.start_websocket_session();
+            metrics.record_websocket_open_runtime(Duration::from_millis(2));
+            metrics.record_websocket_open_command_write(Duration::from_millis(1));
             metrics.record_websocket_message_in();
             metrics.record_websocket_message_out();
+            metrics.record_websocket_message_runtime(Duration::from_millis(3));
+            metrics.record_websocket_message_command_write(Duration::from_millis(4));
+            metrics.record_websocket_message_total(Duration::from_millis(7));
             metrics.record_websocket_ping_in();
             metrics.record_websocket_pong_out();
             metrics.record_websocket_close_in();
@@ -3040,8 +3137,13 @@ export const websocket = {
         assert_eq!(snapshot.websocket.active_connections, 0);
         assert_eq!(snapshot.websocket.peak_connections, 1);
         assert_eq!(snapshot.websocket.sessions_completed, 1);
+        assert_eq!(snapshot.websocket.average_open_runtime_ms, 2.0);
+        assert_eq!(snapshot.websocket.average_open_command_write_ms, 1.0);
         assert_eq!(snapshot.websocket.messages_in, 1);
         assert_eq!(snapshot.websocket.messages_out, 1);
+        assert_eq!(snapshot.websocket.average_message_runtime_ms, 3.0);
+        assert_eq!(snapshot.websocket.average_message_command_write_ms, 4.0);
+        assert_eq!(snapshot.websocket.average_message_total_ms, 7.0);
         assert_eq!(snapshot.websocket.ping_in, 1);
         assert_eq!(snapshot.websocket.pong_out, 1);
         assert_eq!(snapshot.websocket.close_in, 1);

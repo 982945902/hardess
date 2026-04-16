@@ -127,7 +127,9 @@ This repository now contains a real minimal prototype:
 - `/_hardess/ingress-state` now includes websocket ingress counters:
   - upgrade requests / accepted / rejected
   - active / peak / completed sessions
+  - average open callback runtime / open command write cost
   - inbound / outbound message counts
+  - average per-message runtime / command write / total handling cost
   - ping/pong counts
   - close counts
   - protocol/runtime error counts
@@ -138,6 +140,8 @@ This repository now contains a real minimal prototype:
     - `bench/bun_native_websocket.ts`
   - shared round-trip client:
     - `bench/ws_roundtrip.ts`
+  - runtime-only websocket micro-benchmark:
+    - `crates/gateway-host/examples/websocket_runtime_micro.rs`
 
 The current prototype now uses a mixed bridge:
 

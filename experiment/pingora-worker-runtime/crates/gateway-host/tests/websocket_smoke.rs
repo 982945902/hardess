@@ -116,7 +116,10 @@ fn masked_client_text_frame(text: &str) -> Vec<u8> {
 #[derive(Debug, PartialEq, Eq)]
 enum ServerFrame {
     Text(String),
-    Close { code: Option<u16>, reason: Option<String> },
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
 }
 
 fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
@@ -152,7 +155,10 @@ fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
             let (code, reason) = if payload.len() >= 2 {
                 let code = Some(u16::from_be_bytes([payload[0], payload[1]]));
                 let reason = if payload.len() > 2 {
-                    Some(String::from_utf8(payload[2..].to_vec()).expect("close reason should be utf-8"))
+                    Some(
+                        String::from_utf8(payload[2..].to_vec())
+                            .expect("close reason should be utf-8"),
+                    )
                 } else {
                     None
                 };
@@ -168,9 +174,8 @@ fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
 
 fn http_get_json(port: u16, path: &str) -> Value {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("should connect for http get");
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .expect("should write http get");
@@ -212,7 +217,8 @@ export const websocket = {
     let mut child = start_pingora_ingress(&worker_path, port);
     wait_for_ready(port);
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("should connect to websocket port");
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).expect("should connect to websocket port");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("should set read timeout");
@@ -240,7 +246,10 @@ export const websocket = {
         "unexpected handshake headers: {response_headers}"
     );
 
-    assert_eq!(read_server_frame(&mut stream), ServerFrame::Text("opened".to_string()));
+    assert_eq!(
+        read_server_frame(&mut stream),
+        ServerFrame::Text("opened".to_string())
+    );
 
     stream
         .write_all(&masked_client_text_frame("ping"))
@@ -300,6 +309,26 @@ export const websocket = {
             .and_then(Value::as_u64),
         Some(1)
     );
+    assert!(ingress_state
+        .pointer("/ingress_metrics/websocket/average_open_runtime_ms")
+        .and_then(Value::as_f64)
+        .is_some());
+    assert!(ingress_state
+        .pointer("/ingress_metrics/websocket/average_open_command_write_ms")
+        .and_then(Value::as_f64)
+        .is_some());
+    assert!(ingress_state
+        .pointer("/ingress_metrics/websocket/average_message_runtime_ms")
+        .and_then(Value::as_f64)
+        .is_some());
+    assert!(ingress_state
+        .pointer("/ingress_metrics/websocket/average_message_command_write_ms")
+        .and_then(Value::as_f64)
+        .is_some());
+    assert!(ingress_state
+        .pointer("/ingress_metrics/websocket/average_message_total_ms")
+        .and_then(Value::as_f64)
+        .is_some());
 
     stop_child(&mut child);
 }
