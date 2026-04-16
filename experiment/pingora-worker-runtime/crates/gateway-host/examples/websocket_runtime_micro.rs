@@ -32,6 +32,7 @@ struct BenchmarkSummary {
     context_materialization: ContextMaterializationSummary,
     open: EventSummary,
     message: EventSummary,
+    message_with_send: EventSummary,
     close: EventSummary,
 }
 
@@ -184,9 +185,26 @@ export const websocket = {
 };
 "#,
     );
-    let mut runtime = DenoWorkerRuntime::new(&worker_path).await?;
+    let worker_with_send_path = temp_worker_path(
+        "websocket-runtime-micro-send",
+        r#"
+export function fetch() {
+  return new Response("ok");
+}
+
+export const websocket = {
+  onMessage(message, ctx) {
+    if (message.kind !== "text") {
+      throw new Error("unexpected message kind");
+    }
+    ctx.send(message.text);
+  },
+};
+"#,
+    );
     let ctx = sample_context();
 
+    let mut runtime = DenoWorkerRuntime::new(&worker_path).await?;
     warmup(&mut runtime, &ctx, config.warmup_iterations).await?;
 
     let event_materialization = EventMaterializationSummary {
@@ -249,6 +267,19 @@ export const websocket = {
         config.measured_iterations,
     )
     .await?;
+    drop(runtime);
+
+    let mut runtime_with_send = DenoWorkerRuntime::new(&worker_with_send_path).await?;
+    warmup(&mut runtime_with_send, &ctx, config.warmup_iterations).await?;
+    let message_with_send = measure_event(
+        &mut runtime_with_send,
+        WorkerWebSocketEvent::Message {
+            text: "ping".to_string(),
+        },
+        &ctx,
+        config.measured_iterations,
+    )
+    .await?;
 
     println!(
         "{}",
@@ -259,6 +290,7 @@ export const websocket = {
             context_materialization,
             open,
             message,
+            message_with_send,
             close,
         })?
     );

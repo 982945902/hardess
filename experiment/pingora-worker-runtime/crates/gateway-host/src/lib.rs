@@ -117,10 +117,19 @@ struct WebSocketOpState {
     active_invocation: Option<ActiveWebSocketInvocation>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ActiveWebSocketInvocation {
     commands: Vec<WorkerWebSocketCommand>,
     close_requested: bool,
+}
+
+impl Default for ActiveWebSocketInvocation {
+    fn default() -> Self {
+        Self {
+            commands: Vec::with_capacity(1),
+            close_requested: false,
+        }
+    }
 }
 
 impl WebSocketOpState {

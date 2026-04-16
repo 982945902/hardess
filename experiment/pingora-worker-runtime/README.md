@@ -2,6 +2,12 @@
 
 Status: exploratory, runnable
 
+Current checkpoint:
+
+- direction validated for this experiment stage
+- active local performance optimization is no longer the default task
+- next work should bias toward feature completeness and control-plane integration
+
 Current fixed direction:
 
 - one worker entry contract: `fetch(request, env, ctx)`
@@ -25,6 +31,7 @@ Related docs:
 - [Worker generation rollout design note](./design-worker-generation-rollout.md)
 - [Breadth-first TODO note](./TODO-breadth-first.md)
 - [WebSocket runtime design note](./design-websocket-runtime.md)
+- [Stage summary](./stage-summary-2026-04.md)
 
 ## Question
 

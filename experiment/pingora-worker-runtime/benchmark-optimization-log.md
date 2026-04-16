@@ -68,6 +68,8 @@ Harness:
 - worker shape:
   - `onOpen(ctx)` touches `connectionId / workerId / metadata / vars`
   - `onMessage(message, ctx)` validates `message.kind === "text"` and touches `message.text`
+  - additional send-path worker:
+    - `onMessage(message, ctx)` validates `message.kind === "text"` then calls `ctx.send(message.text)`
   - `onClose(event, ctx)` touches `code / reason / remote`
   - no `ctx.send(...)`
   - no `ctx.close(...)`
@@ -377,6 +379,145 @@ Interpretation:
     - but the local end-to-end client benchmark did not improve on this machine in the same session
     - because the micro result and the runtime-side timings disagree with the client-side throughput sample, this experiment should currently be treated as `inconclusive` rather than promoted as a confirmed end-to-end win
     - keep the code in the working tree for now, but do not record it as a kept production optimization until it is rerun under a cleaner A/B environment
+
+- isolated A/B rerun on 2026-04-16:
+  - setup:
+    - create two isolated copies from the same working tree
+    - `baseline`: revert only this fixed V8 key/value string cache change, keep WebSocket Round 2 state
+    - `current`: keep this change
+    - build both with `release`
+    - run both with the same envelope:
+      - fresh server
+      - warmup `1`
+      - measured `3`
+      - `50` connections
+      - `200` messages per connection
+      - `runtime_threads=1`
+      - `queue_capacity=64`
+  - micro A/B:
+    - baseline:
+      - `ctx total`: `1.497 us/op`
+      - `ctx ids`: `0.463 us/op`
+      - `message invoke`: `3.656 us/op`
+      - `close invoke`: `3.877 us/op`
+    - current:
+      - `ctx total`: `1.298 us/op`
+      - `ctx ids`: `0.260 us/op`
+      - `message invoke`: `3.062 us/op`
+      - `close invoke`: `3.358 us/op`
+  - end-to-end A/B:
+    - baseline measured runs:
+      - run1: `55,545 msg/s`, `p50 0.800 ms`, `p90 1.361 ms`, `p99 2.541 ms`
+      - run2: `57,905 msg/s`, `p50 0.777 ms`, `p90 1.272 ms`, `p99 1.970 ms`
+      - run3: `55,116 msg/s`, `p50 0.802 ms`, `p90 1.252 ms`, `p99 1.839 ms`
+    - current measured runs:
+      - run1: `55,997 msg/s`, `p50 0.813 ms`, `p90 1.128 ms`, `p99 2.329 ms`
+      - run2: `56,529 msg/s`, `p50 0.819 ms`, `p90 1.150 ms`, `p99 1.621 ms`
+      - run3: `56,831 msg/s`, `p50 0.813 ms`, `p90 1.206 ms`, `p99 1.546 ms`
+    - measured average:
+      - baseline:
+        - Msg/s: `56,189`
+        - p50: `0.793 ms`
+        - p90: `1.295 ms`
+        - p99: `2.116 ms`
+      - current:
+        - Msg/s: `56,452`
+        - p50: `0.815 ms`
+        - p90: `1.161 ms`
+        - p99: `1.832 ms`
+    - delta current vs baseline:
+      - throughput: `+0.5%`
+      - p50: `+2.8%`
+      - p90: `-10.3%`
+      - p99: `-13.4%`
+  - runtime-side timing A/B from `/_hardess/ingress-state`:
+    - baseline:
+      - `average_message_runtime_ms`: `0.279`
+      - `average_message_total_ms`: `0.286`
+      - `average_queue_wait_ms`: `0.098`
+      - `average_invoke_ms`: `0.00885`
+    - current:
+      - `average_message_runtime_ms`: `0.254`
+      - `average_message_total_ms`: `0.261`
+      - `average_queue_wait_ms`: `0.054`
+      - `average_invoke_ms`: `0.00768`
+    - delta current vs baseline:
+      - message runtime: `-8.8%`
+      - message total: `-8.6%`
+      - queue wait: `-44.6%`
+      - invoke: `-13.2%`
+  - final conclusion:
+    - this optimization is now confirmed as a real keep
+    - the win is still small on headline throughput
+    - the more meaningful gain is lower runtime cost plus better `p90/p99`
+    - `p50` moved slightly worse in this sample, but the tail improvement and host-side timing win are strong enough to keep the change
+
+### WebSocket Experiment D
+
+- code change:
+  - try moving websocket `ctx.send` and `ctx.close` function attachment from JS-side
+    `decorateWebSocketContext(...)` into Rust-side websocket context materialization
+  - idea:
+    - cache function handles once at bootstrap
+    - set `send/close` directly on the V8 context object from Rust
+    - remove one JS wrapper step per websocket invocation
+- release runtime micro-benchmark result:
+  - previous kept baseline before this experiment:
+    - `ctx total`: `0.874 us/op`
+    - `open`: `2.279 us/op`
+    - `message`: `2.408 us/op`
+    - `close`: `2.780 us/op`
+  - experiment sample:
+    - `ctx total`: `1.077 us/op`
+    - `open`: `2.470 us/op`
+    - `message`: `2.638 us/op`
+    - `close`: `2.876 us/op`
+  - delta vs previous kept baseline:
+    - `ctx total`: `+23.3%`
+    - `open`: `+8.4%`
+    - `message`: `+9.5%`
+    - `close`: `+3.5%`
+- end-to-end spot check:
+  - one local sample:
+    - `54,358 msg/s`, `p50 0.861 ms`, `p90 1.198 ms`, `p99 1.810 ms`
+  - this spot check was not enough to overturn the micro-benchmark regression
+- conclusion:
+  - this experiment is not kept
+  - pushing `send/close` attachment into Rust increased websocket context materialization cost enough to outweigh the removed JS decoration step
+  - for this path, fewer JS wrapper lines did not translate into a faster runtime hot path
+
+### WebSocket Experiment E
+
+- code change:
+  - keep websocket command capture shape unchanged
+  - preallocate one command slot for each websocket invocation:
+    - `ActiveWebSocketInvocation.commands = Vec::with_capacity(1)`
+  - rationale:
+    - the common benchmark path is one `message` producing one `ctx.send(...)`
+    - avoid the first dynamic `Vec` growth on the hot path
+- release runtime micro-benchmark result:
+  - previous local sample before this change:
+    - `message`: `2.499 us/op`
+    - `message_with_send`: `2.773 us/op`
+    - `ctx total`: `0.919 us/op`
+  - sample after this change:
+    - `message`: `2.502 us/op`
+    - `message_with_send`: `2.604 us/op`
+    - `ctx total`: `0.915 us/op`
+  - delta:
+    - `message`: `+0.1%`
+    - `message_with_send`: `-6.1%`
+    - `ctx total`: `-0.4%`
+- interpretation:
+  - this is the first micro result that isolates `ctx.send(...)` overhead directly
+  - the improvement is concentrated exactly where expected:
+    - the plain `message` path is flat
+    - the `message_with_send` path improves materially
+  - this suggests the command-capture allocation was a real cost
+- current status:
+  - keep this code change in the working tree
+  - end-to-end websocket reruns on the local machine were too noisy in this session to record as a stable A/B result
+  - next action should be a clean serial A/B rerun focused on this change alone
 
 ## Benchmark rule
 
@@ -690,6 +831,77 @@ The point of this file is trend visibility, not best-effort storytelling.
   - reverted
 
 This attempt is intentionally not counted as a valid optimization round.
+
+## WebSocket Current Checkpoint
+
+Date:
+
+- `2026-04-16`
+
+Purpose:
+
+- record the latest clean websocket comparison before stopping active local optimization
+
+Benchmark shape:
+
+- same host machine
+- `release` only
+- warmup `1`
+- measured `3`
+- `50` connections
+- `200` messages per connection
+- shared round-trip client
+- serial runs only
+
+Measured commands:
+
+- `pingora-v2-ws`
+  - `./experiment/pingora-worker-runtime/target/release/pingora_ingress experiment/pingora-worker-runtime/workers/benchmark_websocket/mod.ts --listen 127.0.0.1:6393 --worker-id ws-bench --runtime-threads 1 --queue-capacity 64 --exec-timeout-ms 5000`
+  - `WS_BENCH_URL=ws://127.0.0.1:6393/ws WS_BENCH_CONNECTIONS=50 WS_BENCH_MESSAGES_PER_CONNECTION=200 bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+- `bun-native-ws`
+  - `BUN_NATIVE_WS_PORT=6394 bun run experiment/pingora-worker-runtime/bench/bun_native_websocket.ts`
+  - `WS_BENCH_URL=ws://127.0.0.1:6394 WS_BENCH_CONNECTIONS=50 WS_BENCH_MESSAGES_PER_CONNECTION=200 bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+
+Average of 3 measured runs:
+
+| Case | Msg/s | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| `pingora-v2-ws` | `55,432` | `0.840 ms` | `1.200 ms` | `1.736 ms` |
+| `bun-native-ws` | `71,477` | `0.616 ms` | `1.115 ms` | `1.692 ms` |
+
+Raw measured runs:
+
+- `pingora-v2-ws`
+  - run1: `55,318 msg/s`, `p50 0.804 ms`, `p90 1.211 ms`, `p99 1.735 ms`
+  - run2: `56,634 msg/s`, `p50 0.852 ms`, `p90 1.156 ms`, `p99 1.665 ms`
+  - run3: `54,345 msg/s`, `p50 0.866 ms`, `p90 1.232 ms`, `p99 1.807 ms`
+- `bun-native-ws`
+  - run1: `71,448 msg/s`, `p50 0.609 ms`, `p90 1.152 ms`, `p99 1.640 ms`
+  - run2: `73,873 msg/s`, `p50 0.597 ms`, `p90 1.065 ms`, `p99 1.594 ms`
+  - run3: `69,110 msg/s`, `p50 0.641 ms`, `p90 1.127 ms`, `p99 1.843 ms`
+
+Gap summary:
+
+- `pingora-v2-ws / bun-native-ws`
+  - throughput: `0.776x`
+  - p50: `1.365x`
+  - p90: `1.076x`
+  - p99: `1.026x`
+
+Supporting `pingora-v2-ws` ingress snapshot:
+
+- `runtime_pool.overloaded`: `0`
+- `average_open_runtime_ms`: `0.162`
+- `average_message_runtime_ms`: `0.294`
+- `average_message_command_write_ms`: `0.007`
+- `average_message_total_ms`: `0.301`
+
+Conclusion:
+
+- this is a respectable checkpoint for the current experiment scope
+- the main remaining gap versus Bun is headline throughput and `p50`
+- `p90` and `p99` are already close enough that further local optimization is no longer the default priority
+- after this checkpoint, the experiment should favor feature completeness and control-plane/runtime integration over more benchmark chasing
 
 ## Post deadlock-fix sanity rerun
 
