@@ -80,6 +80,7 @@ The following are now fixed for this experiment track:
 - the TS handler shape is `fetch(request, env, ctx)`
 - the runtime exposes a Web-style request surface to TS
 - `v1` compatibility is out of scope and removed from this workspace
+- the HTTP runtime pool now uses one completion strategy: `async`
 - Pingora request handling is normalized into the host ABI and then exposed to TS through a Rust-backed Web `Request` facade
 
 The main open runtime choice that remains is implementation depth, not external contract shape.
@@ -113,6 +114,30 @@ This repository now contains a real minimal prototype:
 - direct `jsr:` specifiers are rewritten to `https://jsr.io/...`
 - direct `npm:` specifiers are rewritten to `https://esm.sh/...` for the experiment
 - the host returns a Rust `WorkerResponse`
+- worker modules can now optionally export `websocket = { onOpen, onMessage, onClose }`
+- the runtime now captures `ctx.send(string)` / `ctx.close(code?, reason?)` as Rust-owned websocket commands
+- Pingora ingress now supports a first websocket path on HTTP/1.1
+- current websocket scope is intentionally narrow:
+  - text frames only
+  - ping/pong supported
+  - close supported
+  - no binary frames
+  - no fragmented frames
+  - no direct socket ownership in TS
+- `/_hardess/ingress-state` now includes websocket ingress counters:
+  - upgrade requests / accepted / rejected
+  - active / peak / completed sessions
+  - inbound / outbound message counts
+  - ping/pong counts
+  - close counts
+  - protocol/runtime error counts
+- websocket experiment benchmark scaffold now exists:
+  - Pingora worker echo target:
+    - `workers/benchmark_websocket/mod.ts`
+  - Bun native echo baseline:
+    - `bench/bun_native_websocket.ts`
+  - shared round-trip client:
+    - `bench/ws_roundtrip.ts`
 
 The current prototype now uses a mixed bridge:
 
@@ -195,15 +220,8 @@ cargo run -p gateway-host --bin pingora_ingress -- \
   --runtime-threads 2 \
   --queue-capacity 64 \
   --exec-timeout-ms 5000 \
-  --completion-mode auto \
   --shutdown-drain-timeout-ms 30000
 ```
-
-`--completion-mode` currently supports:
-
-- `auto`
-- `async`
-- `blocking`
 
 Optional Pingora listener/socket tuning flags:
 

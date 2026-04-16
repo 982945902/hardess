@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use gateway_host::bad_request_public_error;
 use gateway_host::inspect_worker_project;
 use gateway_host::internal_public_error;
@@ -25,11 +27,14 @@ use gateway_host::IngressRequestBody;
 use gateway_host::PublicError;
 use gateway_host::RequestBodyCompletionPolicy;
 use gateway_host::RequestDrainController;
-use gateway_host::RuntimeCompletionMode;
 use gateway_host::RuntimePoolError;
 use gateway_host::RuntimePoolSnapshot;
 use gateway_host::WorkerProjectSnapshot;
 use gateway_host::WorkerRuntimePool;
+use gateway_host::WorkerWebSocketCloseEvent;
+use gateway_host::WorkerWebSocketCommand;
+use gateway_host::WorkerWebSocketContext;
+use gateway_host::WorkerWebSocketEvent;
 use gateway_host::HARDESS_CLIENT_ADDR_METADATA_KEY;
 use gateway_host::HARDESS_HTTP_VERSION_METADATA_KEY;
 use gateway_host::HARDESS_REQUEST_BODY_MODE_METADATA_KEY;
@@ -42,6 +47,7 @@ use pingora::apps::HttpServerApp;
 use pingora::apps::ReusedHttpStream;
 use pingora::http::ResponseHeader;
 use pingora::listeners::TcpSocketOptions;
+use pingora::protocols::http::HttpTask;
 use pingora::protocols::http::ServerSession;
 use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt as PingoraOpt;
@@ -55,6 +61,8 @@ use pingora::server::ShutdownSignalWatch;
 use pingora::services::listening::Service;
 use serde::Deserialize;
 use serde::Serialize;
+use sha1::Digest;
+use sha1::Sha1;
 #[cfg(unix)]
 use tokio::signal::unix;
 use worker_abi::WorkerContext;
@@ -67,7 +75,6 @@ struct PingoraCliArgs {
     runtime_threads: usize,
     queue_capacity: usize,
     exec_timeout_ms: u64,
-    completion_mode: RuntimeCompletionMode,
     tcp_fastopen_backlog: Option<usize>,
     tcp_keepalive_idle_secs: Option<u64>,
     tcp_keepalive_interval_secs: Option<u64>,
@@ -93,7 +100,6 @@ impl PingoraCliArgs {
             runtime_threads: 1,
             queue_capacity: 64,
             exec_timeout_ms: 5_000,
-            completion_mode: RuntimeCompletionMode::Auto,
             tcp_fastopen_backlog: None,
             tcp_keepalive_idle_secs: None,
             tcp_keepalive_interval_secs: None,
@@ -133,17 +139,6 @@ impl PingoraCliArgs {
                         .context("--exec-timeout-ms requires a value")?
                         .parse()
                         .context("--exec-timeout-ms must be an integer")?;
-                }
-                "--completion-mode" => {
-                    let value = args.next().context("--completion-mode requires a value")?;
-                    parsed.completion_mode = match value.as_str() {
-                        "auto" => RuntimeCompletionMode::Auto,
-                        "async" => RuntimeCompletionMode::Async,
-                        "blocking" => RuntimeCompletionMode::Blocking,
-                        _ => {
-                            anyhow::bail!("--completion-mode must be one of: auto, async, blocking")
-                        }
-                    };
                 }
                 "--shutdown-drain-timeout-ms" => {
                     parsed.shutdown_drain_timeout_ms = args
@@ -507,6 +502,21 @@ struct IngressMetrics {
     total_response_write_nanos: AtomicU64,
     total_finish_nanos: AtomicU64,
     total_request_nanos: AtomicU64,
+    websocket_upgrade_requests: AtomicU64,
+    websocket_upgrade_accepted: AtomicU64,
+    websocket_upgrade_rejected: AtomicU64,
+    websocket_active_connections: AtomicU64,
+    websocket_peak_connections: AtomicU64,
+    websocket_sessions_completed: AtomicU64,
+    websocket_total_session_nanos: AtomicU64,
+    websocket_messages_in: AtomicU64,
+    websocket_messages_out: AtomicU64,
+    websocket_ping_in: AtomicU64,
+    websocket_pong_out: AtomicU64,
+    websocket_close_in: AtomicU64,
+    websocket_close_out: AtomicU64,
+    websocket_protocol_errors: AtomicU64,
+    websocket_runtime_errors: AtomicU64,
 }
 
 impl IngressMetrics {
@@ -519,6 +529,21 @@ impl IngressMetrics {
             total_response_write_nanos: AtomicU64::new(0),
             total_finish_nanos: AtomicU64::new(0),
             total_request_nanos: AtomicU64::new(0),
+            websocket_upgrade_requests: AtomicU64::new(0),
+            websocket_upgrade_accepted: AtomicU64::new(0),
+            websocket_upgrade_rejected: AtomicU64::new(0),
+            websocket_active_connections: AtomicU64::new(0),
+            websocket_peak_connections: AtomicU64::new(0),
+            websocket_sessions_completed: AtomicU64::new(0),
+            websocket_total_session_nanos: AtomicU64::new(0),
+            websocket_messages_in: AtomicU64::new(0),
+            websocket_messages_out: AtomicU64::new(0),
+            websocket_ping_in: AtomicU64::new(0),
+            websocket_pong_out: AtomicU64::new(0),
+            websocket_close_in: AtomicU64::new(0),
+            websocket_close_out: AtomicU64::new(0),
+            websocket_protocol_errors: AtomicU64::new(0),
+            websocket_runtime_errors: AtomicU64::new(0),
         }
     }
 
@@ -553,6 +578,85 @@ impl IngressMetrics {
             .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
 
+    fn record_websocket_upgrade_request(&self) {
+        self.websocket_upgrade_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_upgrade_rejected(&self) {
+        self.websocket_upgrade_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn start_websocket_session(&self) -> WebSocketSessionGuard<'_> {
+        self.websocket_upgrade_accepted
+            .fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .websocket_active_connections
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let mut peak = self.websocket_peak_connections.load(Ordering::Relaxed);
+        while active > peak {
+            match self.websocket_peak_connections.compare_exchange(
+                peak,
+                active,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+        WebSocketSessionGuard {
+            metrics: self,
+            started_at: std::time::Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn finish_websocket_session(&self, elapsed: Duration) {
+        self.websocket_active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        self.websocket_sessions_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.websocket_total_session_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_websocket_message_in(&self) {
+        self.websocket_messages_in.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_message_out(&self) {
+        self.websocket_messages_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_ping_in(&self) {
+        self.websocket_ping_in.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_pong_out(&self) {
+        self.websocket_pong_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_close_in(&self) {
+        self.websocket_close_in.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_close_out(&self) {
+        self.websocket_close_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_protocol_error(&self) {
+        self.websocket_protocol_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_websocket_runtime_error(&self) {
+        self.websocket_runtime_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> IngressMetricsSnapshot {
         let requests = self.requests.load(Ordering::Relaxed);
         let avg = |total: u64| {
@@ -572,6 +676,56 @@ impl IngressMetrics {
             average_response_write_ms: avg(self.total_response_write_nanos.load(Ordering::Relaxed)),
             average_finish_ms: avg(self.total_finish_nanos.load(Ordering::Relaxed)),
             average_request_total_ms: avg(self.total_request_nanos.load(Ordering::Relaxed)),
+            websocket: WebSocketIngressMetricsSnapshot {
+                upgrade_requests: self.websocket_upgrade_requests.load(Ordering::Relaxed),
+                upgrade_accepted: self.websocket_upgrade_accepted.load(Ordering::Relaxed),
+                upgrade_rejected: self.websocket_upgrade_rejected.load(Ordering::Relaxed),
+                active_connections: self.websocket_active_connections.load(Ordering::Relaxed),
+                peak_connections: self.websocket_peak_connections.load(Ordering::Relaxed),
+                sessions_completed: self.websocket_sessions_completed.load(Ordering::Relaxed),
+                average_session_ms: {
+                    let sessions = self.websocket_sessions_completed.load(Ordering::Relaxed);
+                    if sessions == 0 {
+                        0.0
+                    } else {
+                        (self.websocket_total_session_nanos.load(Ordering::Relaxed) as f64
+                            / sessions as f64)
+                            / 1_000_000.0
+                    }
+                },
+                messages_in: self.websocket_messages_in.load(Ordering::Relaxed),
+                messages_out: self.websocket_messages_out.load(Ordering::Relaxed),
+                ping_in: self.websocket_ping_in.load(Ordering::Relaxed),
+                pong_out: self.websocket_pong_out.load(Ordering::Relaxed),
+                close_in: self.websocket_close_in.load(Ordering::Relaxed),
+                close_out: self.websocket_close_out.load(Ordering::Relaxed),
+                protocol_errors: self.websocket_protocol_errors.load(Ordering::Relaxed),
+                runtime_errors: self.websocket_runtime_errors.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+struct WebSocketSessionGuard<'a> {
+    metrics: &'a IngressMetrics,
+    started_at: std::time::Instant,
+    completed: bool,
+}
+
+impl WebSocketSessionGuard<'_> {
+    fn finish(mut self) {
+        self.metrics
+            .finish_websocket_session(self.started_at.elapsed());
+        self.completed = true;
+    }
+}
+
+impl Drop for WebSocketSessionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.metrics
+                .finish_websocket_session(self.started_at.elapsed());
+            self.completed = true;
         }
     }
 }
@@ -585,6 +739,26 @@ struct IngressMetricsSnapshot {
     average_response_write_ms: f64,
     average_finish_ms: f64,
     average_request_total_ms: f64,
+    websocket: WebSocketIngressMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebSocketIngressMetricsSnapshot {
+    upgrade_requests: u64,
+    upgrade_accepted: u64,
+    upgrade_rejected: u64,
+    active_connections: u64,
+    peak_connections: u64,
+    sessions_completed: u64,
+    average_session_ms: f64,
+    messages_in: u64,
+    messages_out: u64,
+    ping_in: u64,
+    pong_out: u64,
+    close_in: u64,
+    close_out: u64,
+    protocol_errors: u64,
+    runtime_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -691,7 +865,6 @@ struct RuntimeGenerationManagerConfig {
     runtime_threads: usize,
     queue_capacity: usize,
     exec_timeout: Duration,
-    completion_mode: RuntimeCompletionMode,
     generation_drain_timeout: Duration,
 }
 
@@ -1112,7 +1285,6 @@ impl RuntimeGenerationManager {
                 config.runtime_threads,
                 config.queue_capacity,
                 config.exec_timeout,
-                config.completion_mode,
             )?,
             drain_controller: Arc::new(RequestDrainController::new()),
         })
@@ -1210,6 +1382,384 @@ impl WorkerHttpApp {
                 .body(body)
                 .expect("generations response should build"),
             Err(error) => self.public_error_http_response(internal_public_error(error.to_string())),
+        }
+    }
+
+    fn websocket_rejection_gateway_response(
+        &self,
+        status: StatusCode,
+        message: impl Into<String>,
+    ) -> GatewayResponse {
+        let mut response = self.fallback_error_response(status, message.into());
+        response.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+        self.gateway_response_from_http_response(response)
+    }
+
+    fn build_websocket_context(
+        &self,
+        http_stream: &ServerSession,
+        connection_id: u64,
+    ) -> WorkerWebSocketContext {
+        let mut metadata = BTreeMap::new();
+        if let Some(client_addr) = http_stream.client_addr().map(|addr| addr.to_string()) {
+            metadata.insert(HARDESS_CLIENT_ADDR_METADATA_KEY.to_string(), client_addr);
+        }
+        metadata.insert(
+            HARDESS_HTTP_VERSION_METADATA_KEY.to_string(),
+            http_version_label(http_stream.req_header().version).to_string(),
+        );
+        metadata.insert(
+            WEBSOCKET_METADATA_URI_KEY.to_string(),
+            http_stream.req_header().uri.to_string(),
+        );
+
+        WorkerWebSocketContext {
+            connection_id: format!("ws-{connection_id}"),
+            worker_id: self.worker_id.clone(),
+            vars: BTreeMap::new(),
+            metadata,
+        }
+    }
+
+    async fn write_websocket_handshake(
+        &self,
+        http_stream: &mut ServerSession,
+        sec_websocket_key: &str,
+    ) -> Result<(), String> {
+        let mut response_header =
+            ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS.as_u16(), Some(3))
+                .map_err(|error| error.to_string())?;
+        response_header
+            .insert_header(http::header::UPGRADE.as_str(), "websocket")
+            .map_err(|error| error.to_string())?;
+        response_header
+            .insert_header(http::header::CONNECTION.as_str(), "Upgrade")
+            .map_err(|error| error.to_string())?;
+        response_header
+            .insert_header(
+                "sec-websocket-accept",
+                websocket_accept_value(sec_websocket_key),
+            )
+            .map_err(|error| error.to_string())?;
+        http_stream.set_keepalive(None);
+        http_stream
+            .write_response_header(Box::new(response_header))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn invoke_websocket_close_callback(
+        &self,
+        generation: &Arc<RuntimeGeneration>,
+        slot_index: usize,
+        close_event: WorkerWebSocketCloseEvent,
+        ctx: &WorkerWebSocketContext,
+    ) {
+        if let Err(error) = generation
+            .runtime_pool
+            .execute_websocket_on_slot(
+                slot_index,
+                WorkerWebSocketEvent::Close(close_event),
+                ctx.clone(),
+            )
+            .await
+        {
+            eprintln!("websocket onClose callback failed: {}", error.message());
+        }
+    }
+
+    async fn apply_websocket_commands(
+        &self,
+        http_stream: &mut ServerSession,
+        commands: Vec<WorkerWebSocketCommand>,
+    ) -> Result<Option<WorkerWebSocketCloseEvent>, String> {
+        for command in commands {
+            match command {
+                WorkerWebSocketCommand::SendText(text) => {
+                    self.ingress_metrics.record_websocket_message_out();
+                    send_websocket_text_frame(http_stream, &text).await?;
+                }
+                WorkerWebSocketCommand::Close { code, reason } => {
+                    self.ingress_metrics.record_websocket_close_out();
+                    send_websocket_close_frame(http_stream, code, reason.as_deref()).await?;
+                    return Ok(Some(websocket_close_event(code, reason, false)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn process_websocket_session(
+        self: &Arc<Self>,
+        mut http_stream: ServerSession,
+        shutdown: &pingora::server::ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
+        self.ingress_metrics.record_websocket_upgrade_request();
+        if !websocket_sec_version_is_supported(&http_stream) {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let response = self.websocket_rejection_gateway_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "unsupported websocket version; expected Sec-WebSocket-Version: 13",
+            );
+            let _ = self
+                .write_gateway_response(&mut http_stream, response)
+                .await;
+            return None;
+        }
+        let Some(sec_websocket_key) = websocket_sec_key(&http_stream) else {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let response = self.websocket_rejection_gateway_response(
+                StatusCode::BAD_REQUEST,
+                "missing Sec-WebSocket-Key",
+            );
+            let _ = self
+                .write_gateway_response(&mut http_stream, response)
+                .await;
+            return None;
+        };
+
+        if *shutdown.borrow() {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let _ = self
+                .write_gateway_response(&mut http_stream, self.draining_gateway_response())
+                .await;
+            return None;
+        }
+        let Some(_app_guard) = self.drain_controller.try_acquire() else {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let _ = self
+                .write_gateway_response(&mut http_stream, self.draining_gateway_response())
+                .await;
+            return None;
+        };
+
+        let generation = self.runtime_manager.active_generation();
+        let Some(_generation_guard) = generation.drain_controller.try_acquire() else {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let _ = self
+                .write_gateway_response(&mut http_stream, self.draining_gateway_response())
+                .await;
+            return None;
+        };
+        if !generation.runtime_pool.supports_websocket() {
+            self.ingress_metrics.record_websocket_upgrade_rejected();
+            let response = self.websocket_rejection_gateway_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "worker module does not export websocket handlers",
+            );
+            let _ = self
+                .write_gateway_response(&mut http_stream, response)
+                .await;
+            return None;
+        }
+
+        let connection_id = self.next_request_task_id();
+        let ctx = self.build_websocket_context(&http_stream, connection_id);
+        let (slot_index, open_commands) =
+            match generation.runtime_pool.open_websocket(ctx.clone()).await {
+                Ok(result) => result,
+                Err(RuntimePoolError::Worker(message))
+                    if message.contains("does not export websocket handlers") =>
+                {
+                    self.ingress_metrics.record_websocket_upgrade_rejected();
+                    let response = self
+                        .websocket_rejection_gateway_response(StatusCode::NOT_IMPLEMENTED, message);
+                    let _ = self
+                        .write_gateway_response(&mut http_stream, response)
+                        .await;
+                    return None;
+                }
+                Err(error) => {
+                    self.ingress_metrics.record_websocket_upgrade_rejected();
+                    let response = self.runtime_pool_gateway_response(error);
+                    let _ = self
+                        .write_gateway_response(&mut http_stream, response)
+                        .await;
+                    return None;
+                }
+            };
+
+        if let Err(error) = self
+            .write_websocket_handshake(&mut http_stream, &sec_websocket_key)
+            .await
+        {
+            eprintln!("failed to write websocket handshake: {error}");
+            return None;
+        }
+        let session_guard = self.ingress_metrics.start_websocket_session();
+
+        match self
+            .apply_websocket_commands(&mut http_stream, open_commands)
+            .await
+        {
+            Ok(Some(close_event)) => {
+                self.invoke_websocket_close_callback(&generation, slot_index, close_event, &ctx)
+                    .await;
+                session_guard.finish();
+                return None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("failed to send websocket onOpen commands: {error}");
+                return None;
+            }
+        }
+
+        let mut read_buffer = Vec::new();
+        loop {
+            loop {
+                let frame = match parse_websocket_frame(&mut read_buffer) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.ingress_metrics.record_websocket_protocol_error();
+                        self.ingress_metrics.record_websocket_close_out();
+                        let (code, reason) = websocket_close_for_protocol_error(&error);
+                        let _ =
+                            send_websocket_close_frame(&mut http_stream, Some(code), Some(reason))
+                                .await;
+                        self.invoke_websocket_close_callback(
+                            &generation,
+                            slot_index,
+                            websocket_close_event(Some(code), Some(reason.to_string()), false),
+                            &ctx,
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+
+                match frame {
+                    WebSocketFrame::Text(text) => {
+                        self.ingress_metrics.record_websocket_message_in();
+                        let commands = match generation
+                            .runtime_pool
+                            .execute_websocket_on_slot(
+                                slot_index,
+                                WorkerWebSocketEvent::Message { text },
+                                ctx.clone(),
+                            )
+                            .await
+                        {
+                            Ok(commands) => commands,
+                            Err(error) => {
+                                self.ingress_metrics.record_websocket_runtime_error();
+                                self.ingress_metrics.record_websocket_close_out();
+                                let (code, reason) = websocket_close_for_runtime_error(&error);
+                                let _ = send_websocket_close_frame(
+                                    &mut http_stream,
+                                    Some(code),
+                                    Some(reason),
+                                )
+                                .await;
+                                self.invoke_websocket_close_callback(
+                                    &generation,
+                                    slot_index,
+                                    websocket_close_event(
+                                        Some(code),
+                                        Some(reason.to_string()),
+                                        false,
+                                    ),
+                                    &ctx,
+                                )
+                                .await;
+                                return None;
+                            }
+                        };
+
+                        match self
+                            .apply_websocket_commands(&mut http_stream, commands)
+                            .await
+                        {
+                            Ok(Some(close_event)) => {
+                                self.invoke_websocket_close_callback(
+                                    &generation,
+                                    slot_index,
+                                    close_event,
+                                    &ctx,
+                                )
+                                .await;
+                                session_guard.finish();
+                                return None;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("failed to write websocket command frame: {error}");
+                                return None;
+                            }
+                        }
+                    }
+                    WebSocketFrame::Ping(payload) => {
+                        self.ingress_metrics.record_websocket_ping_in();
+                        self.ingress_metrics.record_websocket_pong_out();
+                        if let Err(error) =
+                            send_websocket_pong_frame(&mut http_stream, &payload).await
+                        {
+                            eprintln!("failed to write websocket pong frame: {error}");
+                            return None;
+                        }
+                    }
+                    WebSocketFrame::Pong(_) => {}
+                    WebSocketFrame::Close { code, reason } => {
+                        self.ingress_metrics.record_websocket_close_in();
+                        let close_event = websocket_close_event(code, reason.clone(), true);
+                        let commands = generation
+                            .runtime_pool
+                            .execute_websocket_on_slot(
+                                slot_index,
+                                WorkerWebSocketEvent::Close(close_event.clone()),
+                                ctx.clone(),
+                            )
+                            .await
+                            .unwrap_or_default();
+                        let reply_close =
+                            websocket_close_from_commands(&commands).unwrap_or((code, reason));
+                        self.ingress_metrics.record_websocket_close_out();
+                        let _ = send_websocket_close_frame(
+                            &mut http_stream,
+                            reply_close.0,
+                            reply_close.1.as_deref(),
+                        )
+                        .await;
+                        session_guard.finish();
+                        return None;
+                    }
+                }
+            }
+
+            match http_stream.read_request_body().await {
+                Ok(Some(bytes)) => {
+                    read_buffer.extend_from_slice(&bytes);
+                }
+                Ok(None) => {
+                    self.invoke_websocket_close_callback(
+                        &generation,
+                        slot_index,
+                        websocket_close_event(None, None, true),
+                        &ctx,
+                    )
+                    .await;
+                    let _ = send_websocket_upgraded_bytes(&mut http_stream, None, true).await;
+                    session_guard.finish();
+                    return None;
+                }
+                Err(error) => {
+                    eprintln!("failed to read websocket upgraded bytes: {error}");
+                    self.invoke_websocket_close_callback(
+                        &generation,
+                        slot_index,
+                        websocket_close_event(None, None, true),
+                        &ctx,
+                    )
+                    .await;
+                    session_guard.finish();
+                    return None;
+                }
+            }
         }
     }
 
@@ -1730,6 +2280,302 @@ async fn read_full_request_body(http_stream: &mut ServerSession) -> Result<Vec<u
     }
 }
 
+const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WEBSOCKET_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+const WEBSOCKET_METADATA_URI_KEY: &str = "hardess_websocket_uri";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebSocketFrame {
+    Text(String),
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+}
+
+fn websocket_upgrade_header_is_websocket(http_stream: &ServerSession) -> bool {
+    http_stream
+        .get_header(http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
+fn is_websocket_upgrade_request(http_stream: &ServerSession) -> bool {
+    http_stream.req_header().method == http::Method::GET
+        && http_stream.is_upgrade_req()
+        && websocket_upgrade_header_is_websocket(http_stream)
+}
+
+fn websocket_sec_version_is_supported(http_stream: &ServerSession) -> bool {
+    http_stream
+        .get_header("sec-websocket-version")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "13")
+}
+
+fn websocket_sec_key(http_stream: &ServerSession) -> Option<String> {
+    http_stream
+        .get_header("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn websocket_accept_value(sec_key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(sec_key.as_bytes());
+    hasher.update(WEBSOCKET_ACCEPT_GUID.as_bytes());
+    BASE64_STANDARD.encode(hasher.finalize())
+}
+
+fn websocket_frame_payload_len(
+    buffer: &[u8],
+    second_byte: u8,
+    cursor: &mut usize,
+) -> Result<Option<usize>, String> {
+    let len_code = (second_byte & 0x7f) as usize;
+    match len_code {
+        len @ 0..=125 => Ok(Some(len)),
+        126 => {
+            if buffer.len() < *cursor + 2 {
+                return Ok(None);
+            }
+            let len = u16::from_be_bytes([buffer[*cursor], buffer[*cursor + 1]]) as usize;
+            *cursor += 2;
+            Ok(Some(len))
+        }
+        127 => {
+            if buffer.len() < *cursor + 8 {
+                return Ok(None);
+            }
+            let len = u64::from_be_bytes([
+                buffer[*cursor],
+                buffer[*cursor + 1],
+                buffer[*cursor + 2],
+                buffer[*cursor + 3],
+                buffer[*cursor + 4],
+                buffer[*cursor + 5],
+                buffer[*cursor + 6],
+                buffer[*cursor + 7],
+            ]);
+            *cursor += 8;
+            usize::try_from(len)
+                .map(Some)
+                .map_err(|_| "websocket frame length exceeds host limits".to_string())
+        }
+        _ => Err("invalid websocket frame length".to_string()),
+    }
+}
+
+fn parse_websocket_frame(buffer: &mut Vec<u8>) -> Result<Option<WebSocketFrame>, String> {
+    if buffer.len() < 2 {
+        return Ok(None);
+    }
+
+    let first = buffer[0];
+    let second = buffer[1];
+    let fin = (first & 0x80) != 0;
+    let opcode = first & 0x0f;
+    let masked = (second & 0x80) != 0;
+    if !masked {
+        return Err("downstream websocket client frame must be masked".to_string());
+    }
+    if !fin {
+        return Err("fragmented websocket frames are not supported yet".to_string());
+    }
+
+    let mut cursor = 2usize;
+    let Some(payload_len) = websocket_frame_payload_len(buffer, second, &mut cursor)? else {
+        return Ok(None);
+    };
+    if payload_len > WEBSOCKET_MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "websocket payload exceeds limit: {payload_len} > {WEBSOCKET_MAX_PAYLOAD_BYTES}"
+        ));
+    }
+    if buffer.len() < cursor + 4 + payload_len {
+        return Ok(None);
+    }
+
+    let mask = [
+        buffer[cursor],
+        buffer[cursor + 1],
+        buffer[cursor + 2],
+        buffer[cursor + 3],
+    ];
+    cursor += 4;
+    let frame_len = cursor + payload_len;
+    let remaining = buffer.split_off(frame_len);
+    let frame_bytes = std::mem::replace(buffer, remaining);
+    let mut payload = frame_bytes[cursor..frame_len].to_vec();
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+
+    match opcode {
+        0x1 => String::from_utf8(payload)
+            .map(WebSocketFrame::Text)
+            .map(Some)
+            .map_err(|error| format!("websocket text frame is not valid UTF-8: {error}")),
+        0x2 => Err("binary websocket frames are not supported yet".to_string()),
+        0x8 => {
+            if payload.len() == 1 {
+                return Err("websocket close frame payload length must not be 1".to_string());
+            }
+            let (code, reason) = if payload.len() >= 2 {
+                let code = u16::from_be_bytes([payload[0], payload[1]]);
+                let reason =
+                    if payload.len() > 2 {
+                        Some(String::from_utf8(payload[2..].to_vec()).map_err(|error| {
+                            format!("websocket close reason is not UTF-8: {error}")
+                        })?)
+                    } else {
+                        None
+                    };
+                (Some(code), reason)
+            } else {
+                (None, None)
+            };
+            Ok(Some(WebSocketFrame::Close { code, reason }))
+        }
+        0x9 => Ok(Some(WebSocketFrame::Ping(payload))),
+        0xA => Ok(Some(WebSocketFrame::Pong(payload))),
+        0x0 => Err("websocket continuation frames are not supported yet".to_string()),
+        other => Err(format!("unsupported websocket opcode: {other}")),
+    }
+}
+
+fn encode_websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len().saturating_add(10));
+    frame.push(0x80 | (opcode & 0x0f));
+    if payload.len() <= 125 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn encode_websocket_close_payload(code: Option<u16>, reason: Option<&str>) -> Vec<u8> {
+    let reason = reason.filter(|reason| reason.len() <= 123);
+    let code = if code.is_none() && reason.is_some() {
+        Some(1000)
+    } else {
+        code
+    };
+    let Some(code) = code else {
+        return Vec::new();
+    };
+    let mut payload = Vec::with_capacity(2 + reason.map_or(0, str::len));
+    payload.extend_from_slice(&code.to_be_bytes());
+    if let Some(reason) = reason {
+        payload.extend_from_slice(reason.as_bytes());
+    }
+    payload
+}
+
+async fn send_websocket_upgraded_bytes(
+    http_stream: &mut ServerSession,
+    bytes: Option<Vec<u8>>,
+    end_stream: bool,
+) -> Result<(), String> {
+    http_stream
+        .response_duplex_vec(vec![HttpTask::UpgradedBody(
+            bytes.map(Into::into),
+            end_stream,
+        )])
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn send_websocket_text_frame(
+    http_stream: &mut ServerSession,
+    text: &str,
+) -> Result<(), String> {
+    send_websocket_upgraded_bytes(
+        http_stream,
+        Some(encode_websocket_frame(0x1, text.as_bytes())),
+        false,
+    )
+    .await
+}
+
+async fn send_websocket_pong_frame(
+    http_stream: &mut ServerSession,
+    payload: &[u8],
+) -> Result<(), String> {
+    send_websocket_upgraded_bytes(
+        http_stream,
+        Some(encode_websocket_frame(0xA, payload)),
+        false,
+    )
+    .await
+}
+
+async fn send_websocket_close_frame(
+    http_stream: &mut ServerSession,
+    code: Option<u16>,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let payload = encode_websocket_close_payload(code, reason);
+    send_websocket_upgraded_bytes(
+        http_stream,
+        Some(encode_websocket_frame(0x8, &payload)),
+        true,
+    )
+    .await
+}
+
+fn websocket_close_event(
+    code: Option<u16>,
+    reason: Option<String>,
+    remote: bool,
+) -> WorkerWebSocketCloseEvent {
+    WorkerWebSocketCloseEvent {
+        code,
+        reason,
+        remote,
+    }
+}
+
+fn websocket_close_from_commands(
+    commands: &[WorkerWebSocketCommand],
+) -> Option<(Option<u16>, Option<String>)> {
+    commands.iter().find_map(|command| match command {
+        WorkerWebSocketCommand::Close { code, reason } => Some((*code, reason.clone())),
+        WorkerWebSocketCommand::SendText(_) => None,
+    })
+}
+
+fn websocket_close_for_runtime_error(error: &RuntimePoolError) -> (u16, &'static str) {
+    match error {
+        RuntimePoolError::Overloaded => (1013, "runtime_overloaded"),
+        RuntimePoolError::TimedOut(_) => (1011, "runtime_timeout"),
+        RuntimePoolError::Recycling(_) | RuntimePoolError::Unavailable(_) => {
+            (1012, "runtime_unavailable")
+        }
+        RuntimePoolError::Worker(_) => (1011, "worker_error"),
+    }
+}
+
+fn websocket_close_for_protocol_error(message: &str) -> (u16, &'static str) {
+    if message.contains("payload exceeds limit") {
+        return (1009, "payload_too_large");
+    }
+    if message.contains("binary websocket frames are not supported") {
+        return (1003, "binary_not_supported");
+    }
+    (1002, "protocol_error")
+}
+
 #[async_trait]
 impl HttpServerApp for WorkerHttpApp {
     async fn process_new_http(
@@ -1754,6 +2600,10 @@ impl HttpServerApp for WorkerHttpApp {
             http_stream.set_keepalive(None);
         } else {
             http_stream.set_keepalive(Some(60));
+        }
+
+        if is_websocket_upgrade_request(&http_stream) {
+            return self.process_websocket_session(http_stream, shutdown).await;
         }
 
         let HandleRequestResult {
@@ -1893,7 +2743,6 @@ fn main() {
         runtime_threads: cli.runtime_threads,
         queue_capacity: cli.queue_capacity,
         exec_timeout: Duration::from_millis(cli.exec_timeout_ms),
-        completion_mode: cli.completion_mode,
         generation_drain_timeout: Duration::from_millis(cli.generation_drain_timeout_ms),
     })
     .expect("worker runtime generation manager should initialize");
@@ -1922,13 +2771,12 @@ fn main() {
     service.add_tcp_with_settings(&cli.listen, tcp_socket_options);
 
     println!(
-        "pingora ingress listening on http://{} for worker_id={} runtime_threads={} queue_capacity={} exec_timeout_ms={} completion_mode={:?} tcp_fastopen_backlog={:?} tcp_keepalive={:?} tcp_reuseport={:?} shutdown_drain_timeout_ms={} generation_drain_timeout_ms={}",
+        "pingora ingress listening on http://{} for worker_id={} runtime_threads={} queue_capacity={} exec_timeout_ms={} completion_mode=async tcp_fastopen_backlog={:?} tcp_keepalive={:?} tcp_reuseport={:?} shutdown_drain_timeout_ms={} generation_drain_timeout_ms={}",
         cli.listen,
         cli.worker_id,
         cli.runtime_threads,
         cli.queue_capacity,
         cli.exec_timeout_ms,
-        cli.completion_mode,
         cli.tcp_fastopen_backlog,
         tcp_keepalive_display,
         cli.tcp_reuseport,
@@ -1981,7 +2829,6 @@ mod tests {
                 runtime_threads: 1,
                 queue_capacity: 4,
                 exec_timeout: Duration::from_secs(5),
-                completion_mode: RuntimeCompletionMode::Auto,
                 generation_drain_timeout: Duration::from_millis(10),
             })
             .expect("runtime manager should initialize"),
@@ -1995,6 +2842,23 @@ mod tests {
 
     fn test_app() -> WorkerHttpApp {
         test_app_with_worker(sample_worker_path())
+    }
+
+    fn masked_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = Vec::with_capacity(payload.len() + 16);
+        frame.push(0x80 | opcode);
+        if payload.len() <= 125 {
+            frame.push(0x80 | payload.len() as u8);
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[index % 4]);
+        }
+        frame
     }
 
     #[test]
@@ -2064,6 +2928,129 @@ mod tests {
     }
 
     #[test]
+    fn websocket_accept_value_matches_rfc_sample() {
+        assert_eq!(
+            websocket_accept_value("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn parse_websocket_frames_decodes_masked_text_and_close() {
+        let mut text_frame = masked_client_frame(0x1, b"hello");
+        let parsed = parse_websocket_frame(&mut text_frame)
+            .expect("text frame should parse")
+            .expect("text frame should be complete");
+        assert_eq!(parsed, WebSocketFrame::Text("hello".to_string()));
+        assert!(text_frame.is_empty());
+
+        let close_payload = [1000u16.to_be_bytes().as_slice(), b"bye"].concat();
+        let mut close_frame = masked_client_frame(0x8, &close_payload);
+        let parsed = parse_websocket_frame(&mut close_frame)
+            .expect("close frame should parse")
+            .expect("close frame should be complete");
+        assert_eq!(
+            parsed,
+            WebSocketFrame::Close {
+                code: Some(1000),
+                reason: Some("bye".to_string()),
+            }
+        );
+        assert!(close_frame.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_generation_pool_supports_websocket_workers() {
+        let worker_path = temp_worker_path(
+            "ws-worker",
+            r#"
+export function fetch() {
+  return new Response("ok");
+}
+
+export const websocket = {
+  onOpen(ctx) {
+    ctx.send("opened");
+  },
+  onMessage(message, ctx) {
+    ctx.send(`echo:${message.text}`);
+  },
+};
+"#,
+        );
+        let app = test_app_with_worker(worker_path);
+        let generation = app.runtime_manager.active_generation();
+        assert!(generation.runtime_pool.supports_websocket());
+
+        let base_ctx = WorkerWebSocketContext {
+            connection_id: "ws-1".to_string(),
+            worker_id: "test-worker".to_string(),
+            vars: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+        let (slot_index, commands) = generation
+            .runtime_pool
+            .open_websocket(base_ctx.clone())
+            .await
+            .expect("websocket open should succeed");
+        assert_eq!(
+            commands,
+            vec![WorkerWebSocketCommand::SendText("opened".to_string())]
+        );
+
+        let commands = generation
+            .runtime_pool
+            .execute_websocket_on_slot(
+                slot_index,
+                WorkerWebSocketEvent::Message {
+                    text: "ping".to_string(),
+                },
+                base_ctx,
+            )
+            .await
+            .expect("websocket message should succeed");
+        assert_eq!(
+            commands,
+            vec![WorkerWebSocketCommand::SendText("echo:ping".to_string())]
+        );
+    }
+
+    #[test]
+    fn ingress_metrics_snapshot_includes_websocket_counters() {
+        let metrics = IngressMetrics::new();
+        metrics.record_websocket_upgrade_request();
+        metrics.record_websocket_upgrade_rejected();
+        {
+            let session = metrics.start_websocket_session();
+            metrics.record_websocket_message_in();
+            metrics.record_websocket_message_out();
+            metrics.record_websocket_ping_in();
+            metrics.record_websocket_pong_out();
+            metrics.record_websocket_close_in();
+            metrics.record_websocket_close_out();
+            metrics.record_websocket_protocol_error();
+            metrics.record_websocket_runtime_error();
+            session.finish();
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.websocket.upgrade_requests, 1);
+        assert_eq!(snapshot.websocket.upgrade_accepted, 1);
+        assert_eq!(snapshot.websocket.upgrade_rejected, 1);
+        assert_eq!(snapshot.websocket.active_connections, 0);
+        assert_eq!(snapshot.websocket.peak_connections, 1);
+        assert_eq!(snapshot.websocket.sessions_completed, 1);
+        assert_eq!(snapshot.websocket.messages_in, 1);
+        assert_eq!(snapshot.websocket.messages_out, 1);
+        assert_eq!(snapshot.websocket.ping_in, 1);
+        assert_eq!(snapshot.websocket.pong_out, 1);
+        assert_eq!(snapshot.websocket.close_in, 1);
+        assert_eq!(snapshot.websocket.close_out, 1);
+        assert_eq!(snapshot.websocket.protocol_errors, 1);
+        assert_eq!(snapshot.websocket.runtime_errors, 1);
+    }
+
+    #[test]
     fn ingress_state_response_exposes_active_request_tasks() {
         let app = test_app();
         let _guard = app.request_tasks.track(RequestTaskDescriptor {
@@ -2108,6 +3095,11 @@ mod tests {
         );
         assert_eq!(
             body.pointer("/recent_request_tasks/count")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            body.pointer("/ingress_metrics/websocket/upgrade_requests")
                 .and_then(Value::as_u64),
             Some(0)
         );
@@ -2345,7 +3337,6 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
-            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");
@@ -2483,7 +3474,6 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
-            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");
@@ -2577,7 +3567,6 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
-            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");

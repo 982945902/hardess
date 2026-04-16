@@ -2,6 +2,23 @@
 
 Date: 2026-04-15
 
+Update: 2026-04-16
+
+- `gateway-host` now has a runtime-side WebSocket event bridge
+- worker modules can optionally export:
+  - `websocket.onOpen(ctx)`
+  - `websocket.onMessage(message, ctx)`
+  - `websocket.onClose(event, ctx)`
+- `ctx.send(string)` and `ctx.close(code?, reason?)` now map to Rust-captured commands
+- Pingora ingress now has a first H1 websocket session path wired to that bridge
+- current transport scope is intentionally narrow:
+  - text messages only
+  - ping/pong supported
+  - close supported
+  - binary frames rejected
+  - fragmented frames rejected
+  - connection stays Rust-owned for its entire lifetime
+
 ## Decision
 
 For the next WebSocket-capable version of this experiment, the recommended model is:
@@ -234,17 +251,32 @@ That distinction matters.
 
 ### Stage 1
 
-Build Rust-native WebSocket ingress and connection registry.
+Seal the TS runtime event contract first.
 
 Success condition:
 
-- stable upgrades
-- stable shutdown behavior
-- stable per-connection metrics
+- worker modules can export `websocket`
+- Rust can invoke `onOpen` / `onMessage` / `onClose`
+- TS-issued `ctx.send` / `ctx.close` become Rust-managed commands without giving TS socket ownership
 
 ### Stage 2
 
-Expose a minimal TS event API:
+Build Rust-native WebSocket ingress and connection registry.
+
+Current status:
+
+- H1 upgrade is now wired through Pingora
+- the connection is pinned to one runtime shard for its lifetime
+- app-level drain and generation-level drain now both hold the websocket session open until it exits
+
+Remaining gap inside this stage:
+
+- broaden frame support beyond text-only / non-fragmented
+- add more explicit websocket connection metrics
+
+### Stage 3
+
+Wire Stage 1 and Stage 2 together behind a minimal product-facing API:
 
 - `onOpen`
 - `onMessage`
@@ -256,7 +288,7 @@ Success condition:
 
 - TS can express the product logic without owning the transport
 
-### Stage 3
+### Stage 4
 
 Add targeted higher-level features only if needed:
 
@@ -269,7 +301,7 @@ Success condition:
 
 - product needs are met without making the runtime boundary too magical
 
-### Stage 4
+### Stage 5
 
 Only then evaluate whether a more worker-native long-lived object model is worth the complexity.
 

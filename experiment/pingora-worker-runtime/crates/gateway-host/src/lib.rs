@@ -2,6 +2,7 @@ mod public_error;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read;
 use std::mem;
@@ -43,6 +44,7 @@ use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::ModuleType;
+use deno_core::OpState;
 use deno_core::ResolutionKind;
 use deno_core::RuntimeOptions;
 use deno_error::JsErrorBox;
@@ -52,7 +54,6 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use sha2::Sha512;
-use tokio::runtime::RuntimeFlavor;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Notify;
@@ -79,6 +80,94 @@ pub const HARDESS_REQUEST_BODY_MODE_METADATA_KEY: &str = "hardess_request_body_m
 pub const HARDESS_REQUEST_COMPLETION_POLICY_METADATA_KEY: &str =
     "hardess_request_completion_policy";
 pub const HARDESS_RUNTIME_SHARD_METADATA_KEY: &str = "hardess_runtime_shard";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerWebSocketEvent {
+    Open,
+    Message { text: String },
+    Close(WorkerWebSocketCloseEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerWebSocketCloseEvent {
+    pub code: Option<u16>,
+    pub reason: Option<String>,
+    pub remote: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerWebSocketContext {
+    pub connection_id: String,
+    pub worker_id: String,
+    pub vars: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerWebSocketCommand {
+    SendText(String),
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Default)]
+struct WebSocketOpState {
+    active_invocation: Option<ActiveWebSocketInvocation>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveWebSocketInvocation {
+    commands: Vec<WorkerWebSocketCommand>,
+    close_requested: bool,
+}
+
+impl WebSocketOpState {
+    fn begin_invocation(&mut self) -> Result<(), String> {
+        if self.active_invocation.is_some() {
+            return Err("websocket invocation state is already active".to_string());
+        }
+        self.active_invocation = Some(ActiveWebSocketInvocation::default());
+        Ok(())
+    }
+
+    fn finish_invocation(&mut self) -> Result<Vec<WorkerWebSocketCommand>, String> {
+        self.active_invocation
+            .take()
+            .map(|invocation| invocation.commands)
+            .ok_or_else(|| "websocket invocation state is not active".to_string())
+    }
+
+    fn push_send_text(&mut self, text: String) -> Result<(), String> {
+        let invocation = self
+            .active_invocation
+            .as_mut()
+            .ok_or_else(|| "websocket invocation state is not active".to_string())?;
+        if invocation.close_requested {
+            return Err("websocket ctx.send() cannot be used after ctx.close()".to_string());
+        }
+        invocation
+            .commands
+            .push(WorkerWebSocketCommand::SendText(text));
+        Ok(())
+    }
+
+    fn push_close(&mut self, code: Option<u16>, reason: Option<String>) -> Result<(), String> {
+        let invocation = self
+            .active_invocation
+            .as_mut()
+            .ok_or_else(|| "websocket invocation state is not active".to_string())?;
+        if invocation.close_requested {
+            return Ok(());
+        }
+        invocation.close_requested = true;
+        invocation
+            .commands
+            .push(WorkerWebSocketCommand::Close { code, reason });
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct WorkerProjectConfig {
@@ -849,12 +938,6 @@ impl GatewayRequest {
             .as_ref()
             .map_or(true, RequestBodySource::is_retry_safe)
     }
-
-    fn requires_ingress_body_drive(&self) -> bool {
-        self.body
-            .as_ref()
-            .is_some_and(RequestBodySource::requires_ingress_body_drive)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1087,14 +1170,6 @@ impl RequestBodySource {
             RequestBodyState::Buffered { .. } => true,
             RequestBodyState::Streaming { started, .. } => !started,
         }
-    }
-
-    fn requires_ingress_body_drive(&self) -> bool {
-        let state = self
-            .state
-            .lock()
-            .expect("request body state mutex should not be poisoned");
-        matches!(&*state, RequestBodyState::Streaming { .. })
     }
 
     async fn read_next_chunk(&self) -> Result<Option<Vec<u8>>, String> {
@@ -1339,6 +1414,26 @@ async fn op_worker_request_read_all_bytes(
         .map_err(JsErrorBox::generic)
 }
 
+#[op2(fast)]
+fn op_websocket_ctx_send(state: &mut OpState, #[string] text: String) -> Result<(), JsErrorBox> {
+    state
+        .borrow_mut::<WebSocketOpState>()
+        .push_send_text(text)
+        .map_err(JsErrorBox::generic)
+}
+
+#[op2]
+fn op_websocket_ctx_close(
+    state: &mut OpState,
+    code: Option<u16>,
+    #[string] reason: Option<String>,
+) -> Result<(), JsErrorBox> {
+    state
+        .borrow_mut::<WebSocketOpState>()
+        .push_close(code, reason)
+        .map_err(JsErrorBox::generic)
+}
+
 deno_core::extension!(
     hardess_runtime_bridge,
     ops = [
@@ -1347,7 +1442,10 @@ deno_core::extension!(
         op_worker_request_get_headers,
         op_worker_request_read_next_chunk,
         op_worker_request_read_all_bytes,
-    ]
+        op_websocket_ctx_send,
+        op_websocket_ctx_close,
+    ],
+    state = |state| state.put(WebSocketOpState::default())
 );
 
 const WEB_RUNTIME_BOOTSTRAP: &str = r#"
@@ -2128,7 +2226,12 @@ impl TypescriptModuleLoader {
 
 pub struct DenoWorkerRuntime {
     js_runtime: JsRuntime,
-    invoke_bridge: v8::Global<v8::Function>,
+    invoke_bridge: WorkerInvocationBridge,
+}
+
+struct WorkerInvocationBridge {
+    fetch: v8::Global<v8::Function>,
+    websocket: Option<v8::Global<v8::Function>>,
 }
 
 struct JsResponseChunkReader {
@@ -2186,44 +2289,37 @@ impl PendingGatewayResponse {
     }
 }
 
+enum RuntimeThreadTask {
+    Http {
+        request: GatewayRequest,
+        env: WorkerEnv,
+        ctx: WorkerContext,
+    },
+    WebSocket {
+        event: WorkerWebSocketEvent,
+        ctx: WorkerWebSocketContext,
+    },
+}
+
 struct RuntimeThreadMessage {
-    request: GatewayRequest,
-    env: WorkerEnv,
-    ctx: WorkerContext,
+    task: RuntimeThreadTask,
     enqueued_at: Instant,
-    response_tx: RuntimeThreadResponseTx,
+    response_tx: oneshot::Sender<RuntimeThreadResponse>,
+}
+
+enum RuntimeThreadResult {
+    Http(GatewayResponse),
+    WebSocket(Vec<WorkerWebSocketCommand>),
 }
 
 struct RuntimeThreadResponse {
-    result: Result<GatewayResponse, RuntimePoolError>,
+    result: Result<RuntimeThreadResult, RuntimePoolError>,
     response_sent_at: Instant,
-}
-
-enum RuntimeThreadResponseTx {
-    Async(oneshot::Sender<RuntimeThreadResponse>),
-    Blocking(mpsc::SyncSender<RuntimeThreadResponse>),
-}
-
-enum RuntimeThreadResponseRx {
-    Async(oneshot::Receiver<RuntimeThreadResponse>),
-    Blocking(mpsc::Receiver<RuntimeThreadResponse>),
-}
-
-impl RuntimeThreadResponseTx {
-    fn send(self, response: RuntimeThreadResponse) {
-        match self {
-            Self::Async(sender) => {
-                let _ = sender.send(response);
-            }
-            Self::Blocking(sender) => {
-                let _ = sender.send(response);
-            }
-        }
-    }
 }
 
 struct RuntimeThreadInstance {
     sender: tokio_mpsc::Sender<RuntimeThreadMessage>,
+    websocket_supported: bool,
 }
 
 struct RuntimeSlotState {
@@ -2247,7 +2343,6 @@ struct WorkerRuntimeSlot {
     worker_entry: PathBuf,
     queue_capacity: usize,
     exec_timeout: Duration,
-    completion_mode: RuntimeCompletionMode,
     state: Mutex<RuntimeSlotState>,
     metrics: Arc<WorkerThreadMetrics>,
     pool_metrics: Arc<RuntimePoolMetrics>,
@@ -2261,8 +2356,14 @@ impl WorkerRuntimeSlot {
         ctx
     }
 
-    fn should_use_blocking_completion_for_request(&self, request: &GatewayRequest) -> bool {
-        self.completion_mode.should_use_blocking() && !request.requires_ingress_body_drive()
+    fn attach_websocket_runtime_metadata(
+        &self,
+        mut ctx: WorkerWebSocketContext,
+    ) -> WorkerWebSocketContext {
+        ctx.metadata
+            .entry(HARDESS_RUNTIME_SHARD_METADATA_KEY.to_string())
+            .or_insert_with(|| self.runtime_index.to_string());
+        ctx
     }
 
     fn new(
@@ -2270,7 +2371,6 @@ impl WorkerRuntimeSlot {
         runtime_index: usize,
         queue_capacity: usize,
         exec_timeout: Duration,
-        completion_mode: RuntimeCompletionMode,
         pool_metrics: Arc<RuntimePoolMetrics>,
     ) -> Result<Self> {
         let metrics = Arc::new(WorkerThreadMetrics::new(runtime_index));
@@ -2288,7 +2388,6 @@ impl WorkerRuntimeSlot {
             worker_entry,
             queue_capacity: queue_capacity.max(1),
             exec_timeout,
-            completion_mode,
             state: Mutex::new(RuntimeSlotState {
                 generation: 0,
                 instance,
@@ -2380,6 +2479,7 @@ impl WorkerRuntimeSlot {
                             return;
                         }
                     };
+                    let websocket_supported = worker_runtime.supports_websocket();
                     let timed_out_request_id = Arc::new(AtomicU64::new(0));
                     let watchdog_tx = match Self::spawn_watchdog(
                         runtime_index,
@@ -2393,15 +2493,13 @@ impl WorkerRuntimeSlot {
                             return;
                         }
                     };
-                    let _ = ready_tx.send(Ok(()));
+                    let _ = ready_tx.send(Ok(websocket_supported));
                     let mut next_request_id = 1_u64;
                     let mut should_exit = false;
 
                     while let Some(message) = receiver.recv().await {
                         let RuntimeThreadMessage {
-                            request,
-                            env,
-                            ctx,
+                            task,
                             enqueued_at,
                             response_tx,
                         } = message;
@@ -2422,38 +2520,60 @@ impl WorkerRuntimeSlot {
                         let started_at = Instant::now();
                         let queue_wait = started_at.saturating_duration_since(enqueued_at);
                         let _ = watchdog_tx.send(WatchdogCommand::Arm { request_id });
-                        let worker_result = worker_runtime
-                            .start_gateway_response(request, env, ctx)
-                            .await;
+                        let worker_result: Result<
+                            (
+                                RuntimeThreadResult,
+                                Option<RuntimeResponseBody>,
+                                Option<(u64, u64, u64)>,
+                            ),
+                            RuntimePoolError,
+                        > = match task {
+                            RuntimeThreadTask::Http { request, env, ctx } => worker_runtime
+                                .start_gateway_response(request, env, ctx)
+                                .await
+                                .map(|(pending_response, invoke_timings)| {
+                                    (
+                                        RuntimeThreadResult::Http(pending_response.response),
+                                        pending_response.runtime_body,
+                                        Some((
+                                            invoke_timings.arg_serialize_nanos,
+                                            invoke_timings.js_call_nanos,
+                                            invoke_timings.response_decode_nanos,
+                                        )),
+                                    )
+                                })
+                                .map_err(RuntimePoolError::Worker),
+                            RuntimeThreadTask::WebSocket { event, ctx } => worker_runtime
+                                .invoke_websocket(&event, &ctx)
+                                .await
+                                .map(|commands| {
+                                    (RuntimeThreadResult::WebSocket(commands), None, None)
+                                })
+                                .map_err(RuntimePoolError::Worker),
+                        };
                         let invoke_elapsed = started_at.elapsed();
-                        let invoke_component_nanos =
-                            worker_result.as_ref().ok().map(|(_, invoke_timings)| {
-                                (
-                                    invoke_timings.arg_serialize_nanos,
-                                    invoke_timings.js_call_nanos,
-                                    invoke_timings.response_decode_nanos,
-                                )
-                            });
+                        let invoke_component_nanos = worker_result
+                            .as_ref()
+                            .ok()
+                            .and_then(|(_, _, timings)| *timings);
                         let mut response_tx = Some(response_tx);
                         let result = if timed_out_request_id.load(Ordering::Relaxed) == request_id {
                             Err(RuntimePoolError::TimedOut(exec_timeout.as_millis() as u64))
                         } else {
                             match worker_result {
-                                Ok((mut pending_response, _invoke_timings)) => {
+                                Ok((result, mut runtime_body, _invoke_timings)) => {
                                     if let Some(response_tx) = response_tx.take() {
-                                        response_tx.send(RuntimeThreadResponse {
-                                            result: Ok(pending_response.response),
+                                        let _ = response_tx.send(RuntimeThreadResponse {
+                                            result: Ok(result),
                                             response_sent_at: Instant::now(),
                                         });
                                     }
-                                    if let Some(runtime_body) =
-                                        pending_response.runtime_body.as_mut()
-                                    {
+                                    if let Some(runtime_body) = runtime_body.as_mut() {
                                         runtime_body.finish(&mut worker_runtime).await;
                                     }
                                     Ok(())
                                 }
-                                Err(error) => Err(RuntimePoolError::Worker(error)),
+                                Err(error) => Err(error),
                             }
                         };
                         let elapsed = started_at.elapsed().as_nanos() as u64;
@@ -2530,7 +2650,7 @@ impl WorkerRuntimeSlot {
                             }
                         }
                         if let Some(response_tx) = response_tx.take() {
-                            response_tx.send(RuntimeThreadResponse {
+                            let _ = response_tx.send(RuntimeThreadResponse {
                                 result: match result {
                                     Ok(()) => Err(RuntimePoolError::Unavailable(
                                         "worker runtime completed without a response".to_string(),
@@ -2578,12 +2698,15 @@ impl WorkerRuntimeSlot {
             })
             .context("failed to spawn worker runtime thread")?;
 
-        ready_rx
+        let websocket_supported = ready_rx
             .recv()
             .context("worker runtime thread exited before initialization")?
             .map_err(anyhow::Error::msg)?;
 
-        Ok(RuntimeThreadInstance { sender })
+        Ok(RuntimeThreadInstance {
+            sender,
+            websocket_supported,
+        })
     }
 
     async fn execute(
@@ -2601,71 +2724,28 @@ impl WorkerRuntimeSlot {
             (state.generation, state.instance.sender.clone())
         };
         let enqueued_at = Instant::now();
-        // On the multithreaded ingress runtime, a blocking wait avoids the
-        // large async wakeup cost we measured on the response handoff path.
-        // But requests with a streaming ingress body still need the caller task
-        // to keep servicing body-read commands while the worker is running, so
-        // they must stay on the async completion path.
-        let use_blocking_completion = self.should_use_blocking_completion_for_request(&request);
-        let response_rx = if use_blocking_completion {
-            let (response_tx, response_rx) = mpsc::sync_channel(1);
-            sender
-                .try_send(RuntimeThreadMessage {
-                    request,
-                    env,
-                    ctx,
-                    enqueued_at,
-                    response_tx: RuntimeThreadResponseTx::Blocking(response_tx),
-                })
-                .map_err(|error| match error {
-                    tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
-                    tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
-                        "worker runtime thread is not available".to_string(),
-                    ),
-                })
-                .inspect(|_| {
-                    self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                    self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
-                })?;
-            RuntimeThreadResponseRx::Blocking(response_rx)
-        } else {
-            let (response_tx, response_rx) = oneshot::channel();
-            sender
-                .try_send(RuntimeThreadMessage {
-                    request,
-                    env,
-                    ctx,
-                    enqueued_at,
-                    response_tx: RuntimeThreadResponseTx::Async(response_tx),
-                })
-                .map_err(|error| match error {
-                    tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
-                    tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
-                        "worker runtime thread is not available".to_string(),
-                    ),
-                })
-                .inspect(|_| {
-                    self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                    self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
-                })?;
-            RuntimeThreadResponseRx::Async(response_rx)
-        };
-        let result = match response_rx {
-            RuntimeThreadResponseRx::Async(response_rx) => response_rx.await.map_err(|_| {
-                RuntimePoolError::Unavailable(
-                    "worker runtime thread dropped response channel".to_string(),
-                )
-            })?,
-            RuntimeThreadResponseRx::Blocking(response_rx) => {
-                tokio::task::block_in_place(move || {
-                    response_rx.recv().map_err(|_| {
-                        RuntimePoolError::Unavailable(
-                            "worker runtime thread dropped response channel".to_string(),
-                        )
-                    })
-                })?
-            }
-        };
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .try_send(RuntimeThreadMessage {
+                task: RuntimeThreadTask::Http { request, env, ctx },
+                enqueued_at,
+                response_tx,
+            })
+            .map_err(|error| match error {
+                tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
+                tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
+                    "worker runtime thread is not available".to_string(),
+                ),
+            })
+            .inspect(|_| {
+                self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
+            })?;
+        let result = response_rx.await.map_err(|_| {
+            RuntimePoolError::Unavailable(
+                "worker runtime thread dropped response channel".to_string(),
+            )
+        })?;
         let received_at = Instant::now();
         self.pool_metrics.total_roundtrip_nanos.fetch_add(
             received_at
@@ -2679,7 +2759,90 @@ impl WorkerRuntimeSlot {
                 .as_nanos() as u64,
             Ordering::Relaxed,
         );
-        let result = result.result;
+        let result = match result.result {
+            Ok(RuntimeThreadResult::Http(response)) => Ok(response),
+            Ok(RuntimeThreadResult::WebSocket(_)) => Err(RuntimePoolError::Unavailable(
+                "worker runtime returned websocket commands on an HTTP path".to_string(),
+            )),
+            Err(error) => Err(error),
+        };
+
+        if matches!(
+            &result,
+            Err(RuntimePoolError::TimedOut(_)) | Err(RuntimePoolError::Unavailable(_))
+        ) {
+            let _ = self.rebuild_if_generation(generation);
+        }
+
+        result
+    }
+
+    async fn execute_websocket(
+        &self,
+        event: WorkerWebSocketEvent,
+        ctx: WorkerWebSocketContext,
+    ) -> Result<Vec<WorkerWebSocketCommand>, RuntimePoolError> {
+        let ctx = self.attach_websocket_runtime_metadata(ctx);
+        let (generation, sender, websocket_supported) = {
+            let state = self
+                .state
+                .lock()
+                .expect("worker runtime slot state mutex should not be poisoned");
+            (
+                state.generation,
+                state.instance.sender.clone(),
+                state.instance.websocket_supported,
+            )
+        };
+        if !websocket_supported {
+            return Err(RuntimePoolError::Worker(
+                "worker module does not export websocket handlers".to_string(),
+            ));
+        }
+
+        let enqueued_at = Instant::now();
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .try_send(RuntimeThreadMessage {
+                task: RuntimeThreadTask::WebSocket { event, ctx },
+                enqueued_at,
+                response_tx,
+            })
+            .map_err(|error| match error {
+                tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
+                tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
+                    "worker runtime thread is not available".to_string(),
+                ),
+            })
+            .inspect(|_| {
+                self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
+            })?;
+        let result = response_rx.await.map_err(|_| {
+            RuntimePoolError::Unavailable(
+                "worker runtime thread dropped response channel".to_string(),
+            )
+        })?;
+        let received_at = Instant::now();
+        self.pool_metrics.total_roundtrip_nanos.fetch_add(
+            received_at
+                .saturating_duration_since(enqueued_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.pool_metrics.total_response_handoff_nanos.fetch_add(
+            received_at
+                .saturating_duration_since(result.response_sent_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let result = match result.result {
+            Ok(RuntimeThreadResult::WebSocket(commands)) => Ok(commands),
+            Ok(RuntimeThreadResult::Http(_)) => Err(RuntimePoolError::Unavailable(
+                "worker runtime returned HTTP response on a websocket path".to_string(),
+            )),
+            Err(error) => Err(error),
+        };
 
         if matches!(
             &result,
@@ -2714,6 +2877,14 @@ impl WorkerRuntimeSlot {
         self.pool_metrics.rebuilt.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    fn supports_websocket(&self) -> bool {
+        self.state
+            .lock()
+            .expect("worker runtime slot state mutex should not be poisoned")
+            .instance
+            .websocket_supported
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2747,33 +2918,12 @@ impl RuntimePoolError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeCompletionMode {
-    Auto,
-    Async,
-    Blocking,
-}
-
-impl RuntimeCompletionMode {
-    fn should_use_blocking(self) -> bool {
-        match self {
-            Self::Async => false,
-            Self::Blocking => true,
-            Self::Auto => tokio::runtime::Handle::try_current()
-                .map(|handle| matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread))
-                .unwrap_or(false),
-        }
-    }
-}
-
 pub struct WorkerRuntimePool {
     handles: Vec<WorkerRuntimeSlot>,
     next: AtomicUsize,
     metrics: Arc<RuntimePoolMetrics>,
     queue_capacity: usize,
     exec_timeout: Duration,
-    completion_mode: RuntimeCompletionMode,
 }
 
 impl WorkerRuntimePool {
@@ -2782,7 +2932,6 @@ impl WorkerRuntimePool {
         size: usize,
         queue_capacity: usize,
         exec_timeout: Duration,
-        completion_mode: RuntimeCompletionMode,
     ) -> Result<Arc<Self>> {
         let size = size.max(1);
         let queue_capacity = queue_capacity.max(1);
@@ -2794,7 +2943,6 @@ impl WorkerRuntimePool {
                 runtime_index,
                 queue_capacity,
                 exec_timeout,
-                completion_mode,
                 metrics.clone(),
             )?);
         }
@@ -2805,7 +2953,6 @@ impl WorkerRuntimePool {
             metrics,
             queue_capacity,
             exec_timeout,
-            completion_mode,
         }))
     }
 
@@ -2871,8 +3018,62 @@ impl WorkerRuntimePool {
         Err(error)
     }
 
+    pub async fn open_websocket(
+        &self,
+        ctx: WorkerWebSocketContext,
+    ) -> Result<(usize, Vec<WorkerWebSocketCommand>), RuntimePoolError> {
+        self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        let start_index = self.next.fetch_add(1, Ordering::Relaxed) % self.handles.len();
+        let mut last_error = None::<RuntimePoolError>;
+
+        for offset in 0..self.handles.len() {
+            let index = (start_index + offset) % self.handles.len();
+            match self.handles[index]
+                .execute_websocket(WorkerWebSocketEvent::Open, ctx.clone())
+                .await
+            {
+                Ok(commands) => return Ok((index, commands)),
+                Err(RuntimePoolError::Overloaded) => {
+                    last_error = Some(RuntimePoolError::Overloaded);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let error = last_error.unwrap_or(RuntimePoolError::Overloaded);
+        if error.is_overloaded() {
+            self.metrics.overloaded.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error)
+    }
+
+    pub async fn execute_websocket_on_slot(
+        &self,
+        slot_index: usize,
+        event: WorkerWebSocketEvent,
+        ctx: WorkerWebSocketContext,
+    ) -> Result<Vec<WorkerWebSocketCommand>, RuntimePoolError> {
+        self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        let handle = self.handles.get(slot_index).ok_or_else(|| {
+            RuntimePoolError::Unavailable(format!("invalid runtime slot {slot_index}"))
+        })?;
+        let result = handle.execute_websocket(event, ctx).await;
+        if matches!(result, Err(RuntimePoolError::Overloaded)) {
+            self.metrics.overloaded.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     pub fn size(&self) -> usize {
         self.handles.len()
+    }
+
+    pub fn supports_websocket(&self) -> bool {
+        self.handles
+            .first()
+            .is_some_and(WorkerRuntimeSlot::supports_websocket)
     }
 
     pub fn queue_capacity(&self) -> usize {
@@ -2881,10 +3082,6 @@ impl WorkerRuntimePool {
 
     pub fn exec_timeout(&self) -> Duration {
         self.exec_timeout
-    }
-
-    pub fn completion_mode(&self) -> RuntimeCompletionMode {
-        self.completion_mode
     }
 
     pub fn metrics_snapshot(&self) -> RuntimePoolSnapshot {
@@ -2956,7 +3153,6 @@ impl WorkerRuntimePool {
             runtime_threads: self.size(),
             queue_capacity_per_thread: self.queue_capacity(),
             exec_timeout_ms: self.exec_timeout().as_millis() as u64,
-            completion_mode: self.completion_mode(),
             submitted: self.metrics.submitted.load(Ordering::Relaxed),
             completed: self.metrics.completed.load(Ordering::Relaxed),
             failed: self.metrics.failed.load(Ordering::Relaxed),
@@ -3072,7 +3268,6 @@ pub struct RuntimePoolSnapshot {
     pub runtime_threads: usize,
     pub queue_capacity_per_thread: usize,
     pub exec_timeout_ms: u64,
-    pub completion_mode: RuntimeCompletionMode,
     pub submitted: u64,
     pub completed: u64,
     pub failed: u64,
@@ -3240,7 +3435,7 @@ impl DenoWorkerRuntime {
     async fn initialize_invocation_bridge(
         js_runtime: &mut JsRuntime,
         worker_specifier: &ModuleSpecifier,
-    ) -> Result<v8::Global<v8::Function>> {
+    ) -> Result<WorkerInvocationBridge> {
         let worker_specifier = serde_json::to_string(worker_specifier.as_str())?;
         let bridge_bootstrap_script = format!(
             r#"(async () => {{
@@ -3303,6 +3498,13 @@ impl DenoWorkerRuntime {
       : typeof workerModule.default?.fetch === "function"
         ? workerModule.default.fetch
         : null;
+  const websocketCandidate =
+    workerModule.websocket && typeof workerModule.websocket === "object"
+      ? workerModule.websocket
+      : workerModule.default?.websocket &&
+          typeof workerModule.default.websocket === "object"
+        ? workerModule.default.websocket
+        : null;
   const invokeWeb = async (requestBacking, env, ctxBase) => {{
     const request = Request._fromBacking(requestBacking);
     const waitUntilPromises = [];
@@ -3318,8 +3520,67 @@ impl DenoWorkerRuntime {
     return await normalizeWebResponse(rawResponse);
   }};
 
+  const createWebSocketContext = (ctxBase) => ({{
+    connectionId: ctxBase.connectionId,
+    workerId: ctxBase.workerId,
+    vars: ctxBase.vars ?? {{}},
+    metadata: ctxBase.metadata ?? {{}},
+    send(data) {{
+      if (typeof data !== "string") {{
+        throw new Error("websocket ctx.send() currently only supports string payloads");
+      }}
+      Deno.core.ops.op_websocket_ctx_send(data);
+    }},
+    close(code = undefined, reason = undefined) {{
+      if (code != null && (!Number.isInteger(code) || code < 0 || code > 65535)) {{
+        throw new Error("websocket ctx.close() code must be an unsigned 16-bit integer");
+      }}
+      if (reason != null && typeof reason !== "string") {{
+        reason = String(reason);
+      }}
+      Deno.core.ops.op_websocket_ctx_close(code ?? null, reason ?? null);
+    }},
+  }});
+
+  const invokeWebSocket = async (event, ctxBase) => {{
+    if (!websocketCandidate) {{
+      throw new Error("worker module does not export websocket handlers");
+    }}
+
+    const ctx = createWebSocketContext(ctxBase);
+    switch (event?.type) {{
+      case "open":
+        if (typeof websocketCandidate.onOpen === "function") {{
+          await websocketCandidate.onOpen(ctx);
+        }}
+        return;
+      case "message":
+        if (typeof websocketCandidate.onMessage === "function") {{
+          await websocketCandidate.onMessage({{ kind: "text", text: event.text }}, ctx);
+        }}
+        return;
+      case "close":
+        if (typeof websocketCandidate.onClose === "function") {{
+          await websocketCandidate.onClose(
+            {{
+              code: event.code ?? undefined,
+              reason: event.reason ?? undefined,
+              remote: Boolean(event.remote),
+            }},
+            ctx,
+          );
+        }}
+        return;
+      default:
+        throw new Error(`unsupported websocket event type: ${{event?.type}}`);
+    }}
+  }};
+
   if (typeof webCandidate === "function") {{
-    return invokeWeb;
+    return {{
+      invokeWeb,
+      invokeWebSocket: websocketCandidate ? invokeWebSocket : null,
+    }};
   }}
 
   throw new Error("worker module must export fetch(request, env, ctx)");
@@ -3335,10 +3596,33 @@ impl DenoWorkerRuntime {
         let invoke_bridge = {
             deno_core::scope!(scope, js_runtime);
             let local = v8::Local::new(scope, resolved);
-            let invoke_bridge = v8::Local::<v8::Function>::try_from(local)
-                .map_err(|_| anyhow::anyhow!("worker invocation bridge must return a function"))?;
+            let bridge_object = v8::Local::<v8::Object>::try_from(local)
+                .map_err(|_| anyhow::anyhow!("worker invocation bridge must return an object"))?;
+            let fetch_value = Self::object_property(scope, bridge_object, "invokeWeb")
+                .map_err(anyhow::Error::msg)?;
+            let fetch = v8::Local::<v8::Function>::try_from(fetch_value).map_err(|_| {
+                anyhow::anyhow!("worker invocation bridge invokeWeb must be a function")
+            })?;
+            let websocket_value = Self::object_property(scope, bridge_object, "invokeWebSocket")
+                .map_err(anyhow::Error::msg)?;
+            let websocket = if websocket_value.is_null_or_undefined() {
+                None
+            } else {
+                Some(
+                    v8::Local::<v8::Function>::try_from(websocket_value)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "worker invocation bridge invokeWebSocket must be a function"
+                            )
+                        })
+                        .map(|function| v8::Global::new(scope, function))?,
+                )
+            };
 
-            v8::Global::new(scope, invoke_bridge)
+            WorkerInvocationBridge {
+                fetch: v8::Global::new(scope, fetch),
+                websocket,
+            }
         };
         Ok(invoke_bridge)
     }
@@ -3439,6 +3723,61 @@ impl DenoWorkerRuntime {
         Ok(object.into())
     }
 
+    fn websocket_context_to_v8<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        ctx: &WorkerWebSocketContext,
+    ) -> Result<v8::Local<'s, v8::Value>> {
+        let object = v8::Object::new(scope);
+        let connection_id = Self::v8_string(scope, &ctx.connection_id)?;
+        Self::set_object_property(scope, object, "connectionId", connection_id.into())?;
+        let worker_id = Self::v8_string(scope, &ctx.worker_id)?;
+        Self::set_object_property(scope, object, "workerId", worker_id.into())?;
+        let vars = Self::string_map_to_v8_object(scope, &ctx.vars)?;
+        Self::set_object_property(scope, object, "vars", vars.into())?;
+        let metadata = Self::string_map_to_v8_object(scope, &ctx.metadata)?;
+        Self::set_object_property(scope, object, "metadata", metadata.into())?;
+        Ok(object.into())
+    }
+
+    fn websocket_event_to_v8<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        event: &WorkerWebSocketEvent,
+    ) -> Result<v8::Local<'s, v8::Value>> {
+        let object = v8::Object::new(scope);
+        match event {
+            WorkerWebSocketEvent::Open => {
+                let event_type = Self::v8_string(scope, "open")?;
+                Self::set_object_property(scope, object, "type", event_type.into())?;
+            }
+            WorkerWebSocketEvent::Message { text } => {
+                let event_type = Self::v8_string(scope, "message")?;
+                Self::set_object_property(scope, object, "type", event_type.into())?;
+                let text = Self::v8_string(scope, text)?;
+                Self::set_object_property(scope, object, "text", text.into())?;
+            }
+            WorkerWebSocketEvent::Close(event) => {
+                let event_type = Self::v8_string(scope, "close")?;
+                Self::set_object_property(scope, object, "type", event_type.into())?;
+                let code_value = event
+                    .code
+                    .map(|code| v8::Integer::new_from_unsigned(scope, code as u32).into())
+                    .unwrap_or_else(|| v8::null(scope).into());
+                Self::set_object_property(scope, object, "code", code_value)?;
+                let reason_value = event
+                    .reason
+                    .as_deref()
+                    .map(|reason| Self::v8_string(scope, reason).map(Into::into))
+                    .transpose()?
+                    .unwrap_or_else(|| v8::null(scope).into());
+                Self::set_object_property(scope, object, "reason", reason_value)?;
+                let remote = v8::Boolean::new(scope, event.remote);
+                Self::set_object_property(scope, object, "remote", remote.into())?;
+            }
+        }
+
+        Ok(object.into())
+    }
+
     fn serialize_invocation_args(
         &mut self,
         request: GatewayRequest,
@@ -3458,6 +3797,20 @@ impl DenoWorkerRuntime {
             Self::worker_context_to_v8(scope, ctx)?,
         ];
 
+        Ok(values.map(|value| v8::Global::new(scope, value)))
+    }
+
+    fn serialize_websocket_invocation_args(
+        &mut self,
+        event: &WorkerWebSocketEvent,
+        ctx: &WorkerWebSocketContext,
+    ) -> Result<[v8::Global<v8::Value>; 2]> {
+        let runtime = &mut self.js_runtime;
+        deno_core::scope!(scope, runtime);
+        let values = [
+            Self::websocket_event_to_v8(scope, event)?,
+            Self::websocket_context_to_v8(scope, ctx)?,
+        ];
         Ok(values.map(|value| v8::Global::new(scope, value)))
     }
 
@@ -3503,7 +3856,7 @@ impl DenoWorkerRuntime {
         )]
         let resolved = self
             .js_runtime
-            .call_with_args_and_await(&self.invoke_bridge, &args)
+            .call_with_args_and_await(&self.invoke_bridge.fetch, &args)
             .await
             .map_err(|error| error.to_string())?;
         let js_call_nanos = js_call_started_at.elapsed().as_nanos() as u64;
@@ -3590,6 +3943,54 @@ impl WorkerRuntime for DenoWorkerRuntime {
 }
 
 impl DenoWorkerRuntime {
+    pub fn supports_websocket(&self) -> bool {
+        self.invoke_bridge.websocket.is_some()
+    }
+
+    pub async fn invoke_websocket(
+        &mut self,
+        event: &WorkerWebSocketEvent,
+        ctx: &WorkerWebSocketContext,
+    ) -> Result<Vec<WorkerWebSocketCommand>, String> {
+        let websocket_bridge = self
+            .invoke_bridge
+            .websocket
+            .as_ref()
+            .ok_or_else(|| "worker module does not export websocket handlers".to_string())?
+            .clone();
+        {
+            let op_state = self.js_runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state
+                .borrow_mut::<WebSocketOpState>()
+                .begin_invocation()?;
+        }
+
+        let args = self
+            .serialize_websocket_invocation_args(event, ctx)
+            .map_err(|error| error.to_string())?;
+        #[allow(
+            deprecated,
+            reason = "good enough while migrating off the script bridge"
+        )]
+        let result = self
+            .js_runtime
+            .call_with_args_and_await(&websocket_bridge, &args)
+            .await
+            .map(|_| ());
+
+        let commands = {
+            let op_state = self.js_runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state
+                .borrow_mut::<WebSocketOpState>()
+                .finish_invocation()?
+        };
+
+        result.map_err(|error| error.to_string())?;
+        Ok(commands)
+    }
+
     async fn fetch_gateway(
         &mut self,
         request: GatewayRequest,
@@ -3870,6 +4271,124 @@ export function fetch(_request: Request, env: {{ worker_id: string }}) {{
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn runtime_detects_websocket_handlers_and_captures_commands() {
+        let worker_path = temp_worker_path(
+            "websocket-commands",
+            r#"
+export function fetch() {
+  return new Response("ok");
+}
+
+export const websocket = {
+  onOpen(ctx) {
+    ctx.send(`open:${ctx.connectionId}:${ctx.workerId}:${ctx.metadata.stage}:${ctx.vars.region}`);
+  },
+  onMessage(message, ctx) {
+    ctx.send(`message:${message.kind}:${message.text}`);
+    if (message.text === "bye") {
+      ctx.close(1000, "done");
+    }
+  },
+  onClose(event, ctx) {
+    ctx.send(`close:${event.code ?? "none"}:${event.reason ?? "none"}:${event.remote}`);
+  },
+};
+"#,
+        );
+        let mut runtime = DenoWorkerRuntime::new(&worker_path)
+            .await
+            .expect("websocket worker runtime should bootstrap");
+
+        assert!(runtime.supports_websocket());
+
+        let context = WorkerWebSocketContext {
+            connection_id: "conn-7".to_string(),
+            worker_id: "ws-worker".to_string(),
+            vars: [("region".to_string(), "hz".to_string())]
+                .into_iter()
+                .collect(),
+            metadata: [("stage".to_string(), "test".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let open_commands = runtime
+            .invoke_websocket(&WorkerWebSocketEvent::Open, &context)
+            .await
+            .expect("websocket onOpen should succeed");
+        assert_eq!(
+            open_commands,
+            vec![WorkerWebSocketCommand::SendText(
+                "open:conn-7:ws-worker:test:hz".to_string()
+            )]
+        );
+
+        let message_commands = runtime
+            .invoke_websocket(
+                &WorkerWebSocketEvent::Message {
+                    text: "bye".to_string(),
+                },
+                &context,
+            )
+            .await
+            .expect("websocket onMessage should succeed");
+        assert_eq!(
+            message_commands,
+            vec![
+                WorkerWebSocketCommand::SendText("message:text:bye".to_string()),
+                WorkerWebSocketCommand::Close {
+                    code: Some(1000),
+                    reason: Some("done".to_string()),
+                },
+            ]
+        );
+
+        let close_commands = runtime
+            .invoke_websocket(
+                &WorkerWebSocketEvent::Close(WorkerWebSocketCloseEvent {
+                    code: Some(1001),
+                    reason: Some("server-drain".to_string()),
+                    remote: false,
+                }),
+                &context,
+            )
+            .await
+            .expect("websocket onClose should succeed");
+        assert_eq!(
+            close_commands,
+            vec![WorkerWebSocketCommand::SendText(
+                "close:1001:server-drain:false".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_reports_when_worker_has_no_websocket_handlers() {
+        let mut runtime = DenoWorkerRuntime::new(&sample_worker_path())
+            .await
+            .expect("worker runtime should bootstrap");
+
+        assert!(!runtime.supports_websocket());
+
+        let error = runtime
+            .invoke_websocket(
+                &WorkerWebSocketEvent::Open,
+                &WorkerWebSocketContext {
+                    connection_id: "conn-1".to_string(),
+                    worker_id: "hello-worker".to_string(),
+                    vars: Default::default(),
+                    metadata: Default::default(),
+                },
+            )
+            .await
+            .expect_err("worker without websocket handlers should fail");
+        assert!(
+            error.contains("does not export websocket handlers"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reads_streaming_request_body_across_multiple_chunks() {
         let worker_path = temp_worker_path(
             "streaming-body-text",
@@ -3912,73 +4431,6 @@ export async function fetch(request: Request) {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body.as_deref(), Some("abcdefghij"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_completion_does_not_deadlock_streaming_request_body() {
-        let worker_path = temp_worker_path(
-            "blocking-completion-streaming-body",
-            r#"
-export async function fetch(request: Request) {
-  return new Response(await request.text());
-}
-"#,
-        );
-        let pool = WorkerRuntimePool::new(
-            worker_path,
-            1,
-            4,
-            Duration::from_secs(5),
-            RuntimeCompletionMode::Blocking,
-        )
-        .expect("runtime pool should initialize");
-        let (request, mut ingress_body) = GatewayRequest::streaming(WorkerRequest {
-            method: "POST".to_string(),
-            url: "http://localhost/stream".to_string(),
-            headers: [("content-length".to_string(), "4".to_string())]
-                .into_iter()
-                .collect(),
-            body: None,
-        });
-
-        let response = tokio::time::timeout(Duration::from_secs(1), async {
-            let worker_future = pool.execute_gateway(
-                request,
-                WorkerEnv {
-                    worker_id: "streaming-worker".to_string(),
-                    vars: Default::default(),
-                },
-                WorkerContext::default(),
-            );
-            tokio::pin!(worker_future);
-
-            loop {
-                tokio::select! {
-                    result = &mut worker_future => break result,
-                    command = ingress_body.command_rx.recv() => match command {
-                        Some(RequestBodyCommand::ReadNext { response_tx }) => {
-                            if ingress_body.finished {
-                                let _ = response_tx.send(Ok(None));
-                            } else {
-                                ingress_body.finished = true;
-                                let _ = response_tx.send(Ok(Some(b"ping".to_vec())));
-                            }
-                        }
-                        None => panic!("streaming request body bridge should stay open until completion"),
-                    }
-                }
-            }
-        })
-        .await
-        .expect("streaming request body should not deadlock")
-        .expect("gateway response should complete successfully");
-
-        let response = response
-            .into_worker_response()
-            .await
-            .expect("gateway response should convert back to worker response");
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body.as_deref(), Some("ping"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4045,14 +4497,8 @@ export async function fetch() {
 }
 "#,
         );
-        let pool = WorkerRuntimePool::new(
-            worker_path,
-            1,
-            4,
-            Duration::from_secs(5),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(worker_path, 1, 4, Duration::from_secs(5))
+            .expect("runtime pool should initialize");
 
         let mut response = pool
             .execute_gateway(
@@ -4111,14 +4557,8 @@ export async function fetch(_request: Request, _env: unknown, ctx: { metadata: R
 }
 "#,
         );
-        let pool = WorkerRuntimePool::new(
-            worker_path,
-            1,
-            4,
-            Duration::from_secs(5),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(worker_path, 1, 4, Duration::from_secs(5))
+            .expect("runtime pool should initialize");
 
         let response = pool
             .execute(
@@ -4530,14 +4970,8 @@ export async function fetch(_request: Request, _env: unknown, ctx: { metadata: R
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_reuses_initialized_workers() {
-        let pool = WorkerRuntimePool::new(
-            sample_worker_path(),
-            2,
-            8,
-            Duration::from_secs(5),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(sample_worker_path(), 2, 8, Duration::from_secs(5))
+            .expect("runtime pool should initialize");
         assert_eq!(pool.size(), 2);
 
         let response = pool
@@ -4584,14 +5018,8 @@ export async function fetch(_request: Request, _env: unknown, ctx: { metadata: R
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_rejects_when_all_queues_are_full() {
-        let pool = WorkerRuntimePool::new(
-            blocking_worker_path(),
-            1,
-            1,
-            Duration::from_secs(5),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(blocking_worker_path(), 1, 1, Duration::from_secs(5))
+            .expect("runtime pool should initialize");
         let request_count = 6;
         let barrier = Arc::new(Barrier::new(request_count + 1));
         let mut tasks = Vec::with_capacity(request_count);
@@ -4654,14 +5082,8 @@ export async function fetch(_request: Request, _env: unknown, ctx: { metadata: R
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_times_out_and_rebuilds_slot() {
-        let pool = WorkerRuntimePool::new(
-            flaky_worker_path(),
-            1,
-            4,
-            Duration::from_millis(100),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(flaky_worker_path(), 1, 4, Duration::from_millis(100))
+            .expect("runtime pool should initialize");
 
         let timed_out = pool
             .execute(
@@ -4720,14 +5142,8 @@ export async function fetch(_request: Request, _env: unknown, ctx: { metadata: R
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_requests_retry_cleanly_after_slot_recycles() {
-        let pool = WorkerRuntimePool::new(
-            flaky_worker_path(),
-            1,
-            4,
-            Duration::from_millis(100),
-            RuntimeCompletionMode::Auto,
-        )
-        .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(flaky_worker_path(), 1, 4, Duration::from_millis(100))
+            .expect("runtime pool should initialize");
 
         let timed_out_task = tokio::spawn({
             let pool = pool.clone();

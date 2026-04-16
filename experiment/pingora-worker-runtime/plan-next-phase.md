@@ -2,6 +2,17 @@
 
 Date: 2026-04-15
 
+Update: 2026-04-16
+
+- `release` is now mandatory for `v2` benchmark conclusions
+- HTTP completion has been collapsed to one mode: `async`
+- the `blocking` branch is no longer the HTTP optimization target
+- websocket runtime bridge is now in place inside `gateway-host`
+- Pingora websocket upgrade/session handling is now in place for the first H1 text-only slice
+- the next websocket items are breadth-first hardening, not basic bring-up
+- ingress-state now exposes first websocket counters, so the next gap is
+  end-to-end websocket smoke coverage rather than basic visibility
+
 ## Goal
 
 Turn the current ad-hoc optimization work into a tighter execution plan.
@@ -34,8 +45,8 @@ The best signal so far is:
 - watchdog synchronization rewrites can easily make the system worse
 - dispatch-level fast paths inside `execute_gateway(...)` did not show a stable
   win under same-machine reruns
-- the newly split timing strongly suggests the biggest remaining fixed cost is
-  now `response handoff / caller wakeup`, not worker invoke itself
+- the later release-mode rerun showed the old `blocking` win was not a stable
+  product direction
 
 Concrete same-day sample after adding the extra metric:
 
@@ -53,21 +64,11 @@ Interpretation:
 - that makes the current `oneshot` wakeup / cross-thread handoff path the first
   place to attack, ahead of more request-shape tweaks
 
-That attack has now been prototyped once:
+Current HTTP mainline state:
 
-- multithreaded ingress now uses blocking completion wait instead of async
-  `oneshot` wakeup
-- same-day benchmark signal improved clearly
-
-New state after that prototype:
-
-- the response-handoff bottleneck hypothesis was correct
-- the current best request-path win comes from changing completion strategy, not
-  request-shape micro-optimization
-- the next question is no longer "is wakeup expensive?"
-- it is:
-  - can we keep most of this win without paying the full
-    `block_in_place` tradeoff on longer-running workers?
+- only the async completion path remains
+- request-path tuning should now be evaluated only on the async mainline
+- future work should not spend more time on `block_in_place` tradeoffs
 
 The invocation envelope has now also been split more finely.
 
@@ -254,10 +255,9 @@ The next practical move is no longer "measure more first".
 
 It is:
 
-- decide whether to keep the new blocking completion path as-is for the current
-  small-scale experiment
-- or replace it with a more scalable low-wakeup completion design that keeps
-  most of the gain
+- keep the HTTP path on the async mainline
+- remove dead-end complexity from the temporary blocking branch
+- spend the next optimization cycles only on the async request path
 
 ## Phase 3
 

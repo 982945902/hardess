@@ -12,6 +12,101 @@ It exists to answer a narrower question:
 
 - after each optimization round, did the HTTP request path actually get better?
 
+## WebSocket note
+
+The mainline entries in this file are still the HTTP request-path benchmark.
+
+For WebSocket, the experiment now also has a first benchmark scaffold:
+
+- Pingora worker target:
+  - `workers/benchmark_websocket/mod.ts`
+- Bun native baseline target:
+  - `bench/bun_native_websocket.ts`
+- shared round-trip client:
+  - `bench/ws_roundtrip.ts`
+
+The intended comparison rule is:
+
+- same host machine
+- same client script
+- same connection count
+- same messages per connection
+- same echo semantics
+- Rust side must still use `release`
+
+Suggested commands:
+
+- Pingora worker target:
+  - `cargo build --release -p gateway-host --bin pingora_ingress`
+  - `./experiment/pingora-worker-runtime/target/release/pingora_ingress experiment/pingora-worker-runtime/workers/benchmark_websocket/mod.ts --listen 127.0.0.1:6190 --worker-id ws-bench --runtime-threads 1 --queue-capacity 64 --exec-timeout-ms 5000`
+  - `WS_BENCH_URL=ws://127.0.0.1:6190/ws bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+- Bun native baseline:
+  - `BUN_NATIVE_WS_PORT=6191 bun run experiment/pingora-worker-runtime/bench/bun_native_websocket.ts`
+  - `WS_BENCH_URL=ws://127.0.0.1:6191 bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+
+This benchmark should be read as:
+
+- first compare transport/runtime fixed cost on the same echo workload
+- only then compare richer application semantics
+
+### WebSocket baseline sample
+
+Date: 2026-04-16
+
+Measured shape:
+
+- host machine: same local machine, sequential runs
+- Pingora binary: `target/release/pingora_ingress`
+- warmup: `1` run
+- measured: `3` runs
+- connections: `50`
+- messages per connection: `200`
+- total messages per run: `10,000`
+- worker/runtime threads on Pingora side: `1`
+- echo semantics: text frame in, same text frame out
+
+Measured commands:
+
+- Pingora worker target:
+  - `cargo build --release --manifest-path experiment/pingora-worker-runtime/Cargo.toml -p gateway-host --bin pingora_ingress`
+  - `./experiment/pingora-worker-runtime/target/release/pingora_ingress experiment/pingora-worker-runtime/workers/benchmark_websocket/mod.ts --listen 127.0.0.1:6190 --worker-id ws-bench --runtime-threads 1 --queue-capacity 64 --exec-timeout-ms 5000`
+  - `WS_BENCH_URL=ws://127.0.0.1:6190/ws WS_BENCH_CONNECTIONS=50 WS_BENCH_MESSAGES_PER_CONNECTION=200 bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+- Bun native baseline:
+  - `BUN_NATIVE_WS_PORT=6191 bun run experiment/pingora-worker-runtime/bench/bun_native_websocket.ts`
+  - `WS_BENCH_URL=ws://127.0.0.1:6191 WS_BENCH_CONNECTIONS=50 WS_BENCH_MESSAGES_PER_CONNECTION=200 bun run experiment/pingora-worker-runtime/bench/ws_roundtrip.ts`
+
+Average of 3 measured runs:
+
+| Case | Msg/s | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| `pingora-v2-ws` | `58,113` | `0.821 ms` | `1.074 ms` | `1.558 ms` |
+| `bun-native-ws` | `83,515` | `0.549 ms` | `0.837 ms` | `1.278 ms` |
+
+Raw measured runs:
+
+- `pingora-v2-ws`
+  - run1: `56,516 msg/s`, `p50 0.838 ms`, `p90 1.179 ms`, `p99 1.866 ms`
+  - run2: `59,752 msg/s`, `p50 0.814 ms`, `p90 1.034 ms`, `p99 1.474 ms`
+  - run3: `58,070 msg/s`, `p50 0.812 ms`, `p90 1.008 ms`, `p99 1.335 ms`
+- `bun-native-ws`
+  - run1: `96,016 msg/s`, `p50 0.461 ms`, `p90 0.684 ms`, `p99 1.096 ms`
+  - run2: `78,912 msg/s`, `p50 0.582 ms`, `p90 0.893 ms`, `p99 1.461 ms`
+  - run3: `75,618 msg/s`, `p50 0.606 ms`, `p90 0.933 ms`, `p99 1.278 ms`
+
+Gap summary:
+
+- `pingora-v2-ws / bun-native-ws`
+  - throughput: `0.696x`
+  - p50: `1.50x`
+  - p99: `1.22x`
+
+Interpretation:
+
+- this first WS path is already in the right order of magnitude
+- Pingora worker WS echo is slower than Bun native, but not by an order of magnitude
+- the next optimization focus should stay on the Rust <-> runtime event bridge and session scheduling path
+- all conclusions above are based on `release` build only; `debug` samples are not comparable
+
 ## Benchmark rule
 
 To keep the result comparable, use the same envelope every time unless the log
@@ -23,6 +118,8 @@ explicitly says otherwise.
   - run `target/release/pingora_ingress`
   - `debug` numbers are allowed only for temporary diagnosis and must not be
     used for `v1` vs `v2` conclusions
+- current HTTP benchmark mainline is `v2-async`
+  - old `blocking` samples are kept only as historical experiment records
 - same load generator:
   - [http.ts](/Users/lishuo121/hardess/src/load/http.ts)
 - sequential benchmark runs, not concurrent benchmark runs
@@ -431,9 +528,9 @@ Benchmark shape:
 - measured `50 x 5000`
 - `v2` runtime threads `= 1`
 - `v2-async`
-  - `target/release/pingora_ingress --completion-mode async`
+  - current async mainline
 - `v2-blocking`
-  - `target/release/pingora_ingress --completion-mode blocking`
+  - historical A/B sample before removing the blocking branch
 - `v1-short`
   - `bun run src/runtime/server.ts`
 
@@ -469,6 +566,7 @@ Benchmark shape:
 - on a fairer release-vs-release-style comparison, `v2-async` is already close
   to `v1-short`
 - `v2-blocking` still loses to `v2-async`, so `async` remains the mainline
+- the blocking branch has since been removed from the HTTP path
 - the short-circuit HTTP path no longer shows a large structural gap between
   `v2-async` and `v1`
 
