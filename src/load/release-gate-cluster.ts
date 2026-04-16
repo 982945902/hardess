@@ -15,9 +15,13 @@ interface ManagedProcess {
   stderr: string[];
 }
 
+type ListenerMode = "single" | "dual";
+
 export interface ClusterReleaseGateOptions {
   nodeAPort?: number;
   nodeBPort?: number;
+  nodeAInternalPort?: number;
+  nodeBInternalPort?: number;
   upstreamPort?: number;
   readyTimeoutMs?: number;
   sharedSecret?: string;
@@ -27,12 +31,16 @@ export interface ClusterReleaseGateOptions {
   sendIntervalMs?: number;
   completionTimeoutMs?: number;
   metricsSink?: string;
+  listenerMode?: ListenerMode;
 }
 
 export interface ClusterReleaseGateResult {
   ok: true;
+  listenerMode: ListenerMode;
   nodeAPort: number;
   nodeBPort: number;
+  nodeAInternalPort?: number;
+  nodeBInternalPort?: number;
   upstreamPort: number;
   clusterWsLoad: Awaited<ReturnType<typeof runClusterWsLoadTest>>;
   slo: {
@@ -153,13 +161,32 @@ async function validatePrometheus(baseUrl: string): Promise<void> {
   }
 }
 
+function readListenerMode(raw: string | undefined, fallback: ListenerMode): ListenerMode {
+  if (!raw) {
+    return fallback;
+  }
+
+  if (raw === "single" || raw === "dual") {
+    return raw;
+  }
+
+  throw new Error(`Invalid listener mode: ${raw}`);
+}
+
 export async function runClusterReleaseGate(
   overrides: ClusterReleaseGateOptions = {}
 ): Promise<ClusterReleaseGateResult> {
   applyClusterReleaseGateProfile(envString("CLUSTER_RELEASE_GATE_PROFILE", "default"));
   const clusterReleaseGateSloProfile = envString("CLUSTER_RELEASE_GATE_SLO_PROFILE", "default");
+  const listenerMode = overrides.listenerMode ?? readListenerMode(envString("CLUSTER_RELEASE_GATE_LISTENER_MODE", "single"), "single");
   const nodeAPort = overrides.nodeAPort ?? envNumber("CLUSTER_RELEASE_GATE_PORT_A", 3200);
   const nodeBPort = overrides.nodeBPort ?? envNumber("CLUSTER_RELEASE_GATE_PORT_B", 3201);
+  const nodeAInternalPort = listenerMode === "dual"
+    ? overrides.nodeAInternalPort ?? envNumber("CLUSTER_RELEASE_GATE_INTERNAL_PORT_A", nodeAPort + 2)
+    : undefined;
+  const nodeBInternalPort = listenerMode === "dual"
+    ? overrides.nodeBInternalPort ?? envNumber("CLUSTER_RELEASE_GATE_INTERNAL_PORT_B", nodeBPort + 2)
+    : undefined;
   const upstreamPort = overrides.upstreamPort ?? envNumber("CLUSTER_RELEASE_GATE_UPSTREAM_PORT", 9200);
   const readyTimeoutMs = overrides.readyTimeoutMs ?? envNumber("CLUSTER_RELEASE_GATE_READY_TIMEOUT_MS", 10_000);
   const sharedSecret = overrides.sharedSecret ?? envString("CLUSTER_RELEASE_GATE_SHARED_SECRET", "hardess-cluster-secret");
@@ -214,45 +241,75 @@ export async function runClusterReleaseGate(
 
     nodeA = spawnManagedProcess("runtime-node-a", ["run", "src/runtime/server.ts"], {
       NODE_ID: "node-a",
-      PORT: String(nodeAPort),
+      ...(listenerMode === "dual"
+        ? {
+            PUBLIC_PORT: String(nodeAPort),
+            INTERNAL_PORT: String(nodeAInternalPort),
+            PUBLIC_ALLOWED_PATH_PREFIXES: "/ws,/demo",
+            INTERNAL_ALLOWED_PATH_PREFIXES: "/__admin,/__cluster"
+          }
+        : {
+            PORT: String(nodeAPort)
+          }),
       CONFIG_MODULE_PATH: configPath,
       CLUSTER_TRANSPORT: "ws",
       CLUSTER_SHARED_SECRET: sharedSecret,
-      CLUSTER_PEERS_JSON: JSON.stringify([{ nodeId: "node-b", baseUrl: `http://127.0.0.1:${nodeBPort}` }]),
+      CLUSTER_PEERS_JSON: JSON.stringify([
+        {
+          nodeId: "node-b",
+          baseUrl: `http://127.0.0.1:${listenerMode === "dual" ? nodeBInternalPort : nodeBPort}`
+        }
+      ]),
       METRICS_SINK: metricsSink
     });
 
     nodeB = spawnManagedProcess("runtime-node-b", ["run", "src/runtime/server.ts"], {
       NODE_ID: "node-b",
-      PORT: String(nodeBPort),
+      ...(listenerMode === "dual"
+        ? {
+            PUBLIC_PORT: String(nodeBPort),
+            INTERNAL_PORT: String(nodeBInternalPort),
+            PUBLIC_ALLOWED_PATH_PREFIXES: "/ws,/demo",
+            INTERNAL_ALLOWED_PATH_PREFIXES: "/__admin,/__cluster"
+          }
+        : {
+            PORT: String(nodeBPort)
+          }),
       CONFIG_MODULE_PATH: configPath,
       CLUSTER_TRANSPORT: "ws",
       CLUSTER_SHARED_SECRET: sharedSecret,
-      CLUSTER_PEERS_JSON: JSON.stringify([{ nodeId: "node-a", baseUrl: `http://127.0.0.1:${nodeAPort}` }]),
+      CLUSTER_PEERS_JSON: JSON.stringify([
+        {
+          nodeId: "node-a",
+          baseUrl: `http://127.0.0.1:${listenerMode === "dual" ? nodeAInternalPort : nodeAPort}`
+        }
+      ]),
       METRICS_SINK: metricsSink
     });
 
-    const nodeABaseUrl = `http://127.0.0.1:${nodeAPort}`;
-    const nodeBBaseUrl = `http://127.0.0.1:${nodeBPort}`;
+    const nodeAPublicBaseUrl = `http://127.0.0.1:${nodeAPort}`;
+    const nodeBPublicBaseUrl = `http://127.0.0.1:${nodeBPort}`;
+    const nodeAInternalBaseUrl = `http://127.0.0.1:${nodeAInternalPort ?? nodeAPort}`;
+    const nodeBInternalBaseUrl = `http://127.0.0.1:${nodeBInternalPort ?? nodeBPort}`;
     const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
     await Promise.all([
       waitForHttpOk(`${upstreamBaseUrl}/`, readyTimeoutMs),
-      waitForReady(`${nodeABaseUrl}/__admin/ready`, readyTimeoutMs),
-      waitForReady(`${nodeBBaseUrl}/__admin/ready`, readyTimeoutMs)
+      waitForReady(`${nodeAInternalBaseUrl}/__admin/ready`, readyTimeoutMs),
+      waitForReady(`${nodeBInternalBaseUrl}/__admin/ready`, readyTimeoutMs)
     ]);
 
     await Promise.all([
-      validateClusterPeers(nodeABaseUrl, "node-a"),
-      validateClusterPeers(nodeBBaseUrl, "node-b"),
-      validatePrometheus(nodeABaseUrl),
-      validatePrometheus(nodeBBaseUrl)
+      validateClusterPeers(nodeAInternalBaseUrl, "node-a"),
+      validateClusterPeers(nodeBInternalBaseUrl, "node-b"),
+      validatePrometheus(nodeAInternalBaseUrl),
+      validatePrometheus(nodeBInternalBaseUrl)
     ]);
 
     clusterWsLoad = await runClusterWsLoadTest({
       senderWsUrl: `ws://127.0.0.1:${nodeAPort}/ws`,
       receiverWsUrl: `ws://127.0.0.1:${nodeBPort}/ws`,
-      senderAdminBaseUrl: nodeABaseUrl,
-      receiverAdminBaseUrl: nodeBBaseUrl,
+      senderAdminBaseUrl: nodeAInternalBaseUrl,
+      receiverAdminBaseUrl: nodeBInternalBaseUrl,
       senderCount,
       receiverCount,
       messagesPerSender,
@@ -302,8 +359,11 @@ export async function runClusterReleaseGate(
 
     return {
       ok: true,
+      listenerMode,
       nodeAPort,
       nodeBPort,
+      nodeAInternalPort,
+      nodeBInternalPort,
       upstreamPort,
       clusterWsLoad,
       slo: {

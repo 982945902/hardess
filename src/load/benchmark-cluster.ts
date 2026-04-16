@@ -3,6 +3,8 @@ import { envNumber, envString, parseErrorPayload, summarizeSeries } from "./shar
 import { runClusterReleaseGate } from "./release-gate-cluster.ts";
 import { applyClusterBenchmarkProfile } from "./profiles.ts";
 
+type ListenerMode = "single" | "dual";
+
 interface BenchmarkSloViolation {
   metric: string;
   actual: number;
@@ -112,6 +114,14 @@ const completionTimeoutMs = envNumber("BENCH_CLUSTER_COMPLETION_TIMEOUT_MS", 40_
 const portBase = envNumber("BENCH_CLUSTER_PORT_BASE", 3400);
 const upstreamPortBase = envNumber("BENCH_CLUSTER_UPSTREAM_PORT_BASE", 9400);
 const sendIntervalMs = envNumber("BENCH_CLUSTER_SEND_INTERVAL_MS", 0);
+const listenerMode = (() => {
+  const raw = envString("BENCH_CLUSTER_LISTENER_MODE", "single");
+  if (raw === "single" || raw === "dual") {
+    return raw as ListenerMode;
+  }
+
+  throw new Error(`Invalid BENCH_CLUSTER_LISTENER_MODE: ${raw}`);
+})();
 const wsRateLimitWindowMs = envNumber("WS_RATE_LIMIT_WINDOW_MS", 1_000);
 const wsRateLimitMaxMessages = envNumber("WS_RATE_LIMIT_MAX_MESSAGES", 100);
 const sloThresholds = readClusterWsGateSloThresholds("BENCH_CLUSTER", benchmarkSloProfile);
@@ -134,15 +144,18 @@ for (const [scenarioIndex, messagesPerSender] of scenarioValues.entries()) {
   let firstSloFailure: BenchmarkScenarioResult["firstSloFailure"] | undefined;
 
   for (let runIndex = 0; runIndex < runsPerScenario; runIndex += 1) {
-    const portOffset = scenarioIndex * 20 + runIndex * 3;
+    const portOffset = scenarioIndex * 40 + runIndex * 5;
     console.error(
-      `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} status=starting`
+      `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} listenerMode=${listenerMode} status=starting`
     );
 
     try {
       const result = await runClusterReleaseGate({
+        listenerMode,
         nodeAPort: portBase + portOffset,
         nodeBPort: portBase + portOffset + 1,
+        nodeAInternalPort: listenerMode === "dual" ? portBase + portOffset + 2 : undefined,
+        nodeBInternalPort: listenerMode === "dual" ? portBase + portOffset + 3 : undefined,
         upstreamPort: upstreamPortBase + portOffset,
         senderCount,
         receiverCount,
@@ -184,7 +197,7 @@ for (const [scenarioIndex, messagesPerSender] of scenarioValues.entries()) {
         elapsedMs: summary.elapsedMs
       });
       console.error(
-        `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} ` +
+        `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} listenerMode=${listenerMode} ` +
           `status=ok throughput=${summary.messagesPerSecond.toFixed(2)} recvAckP99Ms=${summary.recvAckLatencyMs.p99Ms.toFixed(2)} ` +
           `handleAckP99Ms=${summary.handleAckLatencyMs.p99Ms.toFixed(2)} routeCacheRetry=${summary.routeCacheRetryCount} ` +
           `httpFallback=${summary.clusterHttpFallbackCount} egressOverflow=${summary.clusterEgressOverflowCount} ` +
@@ -203,7 +216,7 @@ for (const [scenarioIndex, messagesPerSender] of scenarioValues.entries()) {
         error: parsedError
       });
       console.error(
-        `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} status=failed ` +
+        `[bench:cluster] scenario=${messagesPerSender} run=${runIndex + 1}/${runsPerScenario} listenerMode=${listenerMode} status=failed ` +
           `error=${JSON.stringify(parsedError)}`
       );
     }
@@ -254,21 +267,22 @@ console.log(
         sendIntervalMs,
         completionTimeoutMs,
         scenarioValues,
-          benchmarkProfile,
-          benchmarkSloProfile,
-          websocketPolicy: {
-            rateLimitWindowMs: wsRateLimitWindowMs,
-            rateLimitMaxMessages: wsRateLimitMaxMessages
-          },
-          sloThresholds: {
-            maxRecvAckP99Ms: sloThresholds.maxRecvAckP99Ms ?? null,
-            maxHandleAckP99Ms: sloThresholds.maxHandleAckP99Ms ?? null,
-            maxRouteCacheRetryCount: sloThresholds.maxRouteCacheRetryCount ?? null,
-            maxClusterHttpFallbackCount: sloThresholds.maxHttpFallbackCount ?? null,
-            maxClusterEgressOverflowCount: sloThresholds.maxEgressOverflowCount ?? null,
-            maxClusterEgressBackpressureCount: sloThresholds.maxEgressBackpressureCount ?? null,
-            maxSysErrCount: sloThresholds.maxSysErrCount ?? null
-          }
+        listenerMode,
+        benchmarkProfile,
+        benchmarkSloProfile,
+        websocketPolicy: {
+          rateLimitWindowMs: wsRateLimitWindowMs,
+          rateLimitMaxMessages: wsRateLimitMaxMessages
+        },
+        sloThresholds: {
+          maxRecvAckP99Ms: sloThresholds.maxRecvAckP99Ms ?? null,
+          maxHandleAckP99Ms: sloThresholds.maxHandleAckP99Ms ?? null,
+          maxRouteCacheRetryCount: sloThresholds.maxRouteCacheRetryCount ?? null,
+          maxClusterHttpFallbackCount: sloThresholds.maxHttpFallbackCount ?? null,
+          maxClusterEgressOverflowCount: sloThresholds.maxEgressOverflowCount ?? null,
+          maxClusterEgressBackpressureCount: sloThresholds.maxEgressBackpressureCount ?? null,
+          maxSysErrCount: sloThresholds.maxSysErrCount ?? null
+        }
       },
       summary: {
         stablePrefixUpToMessagesPerSender: (() => {

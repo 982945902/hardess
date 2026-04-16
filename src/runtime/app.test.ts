@@ -88,6 +88,202 @@ describe("createRuntimeApp", () => {
     expect(response?.status).toBe(426);
   });
 
+  it("keeps the default listener unrestricted for backward compatibility", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+
+    const defaultAdmin = await app.fetch(
+      new Request("http://localhost/__admin/health"),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "default"
+      }
+    );
+    const defaultWs = await app.fetch(
+      new Request("http://localhost/ws"),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "internal"
+      }
+    );
+
+    expect(defaultAdmin?.status).toBe(200);
+    expect(defaultWs?.status).toBe(426);
+  });
+
+  it("keeps __admin and __cluster internal-only even without listener path policies", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+
+    const publicAdmin = await app.fetch(
+      new Request("http://localhost/__admin/health"),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+    const publicCluster = await app.fetch(
+      new Request("http://localhost/__cluster/locate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          peerIds: ["alice"]
+        })
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+
+    expect(publicAdmin?.status).toBe(404);
+    expect(publicCluster?.status).toBe(404);
+  });
+
+  it("accepts cluster websocket upgrade only on the internal listener", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics()
+    });
+    appDisposers.push(() => app.dispose());
+
+    const publicResponse = await app.fetch(
+      new Request("http://localhost/__cluster/ws"),
+      {
+        upgrade() {
+          return true;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+
+    let internalUpgradeData: unknown;
+    const internalResponse = await app.fetch(
+      new Request("http://localhost/__cluster/ws"),
+      {
+        upgrade(_request, options) {
+          internalUpgradeData = options?.data;
+          return true;
+        }
+      },
+      {
+        listener: "internal"
+      }
+    );
+
+    expect(publicResponse?.status).toBe(404);
+    expect(internalResponse).toBeUndefined();
+    expect((internalUpgradeData as { kind?: string } | undefined)?.kind).toBe("cluster");
+  });
+
+  it("applies listener path policies only when configured", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts",
+      metrics: new InMemoryMetrics(),
+      listeners: {
+        public: {
+          allowedPathPrefixes: ["/ws", "/demo"]
+        },
+        internal: {
+          allowedPathPrefixes: ["/__admin", "/__cluster"]
+        }
+      }
+    });
+    appDisposers.push(() => app.dispose());
+
+    const publicAdmin = await app.fetch(
+      new Request("http://localhost/__admin/health"),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+    const publicBusiness = await app.fetch(
+      new Request("http://localhost/demo/health", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+    const internalCluster = await app.fetch(
+      new Request("http://localhost/__cluster/locate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          peerIds: ["alice"]
+        })
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "internal"
+      }
+    );
+    const internalBusiness = await app.fetch(
+      new Request("http://localhost/demo/health", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      {
+        upgrade() {
+          return false;
+        }
+      },
+      {
+        listener: "internal"
+      }
+    );
+
+    expect(publicAdmin?.status).toBe(404);
+    expect(publicBusiness?.status).toBe(200);
+    expect(internalCluster?.status).toBe(200);
+    expect(internalBusiness?.status).toBe(404);
+  });
+
   it("exposes admin health, readiness, and metrics endpoints", async () => {
     const app = await createRuntimeApp({
       configModulePath: "./config/hardess.config.ts",
@@ -337,7 +533,7 @@ describe("createRuntimeApp", () => {
 
   it("routes websocket traffic across two runtime nodes through cluster relay", async () => {
     interface TestSocket {
-      data: { connId: string };
+      data: Record<string, unknown> & { connId: string };
       sent: string[];
       closed?: { code?: number; reason?: string };
       send(data: string): number;
@@ -362,6 +558,34 @@ describe("createRuntimeApp", () => {
       };
     }
 
+    async function openClientSocketThroughPublicListener(
+      app: Awaited<ReturnType<typeof createRuntimeApp>>,
+      connId: string
+    ): Promise<TestSocket> {
+      let upgradeData: unknown;
+      const response = await app.fetch(
+        new Request("http://localhost/ws"),
+        {
+          upgrade(_request, options) {
+            upgradeData = options?.data;
+            return true;
+          }
+        },
+        {
+          listener: "public"
+        }
+      );
+
+      expect(response).toBeUndefined();
+      const socket = createSocket(connId);
+      socket.data = {
+        ...(upgradeData as Record<string, unknown>),
+        connId
+      };
+      app.websocket.open(socket);
+      return socket;
+    }
+
     let appA: Awaited<ReturnType<typeof createRuntimeApp>>;
     let appB: Awaited<ReturnType<typeof createRuntimeApp>>;
     const upgradeRef = {
@@ -371,11 +595,15 @@ describe("createRuntimeApp", () => {
     };
     const fetchA = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      return await appB.fetch(new Request(url, init), upgradeRef);
+      return await appB.fetch(new Request(url, init), upgradeRef, {
+        listener: "internal"
+      });
     }) as unknown as typeof fetch;
     const fetchB = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      return await appA.fetch(new Request(url, init), upgradeRef);
+      return await appA.fetch(new Request(url, init), upgradeRef, {
+        listener: "internal"
+      });
     }) as unknown as typeof fetch;
 
     appA = await createRuntimeApp({
@@ -401,10 +629,8 @@ describe("createRuntimeApp", () => {
     appDisposers.push(() => appA.dispose());
     appDisposers.push(() => appB.dispose());
 
-    const alice = createSocket("conn-alice");
-    const bob = createSocket("conn-bob");
-    appA.websocket.open(alice);
-    appB.websocket.open(bob);
+    const alice = await openClientSocketThroughPublicListener(appA, "conn-alice");
+    const bob = await openClientSocketThroughPublicListener(appB, "conn-bob");
 
     await appA.websocket.message(
       alice,

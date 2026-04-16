@@ -54,11 +54,27 @@ export interface RuntimeAppOptions {
     };
     shutdownGraceMs?: number;
   };
+  listeners?: {
+    public?: {
+      allowedPathPrefixes?: string[];
+    };
+    internal?: {
+      allowedPathPrefixes?: string[];
+    };
+  };
 }
 
 export interface UpgradeServerRef {
   upgrade(request: Request, options?: { data?: unknown }): boolean;
 }
+
+export type RuntimeListenerName = "default" | "public" | "internal";
+
+interface RuntimeRequestContext {
+  listener?: RuntimeListenerName;
+}
+
+const INTERNAL_ONLY_PATH_PREFIXES = ["/__admin", "/__cluster"];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -195,6 +211,28 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     };
   }
 
+  function isPathAllowedOnListener(pathname: string, listener: RuntimeListenerName): boolean {
+    if (listener === "default") {
+      return true;
+    }
+
+    const isInternalOnlyPath = INTERNAL_ONLY_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+    if (isInternalOnlyPath) {
+      return listener === "internal";
+    }
+
+    const allowedPathPrefixes =
+      listener === "public"
+        ? options.listeners?.public?.allowedPathPrefixes
+        : options.listeners?.internal?.allowedPathPrefixes;
+
+    if (allowedPathPrefixes === undefined) {
+      return true;
+    }
+
+    return allowedPathPrefixes.some((prefix) => pathname.startsWith(prefix));
+  }
+
   return {
     logger,
     metrics,
@@ -246,8 +284,24 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       websocket.dispose();
       clusterNetwork.dispose();
     },
-    async fetch(request: Request, serverRef: UpgradeServerRef): Promise<Response | undefined> {
+    async fetch(
+      request: Request,
+      serverRef: UpgradeServerRef,
+      context: RuntimeRequestContext = {}
+    ): Promise<Response | undefined> {
       const url = new URL(request.url);
+      const listener = context.listener ?? "default";
+
+      if (!isPathAllowedOnListener(url.pathname, listener)) {
+        return json(
+          {
+            ok: false,
+            error: "Path is not exposed on this listener",
+            listener
+          },
+          { status: 404 }
+        );
+      }
 
       if (url.pathname === "/__admin/health") {
         return json({

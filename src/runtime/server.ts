@@ -1,4 +1,4 @@
-import { createRuntimeApp } from "./app.ts";
+import { createRuntimeApp, type RuntimeListenerName } from "./app.ts";
 import { parseClusterPeersEnv, parseClusterTransportEnv } from "./cluster/schema.ts";
 import { MetricsAlertMonitor, type MetricsAlertThresholds } from "./observability/alerts.ts";
 import { ConsoleLogger } from "./observability/logger.ts";
@@ -40,6 +40,18 @@ function envNumber(name: string): number | undefined {
 
 function envString(name: string): string | undefined {
   return processEnv[name];
+}
+
+function envPathPrefixes(name: string): string[] | undefined {
+  const value = envString(name);
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 function parseClusterPeers() {
@@ -89,9 +101,36 @@ function hasAlertThresholds(thresholds: MetricsAlertThresholds): boolean {
   return Object.values(thresholds).some((value) => value !== undefined);
 }
 
+function createListenConfig(): {
+  publicPort: number;
+  internalPort?: number;
+  publicAllowedPathPrefixes?: string[];
+  internalAllowedPathPrefixes?: string[];
+  singleListenerName: RuntimeListenerName;
+} {
+  const publicPort = envNumber("PUBLIC_PORT") ?? envNumber("PORT") ?? 3000;
+  const internalPort = envNumber("INTERNAL_PORT");
+  const publicAllowedPathPrefixes = envPathPrefixes("PUBLIC_ALLOWED_PATH_PREFIXES");
+  const internalAllowedPathPrefixes = envPathPrefixes("INTERNAL_ALLOWED_PATH_PREFIXES");
+  const hasNamedListenerConfig =
+    processEnv.PUBLIC_PORT !== undefined ||
+    processEnv.INTERNAL_PORT !== undefined ||
+    publicAllowedPathPrefixes !== undefined ||
+    internalAllowedPathPrefixes !== undefined;
+
+  return {
+    publicPort,
+    internalPort: internalPort !== undefined && internalPort !== publicPort ? internalPort : undefined,
+    publicAllowedPathPrefixes,
+    internalAllowedPathPrefixes,
+    singleListenerName: hasNamedListenerConfig ? "public" : "default"
+  };
+}
+
 try {
   const { sink: metrics, mode: metricsMode } = createMetricsSink();
   const websocketShutdownGraceMs = envNumber("WS_SHUTDOWN_GRACE_MS") ?? 3_000;
+  const listenConfig = createListenConfig();
   const app = await createRuntimeApp({
     configModulePath: processEnv.CONFIG_MODULE_PATH,
     nodeId: envString("NODE_ID") ?? "local",
@@ -129,16 +168,38 @@ try {
           }
         : undefined,
       shutdownGraceMs: websocketShutdownGraceMs
+    },
+    listeners: {
+      public: {
+        allowedPathPrefixes: listenConfig.publicAllowedPathPrefixes
+      },
+      internal: {
+        allowedPathPrefixes: listenConfig.internalAllowedPathPrefixes
+      }
     }
   });
 
-  const server = Bun.serve({
-    port: Number(processEnv.PORT ?? 3000),
+  const publicServer = Bun.serve({
+    port: listenConfig.publicPort,
     async fetch(request, serverRef) {
-      return app.fetch(request, serverRef);
+      return app.fetch(request, serverRef, {
+        listener: listenConfig.singleListenerName
+      });
     },
     websocket: app.websocket
   });
+  const internalServer = listenConfig.internalPort === undefined
+    ? undefined
+    : Bun.serve({
+        port: listenConfig.internalPort,
+        async fetch(request, serverRef) {
+          return app.fetch(request, serverRef, {
+            listener: "internal"
+          });
+        },
+        websocket: app.websocket
+      });
+  const servers = [publicServer, internalServer].filter((server): server is typeof publicServer => server !== undefined);
 
   const alertWindowMs = envNumber("ALERT_WINDOW_MS") ?? 30_000;
   const alertThresholds = createAlertThresholds();
@@ -157,7 +218,12 @@ try {
     : undefined;
 
   app.logger.info("hardess runtime listening", {
-    port: server.port,
+    publicPort: publicServer.port,
+    internalPort: internalServer?.port,
+    listenerMode: internalServer ? "dual" : "single",
+    singleListenerName: internalServer ? undefined : listenConfig.singleListenerName,
+    publicAllowedPathPrefixes: listenConfig.publicAllowedPathPrefixes,
+    internalAllowedPathPrefixes: listenConfig.internalAllowedPathPrefixes,
     metricsMode,
     configModulePath: processEnv.CONFIG_MODULE_PATH ?? "./config/hardess.config.ts",
     nodeId: envString("NODE_ID") ?? "local",
@@ -191,7 +257,7 @@ try {
 
     const forceStopTimer = setTimeout(() => {
       app.logger.info("forcing hardess runtime shutdown", { signal });
-      void server.stop(true);
+      void Promise.allSettled(servers.map((server) => server.stop(true)));
     }, gracefulShutdownTimeoutMs);
 
     try {
@@ -208,7 +274,7 @@ try {
           inFlightHttpRequests: app.runtimeState().inFlightHttpRequests
         });
       }
-      await server.stop();
+      await Promise.all(servers.map((server) => server.stop()));
       app.logger.info("hardess runtime stopped", { signal });
     } catch (error) {
       app.logger.error("hardess runtime shutdown failed", {

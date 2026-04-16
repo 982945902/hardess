@@ -59,12 +59,13 @@ Implemented in repository:
 7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
 8. Runtime metrics now include bounded snapshot support for server mode, HTTP/worker/proxy/WebSocket-side counters and timings, cluster-transport counters for internal WS channels, threshold-based structured alert logging over configurable windows, and Prometheus text export for external scraping.
 9. Runtime admin endpoints now exist for `__admin/health`, `__admin/ready`, `__admin/metrics`, `__admin/metrics/prometheus`, and `__admin/cluster/peers`, and the Bun server path supports graceful shutdown signaling with an explicit drain window before stop/dispose.
-10. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional or profile-driven SLO thresholds, optional Toxiproxy weak-network simulation, repo-level workflow entrypoints, tuned single-node plus cluster high-load benchmark profiles with optional or profile-driven SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
-11. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
-12. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/internal HTTP/admin response validation, business protocol payloads, and worker result validation.
-13. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
-14. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, immediate tracked-send failure on transport close, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
-15. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, and schema validation boundaries.
+10. The runtime server now supports an optional dual-listener deployment shape: one shared `RuntimeApp` can serve a public listener and an internal listener simultaneously, with optional per-listener path-prefix policies and permissive defaults when those policies are unset.
+11. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional or profile-driven SLO thresholds, optional Toxiproxy weak-network simulation, repo-level workflow entrypoints, tuned single-node plus cluster high-load benchmark profiles with optional or profile-driven SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
+12. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
+13. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/internal HTTP/admin response validation, business protocol payloads, and worker result validation.
+14. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
+15. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, immediate tracked-send failure on transport close, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
+16. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, listener-policy behavior, and schema validation boundaries.
 
 Implementation checklist by module:
 
@@ -290,7 +291,7 @@ Rules:
 1. All `peerId -> ConnRef[]` expansion must go through `PeerLocator`.
 2. The current repo ships two implementations: local in-memory lookup for single-node mode and a static-peer distributed lookup that merges local indexes with cached remote lookups.
 3. `ConnRef` always includes `nodeId`, even in single-node mode.
-4. Cluster peer membership is currently static and configured per node; stronger distributed coordination can replace this without changing protocol hooks or SDK contracts.
+4. Cluster peer membership is currently static and configured per node; stronger distributed coordination or service-discovery-backed membership can replace this without changing protocol hooks or SDK contracts.
 
 ### 6.5 Static Cluster Transport Baseline
 The current multi-node transport is intentionally hybrid rather than fully distributed.
@@ -305,6 +306,9 @@ Why this shape exists:
 1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.
 2. `deliver` and `handleAck` are the hotter cross-node path, so moving them onto a reused internal channel removes repeated HTTP setup overhead.
 3. This is still a static-cluster baseline, not a distributed membership or durable routing system.
+
+Deployment note:
+1. The current implementation is still single-listener, but the intended deployment evolution is a dual-port single-process model where public ingress and internal cluster/admin traffic are separated while sharing one runtime state. See [swarm-dual-port-cluster-design.md](swarm-dual-port-cluster-design.md).
 
 ## 7. Protocol Model
 Hardess protocol is split into two layers:

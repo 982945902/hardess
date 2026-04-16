@@ -16,11 +16,27 @@ bun run clean
 
 HTTP / process:
 
-- `PORT`: runtime listen port, default `3000`
+- `PORT`: legacy single-listener port, default `3000`
+- `PUBLIC_PORT`: public listener port; if unset, falls back to `PORT`
+- `INTERNAL_PORT`: optional internal listener port for `__admin/*` and `__cluster/*`; if unset, the runtime stays single-listener
 - `CONFIG_MODULE_PATH`: config module path, default `./config/hardess.config.ts`
 - `SHUTDOWN_DRAIN_MS`: time to stay not-ready before stopping the server, default `250`
 - `SHUTDOWN_TIMEOUT_MS`: hard stop timeout, default `10000`
 - `WS_SHUTDOWN_GRACE_MS`: websocket drain grace after shutdown starts, default `3000`
+
+Optional listener path policy:
+
+- `PUBLIC_ALLOWED_PATH_PREFIXES`: comma-separated public-listener path prefixes
+- `INTERNAL_ALLOWED_PATH_PREFIXES`: comma-separated internal-listener path prefixes
+
+Listener policy semantics:
+
+- if a listener path policy env is unset, that listener stays unrestricted
+- if set, only matching path prefixes are exposed on that listener
+- `__admin/*` and `__cluster/*` are reserved internal-only routes and are never exposed on the public listener, regardless of listener path policy
+- the recommended dual-port shape is:
+  - public listener: business HTTP paths plus `/ws`
+  - internal listener: `/__admin` plus `/__cluster`
 
 HTTP proxy timeout semantics:
 - `connectTimeoutMs`: budget until Hardess gets the upstream response
@@ -92,6 +108,12 @@ Single-node release gate:
 Cluster release gate:
 
 - `CLUSTER_RELEASE_GATE_*`: cluster gate profile, ports, shared-secret wiring, sizing, readiness timing, metrics mode, an optional layered `CLUSTER_RELEASE_GATE_SLO_PROFILE`, and optional cluster SLO thresholds
+- `CLUSTER_RELEASE_GATE_LISTENER_MODE`: `single` or `dual`; `dual` runs client WS on public ports and admin/cluster traffic on internal ports
+- `CLUSTER_RELEASE_GATE_INTERNAL_PORT_A` / `CLUSTER_RELEASE_GATE_INTERNAL_PORT_B`: optional explicit internal ports when the cluster release gate runs in `dual` mode
+
+Cluster benchmark:
+
+- `BENCH_CLUSTER_LISTENER_MODE`: `single` or `dual`; `dual` benchmarks the split-path shape where client WS uses public ingress and node-to-node/admin traffic uses internal listeners
 
 Detailed per-variable examples and the full verification env reference live in [load-testing.md](load-testing.md).
 
@@ -142,6 +164,7 @@ The current multi-node baseline is static-peer based:
 - remote `deliver` and `handleAck` use a long-lived internal websocket channel at `GET /__cluster/ws`
 - `CLUSTER_TRANSPORT=http` keeps the older pure-HTTP transport available as a fallback path
 - when `CLUSTER_TRANSPORT=ws`, per-request fallback to the internal HTTP endpoints is now used if the cluster WS channel is temporarily unavailable or its outbound queue overflows
+- in dual-port deployments, cluster peer `baseUrl` entries should point to the internal listener, not the public listener
 
 Current boundary:
 

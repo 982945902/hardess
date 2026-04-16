@@ -131,6 +131,7 @@ SDK behavior notes:
 - [Load testing and weak-network simulation](docs/load-testing.md)
 - [Current local release baseline](docs/local-release-baseline.md)
 - [Operator guide](docs/operator-guide.md)
+- [Dual-port cluster and Swarm design](docs/swarm-dual-port-cluster-design.md)
 - [Grafana dashboard template](docs/grafana-hardess-overview.dashboard.json)
 - [Architecture design and current status](docs/hardess-architecture.md)
 - [Pingora / workerd as Hardess v2 research](docs/research-pingora-for-hardess-v2.md)
