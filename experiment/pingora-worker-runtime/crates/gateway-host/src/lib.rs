@@ -52,6 +52,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use sha2::Sha512;
+use tokio::runtime::RuntimeFlavor;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Notify;
@@ -71,6 +72,13 @@ pub use public_error::PublicErrorCategory;
 type SourceMapStore = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 const REMOTE_CACHE_MAX_ENTRIES: usize = 128;
 const REMOTE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const HARDESS_REQUEST_TASK_ID_METADATA_KEY: &str = "hardess_request_task_id";
+pub const HARDESS_CLIENT_ADDR_METADATA_KEY: &str = "hardess_client_addr";
+pub const HARDESS_HTTP_VERSION_METADATA_KEY: &str = "hardess_http_version";
+pub const HARDESS_REQUEST_BODY_MODE_METADATA_KEY: &str = "hardess_request_body_mode";
+pub const HARDESS_REQUEST_COMPLETION_POLICY_METADATA_KEY: &str =
+    "hardess_request_completion_policy";
+pub const HARDESS_RUNTIME_SHARD_METADATA_KEY: &str = "hardess_runtime_shard";
 
 #[derive(Debug, Clone)]
 struct WorkerProjectConfig {
@@ -766,8 +774,11 @@ fn media_type_from_remote(
 
 #[derive(Debug, Clone)]
 pub struct GatewayRequest {
-    request: WorkerRequest,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
     body: Option<RequestBodySource>,
+    completion_policy: RequestBodyCompletionPolicy,
 }
 
 impl GatewayRequest {
@@ -776,49 +787,59 @@ impl GatewayRequest {
             .body
             .take()
             .map(|body| RequestBodySource::buffered(body.into_bytes()));
-        Self { request, body }
+        Self {
+            method: request.method,
+            url: request.url,
+            headers: request.headers.into_iter().collect(),
+            body,
+            completion_policy: RequestBodyCompletionPolicy::AlreadyComplete,
+        }
     }
 
     pub fn streaming(request: WorkerRequest) -> (Self, IngressRequestBody) {
+        let headers: Vec<(String, String)> = request.headers.into_iter().collect();
+        let completion_policy = request_body_completion_policy_from_header_entries(&headers);
+        Self::streaming_parts(request.method, request.url, headers, completion_policy)
+    }
+
+    pub fn buffered_parts(method: String, url: String, headers: Vec<(String, String)>) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body: None,
+            completion_policy: RequestBodyCompletionPolicy::AlreadyComplete,
+        }
+    }
+
+    pub fn streaming_parts(
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        completion_policy: RequestBodyCompletionPolicy,
+    ) -> (Self, IngressRequestBody) {
         let (body, ingress_body) = RequestBodySource::streaming();
         (
             Self {
-                request,
+                method,
+                url,
+                headers,
                 body: Some(body),
+                completion_policy,
             },
             ingress_body,
         )
     }
 
     pub fn completion_policy(&self) -> RequestBodyCompletionPolicy {
-        if self.body.is_none() {
-            return RequestBodyCompletionPolicy::AlreadyComplete;
-        }
-
-        let headers = &self.request.headers;
-        if let Some(content_length) = headers.get("content-length") {
-            if let Ok(length) = content_length.trim().parse::<u64>() {
-                if length == 0 {
-                    return RequestBodyCompletionPolicy::AlreadyComplete;
-                }
-                if length <= 64 * 1024 {
-                    return RequestBodyCompletionPolicy::Drain;
-                }
-            }
-        }
-
-        if headers.contains_key("transfer-encoding") {
-            return RequestBodyCompletionPolicy::DisableKeepalive;
-        }
-
-        RequestBodyCompletionPolicy::DisableKeepalive
+        self.completion_policy
     }
 
     fn into_js_request(self) -> JsWorkerRequest {
         JsWorkerRequest {
-            method: self.request.method,
-            url: self.request.url,
-            headers: self.request.headers.into_iter().collect(),
+            method: self.method,
+            url: self.url,
+            headers: self.headers,
             body: self.body,
         }
     }
@@ -828,6 +849,12 @@ impl GatewayRequest {
             .as_ref()
             .map_or(true, RequestBodySource::is_retry_safe)
     }
+
+    fn requires_ingress_body_drive(&self) -> bool {
+        self.body
+            .as_ref()
+            .is_some_and(RequestBodySource::requires_ingress_body_drive)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,6 +862,32 @@ pub enum RequestBodyCompletionPolicy {
     AlreadyComplete,
     Drain,
     DisableKeepalive,
+}
+
+fn request_body_completion_policy_from_header_entries(
+    headers: &[(String, String)],
+) -> RequestBodyCompletionPolicy {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            if let Ok(length) = value.trim().parse::<u64>() {
+                if length == 0 {
+                    return RequestBodyCompletionPolicy::AlreadyComplete;
+                }
+                if length <= 64 * 1024 {
+                    return RequestBodyCompletionPolicy::Drain;
+                }
+            }
+        }
+    }
+
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return RequestBodyCompletionPolicy::DisableKeepalive;
+    }
+
+    RequestBodyCompletionPolicy::DisableKeepalive
 }
 
 #[derive(Debug, Clone)]
@@ -1036,6 +1089,14 @@ impl RequestBodySource {
         }
     }
 
+    fn requires_ingress_body_drive(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("request body state mutex should not be poisoned");
+        matches!(&*state, RequestBodyState::Streaming { .. })
+    }
+
     async fn read_next_chunk(&self) -> Result<Option<Vec<u8>>, String> {
         let command_tx = {
             let mut state = self
@@ -1215,6 +1276,14 @@ struct JsWorkerRequest {
     body: Option<RequestBodySource>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsWorkerRequestHead {
+    method: String,
+    url: String,
+    has_body: bool,
+}
+
 unsafe impl GarbageCollected for JsWorkerRequest {
     fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
 
@@ -1229,26 +1298,19 @@ fn op_worker_request_is_backing(#[cppgc] request: Option<&JsWorkerRequest>) -> b
 }
 
 #[op2]
-#[string]
-fn op_worker_request_get_method(#[cppgc] request: &JsWorkerRequest) -> String {
-    request.method.clone()
-}
-
-#[op2]
-#[string]
-fn op_worker_request_get_url(#[cppgc] request: &JsWorkerRequest) -> String {
-    request.url.clone()
+#[serde]
+fn op_worker_request_get_head(#[cppgc] request: &JsWorkerRequest) -> JsWorkerRequestHead {
+    JsWorkerRequestHead {
+        method: request.method.clone(),
+        url: request.url.clone(),
+        has_body: request.body.is_some(),
+    }
 }
 
 #[op2]
 #[serde]
 fn op_worker_request_get_headers(#[cppgc] request: &JsWorkerRequest) -> Vec<(String, String)> {
     request.headers.clone()
-}
-
-#[op2(fast)]
-fn op_worker_request_has_body(#[cppgc] request: &JsWorkerRequest) -> bool {
-    request.body.is_some()
 }
 
 #[op2]
@@ -1281,10 +1343,8 @@ deno_core::extension!(
     hardess_runtime_bridge,
     ops = [
         op_worker_request_is_backing,
-        op_worker_request_get_method,
-        op_worker_request_get_url,
+        op_worker_request_get_head,
         op_worker_request_get_headers,
-        op_worker_request_has_body,
         op_worker_request_read_next_chunk,
         op_worker_request_read_all_bytes,
     ]
@@ -1295,17 +1355,11 @@ const workerRequestOps = {
   isBacking(value) {
     return Deno.core.ops.op_worker_request_is_backing(value);
   },
-  method(value) {
-    return Deno.core.ops.op_worker_request_get_method(value);
-  },
-  url(value) {
-    return Deno.core.ops.op_worker_request_get_url(value);
+  head(value) {
+    return Deno.core.ops.op_worker_request_get_head(value);
   },
   headers(value) {
     return Deno.core.ops.op_worker_request_get_headers(value);
-  },
-  hasBody(value) {
-    return Deno.core.ops.op_worker_request_has_body(value);
   },
   async readNextChunk(value) {
     return await Deno.core.ops.op_worker_request_read_next_chunk(value);
@@ -1316,31 +1370,18 @@ const workerRequestOps = {
 };
 
 class Headers {
+  static _fromLazyEntries(loadEntries) {
+    const headers = Object.create(Headers.prototype);
+    headers._map = undefined;
+    headers._entries = undefined;
+    headers._lazyEntries = loadEntries;
+    return headers;
+  }
+
   constructor(init = undefined) {
-    this._map = new Map();
-
-    if (init instanceof Headers) {
-      for (const [key, value] of init.entries()) {
-        this.append(key, value);
-      }
-      return;
-    }
-
-    if (Array.isArray(init)) {
-      for (const entry of init) {
-        if (!Array.isArray(entry) || entry.length !== 2) {
-          throw new TypeError("Headers init entries must be [name, value]");
-        }
-        this.append(entry[0], entry[1]);
-      }
-      return;
-    }
-
-    if (init && typeof init === "object") {
-      for (const [key, value] of Object.entries(init)) {
-        this.append(key, value);
-      }
-    }
+    this._map = undefined;
+    this._lazyEntries = undefined;
+    this._entries = Headers._normalizeEntries(init);
   }
 
   _normalizeName(name) {
@@ -1351,47 +1392,128 @@ class Headers {
     return String(value);
   }
 
+  static _normalizeEntries(init) {
+    const headerPairs = [];
+
+    if (init instanceof Headers) {
+      for (const [key, value] of init.entries()) {
+        headerPairs.push([key, value]);
+      }
+    } else if (Array.isArray(init)) {
+      for (const entry of init) {
+        if (!Array.isArray(entry) || entry.length !== 2) {
+          throw new TypeError("Headers init entries must be [name, value]");
+        }
+        headerPairs.push(entry);
+      }
+    } else if (init && typeof init === "object") {
+      for (const [key, value] of Object.entries(init)) {
+        headerPairs.push([key, value]);
+      }
+    }
+
+    const map = new Map();
+    for (const [name, value] of headerPairs) {
+      const normalizedName = String(name).toLowerCase();
+      const normalizedValue = String(value);
+      const previous = map.get(normalizedName);
+      map.set(
+        normalizedName,
+        previous ? `${previous}, ${normalizedValue}` : normalizedValue,
+      );
+    }
+    return Array.from(map.entries());
+  }
+
+  _ensureEntries() {
+    if (this._entries !== undefined) {
+      return this._entries;
+    }
+
+    if (this._map !== undefined) {
+      this._entries = Array.from(this._map.entries());
+      return this._entries;
+    }
+
+    if (this._lazyEntries !== undefined) {
+      this._entries = Headers._normalizeEntries(this._lazyEntries());
+      this._lazyEntries = undefined;
+      return this._entries;
+    }
+
+    this._entries = [];
+    return this._entries;
+  }
+
+  _ensureMap() {
+    if (this._map !== undefined) {
+      return this._map;
+    }
+
+    this._map = new Map(this._ensureEntries());
+    return this._map;
+  }
+
+  _syncEntriesFromMap() {
+    this._entries = Array.from(this._map.entries());
+  }
+
   append(name, value) {
+    const map = this._ensureMap();
     const normalizedName = this._normalizeName(name);
     const normalizedValue = this._normalizeValue(value);
-    const previous = this._map.get(normalizedName);
-    this._map.set(
+    const previous = map.get(normalizedName);
+    map.set(
       normalizedName,
       previous ? `${previous}, ${normalizedValue}` : normalizedValue,
     );
+    this._syncEntriesFromMap();
   }
 
   delete(name) {
-    this._map.delete(this._normalizeName(name));
+    this._ensureMap().delete(this._normalizeName(name));
+    this._syncEntriesFromMap();
   }
 
   get(name) {
-    const value = this._map.get(this._normalizeName(name));
-    return value === undefined ? null : value;
+    const normalizedName = this._normalizeName(name);
+    for (const [key, value] of this._ensureEntries()) {
+      if (key === normalizedName) {
+        return value;
+      }
+    }
+    return null;
   }
 
   has(name) {
-    return this._map.has(this._normalizeName(name));
+    const normalizedName = this._normalizeName(name);
+    for (const [key] of this._ensureEntries()) {
+      if (key === normalizedName) {
+        return true;
+      }
+    }
+    return false;
   }
 
   set(name, value) {
-    this._map.set(this._normalizeName(name), this._normalizeValue(value));
+    this._ensureMap().set(this._normalizeName(name), this._normalizeValue(value));
+    this._syncEntriesFromMap();
   }
 
   entries() {
-    return this._map.entries();
+    return this._ensureEntries()[Symbol.iterator]();
   }
 
   keys() {
-    return this._map.keys();
+    return this._ensureEntries().map(([key]) => key)[Symbol.iterator]();
   }
 
   values() {
-    return this._map.values();
+    return this._ensureEntries().map(([, value]) => value)[Symbol.iterator]();
   }
 
   forEach(callback, thisArg = undefined) {
-    for (const [key, value] of this._map.entries()) {
+    for (const [key, value] of this._ensureEntries()) {
       callback.call(thisArg, value, key, this);
     }
   }
@@ -1402,12 +1524,12 @@ class Headers {
 }
 
 class RequestBody {
-  constructor(owner) {
-    this._owner = owner;
+  constructor(inner) {
+    this._inner = inner;
   }
 
   async nextChunk() {
-    return await this._owner._readNextChunkForBody();
+    return await this._inner.readNextChunk();
   }
 
   async *[Symbol.asyncIterator]() {
@@ -1421,63 +1543,113 @@ class RequestBody {
   }
 }
 
-class Request {
-  constructor(input, init = undefined) {
-    this._backing = null;
-    this._streamingBody = null;
-    this._bodyBytes = undefined;
-
-    if (input instanceof Request) {
-      if (
-        input._streamingBody !== null &&
-        input._bodyBytes === undefined &&
-        input._bodyText === undefined
-      ) {
-        throw new TypeError(
-          "Request.clone() with a streaming body is not supported in this experiment",
-        );
-      }
-      this._backing = input._backing;
-      this.method = init?.method ?? input.method;
-      this.url = init?.url ?? input.url;
-      this.headers = new Headers(init?.headers ?? input.headers);
-      this._streamingBody = null;
-      this._bodyBytes = input._bodyBytes;
-      this._bodyText =
-        init && Object.hasOwn(init, "body") ? init.body : input._bodyText;
-    } else if (workerRequestOps.isBacking(input)) {
-      this._backing = input;
-      this.method = init?.method ?? workerRequestOps.method(input);
-      this.url = init?.url ?? workerRequestOps.url(input);
-      this.headers = new Headers(init?.headers ?? workerRequestOps.headers(input));
-      this._streamingBody =
-        init && Object.hasOwn(init, "body")
-          ? null
-          : workerRequestOps.hasBody(input)
-            ? input
-            : null;
-      this._bodyText =
-        init && Object.hasOwn(init, "body") ? init.body : undefined;
-    } else {
-      this.method = init?.method ?? "GET";
-      this.url = String(input);
-      this.headers = new Headers(init?.headers);
-      this._bodyText =
-        init && Object.hasOwn(init, "body") ? init.body : undefined;
-    }
-
-    this.method = String(this.method).toUpperCase();
-    this.bodyUsed = false;
-    this.body = this._streamingBody !== null ? new RequestBody(this) : null;
+class InnerRequest {
+  static fromBacking(input) {
+    const head = workerRequestOps.head(input);
+    return new InnerRequest({
+      backing: input,
+      head,
+      backingHasBody: head.hasBody,
+      method: head.method,
+      url: head.url,
+    });
   }
 
-  async _readNextChunkForBody() {
+  constructor(init = undefined) {
+    this._backing = init?.backing ?? null;
+    this._head = init?.head;
+    this._streamingBody = null;
+    this._backingHasBody = init?.backingHasBody ?? false;
+    this._bodyBytes = init?.bodyBytes;
+    this._bodyText = init?.bodyText;
+    this._headers = init?.headers;
+    this._body = undefined;
+    this.bodyUsed = false;
+    this.method = String(init?.method ?? "GET").toUpperCase();
+    this.url = String(init?.url ?? "");
+  }
+
+  static cloneFromRequest(request, init = undefined) {
+    if (request._inner.hasUnreadStreamingBody()) {
+      throw new TypeError(
+        "Request.clone() with a streaming body is not supported in this experiment",
+      );
+    }
+
+    return new InnerRequest({
+      backing: request._inner._backing,
+      head: request._inner._head,
+      backingHasBody: request._inner._backingHasBody,
+      method: init?.method ?? request.method,
+      url: init?.url ?? request.url,
+      headers: new Headers(init?.headers ?? request.headers),
+      bodyBytes: request._inner._bodyBytes,
+      bodyText:
+        init && Object.hasOwn(init, "body") ? init.body : request._inner._bodyText,
+    });
+  }
+
+  ensureHeaders() {
+    if (this._headers !== undefined) {
+      return this._headers;
+    }
+
+    if (this._backing !== null) {
+      this._headers = Headers._fromLazyEntries(() => workerRequestOps.headers(this._backing));
+    } else {
+      this._headers = new Headers();
+    }
+    return this._headers;
+  }
+
+  ensureStreamingBody() {
+    if (this._bodyBytes !== undefined || this._bodyText !== undefined) {
+      return;
+    }
+
+    if (this._streamingBody !== null || this._backing === null) {
+      return;
+    }
+
+    if (this._backingHasBody === undefined) {
+      this._backingHasBody = workerRequestOps.hasBody(this._backing);
+    }
+
+    if (this._backingHasBody) {
+      this._streamingBody = this._backing;
+    }
+  }
+
+  hasUnreadStreamingBody() {
+    this.ensureStreamingBody();
+    return this._streamingBody !== null &&
+      this._bodyBytes === undefined &&
+      this._bodyText === undefined;
+  }
+
+  getBody() {
+    if (this._body !== undefined) {
+      return this._body;
+    }
+
+    if (this._bodyBytes !== undefined || this._bodyText !== undefined) {
+      this._body = null;
+      return this._body;
+    }
+
+    this.ensureStreamingBody();
+    this._body = this._streamingBody !== null ? new RequestBody(this) : null;
+    return this._body;
+  }
+
+  async readNextChunk() {
     if (this._bodyBytes !== undefined || this._bodyText !== undefined) {
       return null;
     }
 
+    this.ensureStreamingBody();
     if (this._streamingBody === null) {
-      this.body = null;
+      this._body = null;
       return null;
     }
 
@@ -1485,12 +1657,12 @@ class Request {
     const chunk = await workerRequestOps.readNextChunk(this._streamingBody);
     if (chunk === null) {
       this._streamingBody = null;
-      this.body = null;
+      this._body = null;
     }
     return chunk;
   }
 
-  async _readAllBytes() {
+  async readAllBytes() {
     if (this.bodyUsed && this._bodyBytes === undefined && this._bodyText === undefined) {
       throw new TypeError("Body already used");
     }
@@ -1501,29 +1673,110 @@ class Request {
 
     if (this._bodyText !== undefined) {
       this._bodyBytes = Deno.core.encode(this._bodyText);
-      this.body = null;
+      this._body = null;
       return this._bodyBytes.slice();
     }
 
     this.bodyUsed = true;
+    this.ensureStreamingBody();
     if (this._streamingBody === null) {
       this._bodyBytes = new Uint8Array(0);
-      this.body = null;
+      this._body = null;
       return this._bodyBytes.slice();
     }
 
     this._bodyBytes = await workerRequestOps.readAllBytes(this._streamingBody);
     this._streamingBody = null;
-    this.body = null;
+    this._body = null;
     return this._bodyBytes.slice();
+  }
+}
+
+class Request {
+  static _fromBacking(input) {
+    const request = Object.create(Request.prototype);
+    request._inner = InnerRequest.fromBacking(input);
+    return request;
+  }
+
+  constructor(input, init = undefined) {
+    if (input instanceof Request) {
+      this._inner = InnerRequest.cloneFromRequest(input, init);
+    } else if (workerRequestOps.isBacking(input)) {
+      const inner = InnerRequest.fromBacking(input);
+      if (init && Object.hasOwn(init, "headers")) {
+        inner._headers = new Headers(init.headers);
+      }
+      if (init && Object.hasOwn(init, "body")) {
+        inner._bodyText = init.body;
+      }
+      inner.method = String(init?.method ?? inner.method).toUpperCase();
+      inner.url = String(init?.url ?? inner.url);
+      this._inner = inner;
+    } else {
+      this._inner = new InnerRequest({
+        method: init?.method ?? "GET",
+        url: String(input),
+        headers: new Headers(init?.headers),
+        bodyText: init && Object.hasOwn(init, "body") ? init.body : undefined,
+      });
+    }
+  }
+
+  get method() {
+    return this._inner.method;
+  }
+
+  set method(value) {
+    this._inner.method = String(value).toUpperCase();
+  }
+
+  get url() {
+    return this._inner.url;
+  }
+
+  set url(value) {
+    this._inner.url = String(value);
+  }
+
+  get headers() {
+    return this._inner.ensureHeaders();
+  }
+
+  set headers(value) {
+    this._inner._headers = value instanceof Headers ? value : new Headers(value);
+  }
+
+  get body() {
+    return this._inner.getBody();
+  }
+
+  set body(value) {
+    this._inner._body = value;
+  }
+
+  get bodyUsed() {
+    return this._inner.bodyUsed;
+  }
+
+  set bodyUsed(value) {
+    this._inner.bodyUsed = Boolean(value);
+  }
+
+  async _readNextChunkForBody() {
+    return await this._inner.readNextChunk();
+  }
+
+  async _readAllBytes() {
+    return await this._inner.readAllBytes();
   }
 
   async text() {
-    if (this._bodyText === undefined) {
-      this._bodyText = Deno.core.decode(await this._readAllBytes());
+    if (this._inner._bodyText === undefined) {
+      this._inner._bodyText = Deno.core.decode(await this._readAllBytes());
     }
     this.bodyUsed = true;
-    return this._bodyText;
+    return this._inner._bodyText;
   }
 
   async json() {
@@ -1887,6 +2140,12 @@ struct PendingGatewayResponse {
     runtime_body: Option<RuntimeResponseBody>,
 }
 
+struct InvokeTimings {
+    arg_serialize_nanos: u64,
+    js_call_nanos: u64,
+    response_decode_nanos: u64,
+}
+
 impl PendingGatewayResponse {
     async fn into_worker_response(
         mut self,
@@ -1931,7 +2190,36 @@ struct RuntimeThreadMessage {
     request: GatewayRequest,
     env: WorkerEnv,
     ctx: WorkerContext,
-    response_tx: oneshot::Sender<Result<GatewayResponse, RuntimePoolError>>,
+    enqueued_at: Instant,
+    response_tx: RuntimeThreadResponseTx,
+}
+
+struct RuntimeThreadResponse {
+    result: Result<GatewayResponse, RuntimePoolError>,
+    response_sent_at: Instant,
+}
+
+enum RuntimeThreadResponseTx {
+    Async(oneshot::Sender<RuntimeThreadResponse>),
+    Blocking(mpsc::SyncSender<RuntimeThreadResponse>),
+}
+
+enum RuntimeThreadResponseRx {
+    Async(oneshot::Receiver<RuntimeThreadResponse>),
+    Blocking(mpsc::Receiver<RuntimeThreadResponse>),
+}
+
+impl RuntimeThreadResponseTx {
+    fn send(self, response: RuntimeThreadResponse) {
+        match self {
+            Self::Async(sender) => {
+                let _ = sender.send(response);
+            }
+            Self::Blocking(sender) => {
+                let _ = sender.send(response);
+            }
+        }
+    }
 }
 
 struct RuntimeThreadInstance {
@@ -1959,17 +2247,30 @@ struct WorkerRuntimeSlot {
     worker_entry: PathBuf,
     queue_capacity: usize,
     exec_timeout: Duration,
+    completion_mode: RuntimeCompletionMode,
     state: Mutex<RuntimeSlotState>,
     metrics: Arc<WorkerThreadMetrics>,
     pool_metrics: Arc<RuntimePoolMetrics>,
 }
 
 impl WorkerRuntimeSlot {
+    fn attach_runtime_metadata(&self, mut ctx: WorkerContext) -> WorkerContext {
+        ctx.metadata
+            .entry(HARDESS_RUNTIME_SHARD_METADATA_KEY.to_string())
+            .or_insert_with(|| self.runtime_index.to_string());
+        ctx
+    }
+
+    fn should_use_blocking_completion_for_request(&self, request: &GatewayRequest) -> bool {
+        self.completion_mode.should_use_blocking() && !request.requires_ingress_body_drive()
+    }
+
     fn new(
         worker_entry: PathBuf,
         runtime_index: usize,
         queue_capacity: usize,
         exec_timeout: Duration,
+        completion_mode: RuntimeCompletionMode,
         pool_metrics: Arc<RuntimePoolMetrics>,
     ) -> Result<Self> {
         let metrics = Arc::new(WorkerThreadMetrics::new(runtime_index));
@@ -1987,6 +2288,7 @@ impl WorkerRuntimeSlot {
             worker_entry,
             queue_capacity: queue_capacity.max(1),
             exec_timeout,
+            completion_mode,
             state: Mutex::new(RuntimeSlotState {
                 generation: 0,
                 instance,
@@ -2070,7 +2372,6 @@ impl WorkerRuntimeSlot {
                         return;
                     }
                 };
-
                 thread_runtime.block_on(async move {
                     let mut worker_runtime = match DenoWorkerRuntime::new(&worker_entry).await {
                         Ok(runtime) => runtime,
@@ -2101,6 +2402,7 @@ impl WorkerRuntimeSlot {
                             request,
                             env,
                             ctx,
+                            enqueued_at,
                             response_tx,
                         } = message;
                         thread_metrics_for_thread
@@ -2117,19 +2419,32 @@ impl WorkerRuntimeSlot {
                             .fetch_add(1, Ordering::Relaxed);
                         let request_id = next_request_id;
                         next_request_id += 1;
-                        let _ = watchdog_tx.send(WatchdogCommand::Arm { request_id });
                         let started_at = Instant::now();
+                        let queue_wait = started_at.saturating_duration_since(enqueued_at);
+                        let _ = watchdog_tx.send(WatchdogCommand::Arm { request_id });
                         let worker_result = worker_runtime
                             .start_gateway_response(request, env, ctx)
                             .await;
+                        let invoke_elapsed = started_at.elapsed();
+                        let invoke_component_nanos =
+                            worker_result.as_ref().ok().map(|(_, invoke_timings)| {
+                                (
+                                    invoke_timings.arg_serialize_nanos,
+                                    invoke_timings.js_call_nanos,
+                                    invoke_timings.response_decode_nanos,
+                                )
+                            });
                         let mut response_tx = Some(response_tx);
                         let result = if timed_out_request_id.load(Ordering::Relaxed) == request_id {
                             Err(RuntimePoolError::TimedOut(exec_timeout.as_millis() as u64))
                         } else {
                             match worker_result {
-                                Ok(mut pending_response) => {
+                                Ok((mut pending_response, _invoke_timings)) => {
                                     if let Some(response_tx) = response_tx.take() {
-                                        let _ = response_tx.send(Ok(pending_response.response));
+                                        response_tx.send(RuntimeThreadResponse {
+                                            result: Ok(pending_response.response),
+                                            response_sent_at: Instant::now(),
+                                        });
                                     }
                                     if let Some(runtime_body) =
                                         pending_response.runtime_body.as_mut()
@@ -2153,6 +2468,25 @@ impl WorkerRuntimeSlot {
                         pool_metrics_for_thread
                             .inflight
                             .fetch_sub(1, Ordering::Relaxed);
+                        pool_metrics_for_thread
+                            .total_queue_wait_nanos
+                            .fetch_add(queue_wait.as_nanos() as u64, Ordering::Relaxed);
+                        pool_metrics_for_thread
+                            .total_invoke_nanos
+                            .fetch_add(invoke_elapsed.as_nanos() as u64, Ordering::Relaxed);
+                        if let Some((arg_serialize_nanos, js_call_nanos, response_decode_nanos)) =
+                            invoke_component_nanos
+                        {
+                            pool_metrics_for_thread
+                                .total_arg_serialize_nanos
+                                .fetch_add(arg_serialize_nanos, Ordering::Relaxed);
+                            pool_metrics_for_thread
+                                .total_js_call_nanos
+                                .fetch_add(js_call_nanos, Ordering::Relaxed);
+                            pool_metrics_for_thread
+                                .total_response_decode_nanos
+                                .fetch_add(response_decode_nanos, Ordering::Relaxed);
+                        }
                         pool_metrics_for_thread
                             .total_exec_nanos
                             .fetch_add(elapsed, Ordering::Relaxed);
@@ -2196,11 +2530,14 @@ impl WorkerRuntimeSlot {
                             }
                         }
                         if let Some(response_tx) = response_tx.take() {
-                            let _ = response_tx.send(match result {
-                                Ok(()) => Err(RuntimePoolError::Unavailable(
-                                    "worker runtime completed without a response".to_string(),
-                                )),
-                                Err(error) => Err(error),
+                            response_tx.send(RuntimeThreadResponse {
+                                result: match result {
+                                    Ok(()) => Err(RuntimePoolError::Unavailable(
+                                        "worker runtime completed without a response".to_string(),
+                                    )),
+                                    Err(error) => Err(error),
+                                },
+                                response_sent_at: Instant::now(),
                             });
                         }
                         if should_exit {
@@ -2224,9 +2561,10 @@ impl WorkerRuntimeSlot {
                         pool_metrics_for_thread
                             .failed
                             .fetch_add(1, Ordering::Relaxed);
-                        let _ = message
-                            .response_tx
-                            .send(Err(recycling_error(runtime_index)));
+                        let _ = message.response_tx.send(RuntimeThreadResponse {
+                            result: Err(recycling_error(runtime_index)),
+                            response_sent_at: Instant::now(),
+                        });
                     }
                     if recycled_queued > 0 {
                         thread_metrics_for_thread
@@ -2254,6 +2592,7 @@ impl WorkerRuntimeSlot {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<GatewayResponse, RuntimePoolError> {
+        let ctx = self.attach_runtime_metadata(ctx);
         let (generation, sender) = {
             let state = self
                 .state
@@ -2261,29 +2600,86 @@ impl WorkerRuntimeSlot {
                 .expect("worker runtime slot state mutex should not be poisoned");
             (state.generation, state.instance.sender.clone())
         };
-        let (response_tx, response_rx) = oneshot::channel();
-        sender
-            .try_send(RuntimeThreadMessage {
-                request,
-                env,
-                ctx,
-                response_tx,
-            })
-            .map_err(|error| match error {
-                tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
-                tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
-                    "worker runtime thread is not available".to_string(),
-                ),
-            })
-            .inspect(|_| {
-                self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
-            })?;
-        let result = response_rx.await.map_err(|_| {
-            RuntimePoolError::Unavailable(
-                "worker runtime thread dropped response channel".to_string(),
-            )
-        })?;
+        let enqueued_at = Instant::now();
+        // On the multithreaded ingress runtime, a blocking wait avoids the
+        // large async wakeup cost we measured on the response handoff path.
+        // But requests with a streaming ingress body still need the caller task
+        // to keep servicing body-read commands while the worker is running, so
+        // they must stay on the async completion path.
+        let use_blocking_completion = self.should_use_blocking_completion_for_request(&request);
+        let response_rx = if use_blocking_completion {
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            sender
+                .try_send(RuntimeThreadMessage {
+                    request,
+                    env,
+                    ctx,
+                    enqueued_at,
+                    response_tx: RuntimeThreadResponseTx::Blocking(response_tx),
+                })
+                .map_err(|error| match error {
+                    tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
+                    tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
+                        "worker runtime thread is not available".to_string(),
+                    ),
+                })
+                .inspect(|_| {
+                    self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                    self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
+                })?;
+            RuntimeThreadResponseRx::Blocking(response_rx)
+        } else {
+            let (response_tx, response_rx) = oneshot::channel();
+            sender
+                .try_send(RuntimeThreadMessage {
+                    request,
+                    env,
+                    ctx,
+                    enqueued_at,
+                    response_tx: RuntimeThreadResponseTx::Async(response_tx),
+                })
+                .map_err(|error| match error {
+                    tokio_mpsc::error::TrySendError::Full(_) => RuntimePoolError::Overloaded,
+                    tokio_mpsc::error::TrySendError::Closed(_) => RuntimePoolError::Unavailable(
+                        "worker runtime thread is not available".to_string(),
+                    ),
+                })
+                .inspect(|_| {
+                    self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                    self.pool_metrics.queued.fetch_add(1, Ordering::Relaxed);
+                })?;
+            RuntimeThreadResponseRx::Async(response_rx)
+        };
+        let result = match response_rx {
+            RuntimeThreadResponseRx::Async(response_rx) => response_rx.await.map_err(|_| {
+                RuntimePoolError::Unavailable(
+                    "worker runtime thread dropped response channel".to_string(),
+                )
+            })?,
+            RuntimeThreadResponseRx::Blocking(response_rx) => {
+                tokio::task::block_in_place(move || {
+                    response_rx.recv().map_err(|_| {
+                        RuntimePoolError::Unavailable(
+                            "worker runtime thread dropped response channel".to_string(),
+                        )
+                    })
+                })?
+            }
+        };
+        let received_at = Instant::now();
+        self.pool_metrics.total_roundtrip_nanos.fetch_add(
+            received_at
+                .saturating_duration_since(enqueued_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.pool_metrics.total_response_handoff_nanos.fetch_add(
+            received_at
+                .saturating_duration_since(result.response_sent_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let result = result.result;
 
         if matches!(
             &result,
@@ -2351,12 +2747,33 @@ impl RuntimePoolError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCompletionMode {
+    Auto,
+    Async,
+    Blocking,
+}
+
+impl RuntimeCompletionMode {
+    fn should_use_blocking(self) -> bool {
+        match self {
+            Self::Async => false,
+            Self::Blocking => true,
+            Self::Auto => tokio::runtime::Handle::try_current()
+                .map(|handle| matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread))
+                .unwrap_or(false),
+        }
+    }
+}
+
 pub struct WorkerRuntimePool {
     handles: Vec<WorkerRuntimeSlot>,
     next: AtomicUsize,
     metrics: Arc<RuntimePoolMetrics>,
     queue_capacity: usize,
     exec_timeout: Duration,
+    completion_mode: RuntimeCompletionMode,
 }
 
 impl WorkerRuntimePool {
@@ -2365,6 +2782,7 @@ impl WorkerRuntimePool {
         size: usize,
         queue_capacity: usize,
         exec_timeout: Duration,
+        completion_mode: RuntimeCompletionMode,
     ) -> Result<Arc<Self>> {
         let size = size.max(1);
         let queue_capacity = queue_capacity.max(1);
@@ -2376,6 +2794,7 @@ impl WorkerRuntimePool {
                 runtime_index,
                 queue_capacity,
                 exec_timeout,
+                completion_mode,
                 metrics.clone(),
             )?);
         }
@@ -2386,6 +2805,7 @@ impl WorkerRuntimePool {
             metrics,
             queue_capacity,
             exec_timeout,
+            completion_mode,
         }))
     }
 
@@ -2408,8 +2828,8 @@ impl WorkerRuntimePool {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<GatewayResponse, RuntimePoolError> {
-        let start_index = self.next.fetch_add(1, Ordering::Relaxed) % self.handles.len();
         self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        let start_index = self.next.fetch_add(1, Ordering::Relaxed) % self.handles.len();
         let mut last_error = None::<RuntimePoolError>;
 
         for attempt in 0..2 {
@@ -2463,6 +2883,10 @@ impl WorkerRuntimePool {
         self.exec_timeout
     }
 
+    pub fn completion_mode(&self) -> RuntimeCompletionMode {
+        self.completion_mode
+    }
+
     pub fn metrics_snapshot(&self) -> RuntimePoolSnapshot {
         let per_thread = self
             .handles
@@ -2470,17 +2894,69 @@ impl WorkerRuntimePool {
             .map(|handle| handle.metrics.snapshot())
             .collect::<Vec<_>>();
         let total_exec_nanos = self.metrics.total_exec_nanos.load(Ordering::Relaxed);
+        let total_queue_wait_nanos = self.metrics.total_queue_wait_nanos.load(Ordering::Relaxed);
+        let total_invoke_nanos = self.metrics.total_invoke_nanos.load(Ordering::Relaxed);
+        let total_arg_serialize_nanos = self
+            .metrics
+            .total_arg_serialize_nanos
+            .load(Ordering::Relaxed);
+        let total_js_call_nanos = self.metrics.total_js_call_nanos.load(Ordering::Relaxed);
+        let total_response_decode_nanos = self
+            .metrics
+            .total_response_decode_nanos
+            .load(Ordering::Relaxed);
+        let total_roundtrip_nanos = self.metrics.total_roundtrip_nanos.load(Ordering::Relaxed);
+        let total_response_handoff_nanos = self
+            .metrics
+            .total_response_handoff_nanos
+            .load(Ordering::Relaxed);
         let exec_count = self.metrics.exec_count.load(Ordering::Relaxed);
+        let average_queue_wait_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_queue_wait_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_invoke_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_invoke_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_arg_serialize_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_arg_serialize_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_js_call_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_js_call_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_response_decode_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_response_decode_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
         let average_exec_ms = if exec_count == 0 {
             0.0
         } else {
             (total_exec_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_roundtrip_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_roundtrip_nanos as f64 / exec_count as f64) / 1_000_000.0
+        };
+        let average_response_handoff_ms = if exec_count == 0 {
+            0.0
+        } else {
+            (total_response_handoff_nanos as f64 / exec_count as f64) / 1_000_000.0
         };
 
         RuntimePoolSnapshot {
             runtime_threads: self.size(),
             queue_capacity_per_thread: self.queue_capacity(),
             exec_timeout_ms: self.exec_timeout().as_millis() as u64,
+            completion_mode: self.completion_mode(),
             submitted: self.metrics.submitted.load(Ordering::Relaxed),
             completed: self.metrics.completed.load(Ordering::Relaxed),
             failed: self.metrics.failed.load(Ordering::Relaxed),
@@ -2490,7 +2966,14 @@ impl WorkerRuntimePool {
             rebuilt: self.metrics.rebuilt.load(Ordering::Relaxed),
             inflight: self.metrics.inflight.load(Ordering::Relaxed) as usize,
             queued: self.metrics.queued.load(Ordering::Relaxed) as usize,
+            average_queue_wait_ms,
+            average_invoke_ms,
+            average_arg_serialize_ms,
+            average_js_call_ms,
+            average_response_decode_ms,
             average_exec_ms,
+            average_roundtrip_ms,
+            average_response_handoff_ms,
             per_thread,
         }
     }
@@ -2506,7 +2989,14 @@ struct RuntimePoolMetrics {
     rebuilt: AtomicU64,
     inflight: AtomicU64,
     queued: AtomicU64,
+    total_queue_wait_nanos: AtomicU64,
+    total_invoke_nanos: AtomicU64,
+    total_arg_serialize_nanos: AtomicU64,
+    total_js_call_nanos: AtomicU64,
+    total_response_decode_nanos: AtomicU64,
     total_exec_nanos: AtomicU64,
+    total_roundtrip_nanos: AtomicU64,
+    total_response_handoff_nanos: AtomicU64,
     exec_count: AtomicU64,
 }
 
@@ -2522,7 +3012,14 @@ impl RuntimePoolMetrics {
             rebuilt: AtomicU64::new(0),
             inflight: AtomicU64::new(0),
             queued: AtomicU64::new(0),
+            total_queue_wait_nanos: AtomicU64::new(0),
+            total_invoke_nanos: AtomicU64::new(0),
+            total_arg_serialize_nanos: AtomicU64::new(0),
+            total_js_call_nanos: AtomicU64::new(0),
+            total_response_decode_nanos: AtomicU64::new(0),
             total_exec_nanos: AtomicU64::new(0),
+            total_roundtrip_nanos: AtomicU64::new(0),
+            total_response_handoff_nanos: AtomicU64::new(0),
             exec_count: AtomicU64::new(0),
         }
     }
@@ -2575,6 +3072,7 @@ pub struct RuntimePoolSnapshot {
     pub runtime_threads: usize,
     pub queue_capacity_per_thread: usize,
     pub exec_timeout_ms: u64,
+    pub completion_mode: RuntimeCompletionMode,
     pub submitted: u64,
     pub completed: u64,
     pub failed: u64,
@@ -2584,7 +3082,14 @@ pub struct RuntimePoolSnapshot {
     pub rebuilt: u64,
     pub inflight: usize,
     pub queued: usize,
+    pub average_queue_wait_ms: f64,
+    pub average_invoke_ms: f64,
+    pub average_arg_serialize_ms: f64,
+    pub average_js_call_ms: f64,
+    pub average_response_decode_ms: f64,
     pub average_exec_ms: f64,
+    pub average_roundtrip_ms: f64,
+    pub average_response_handoff_ms: f64,
     pub per_thread: Vec<RuntimeThreadSnapshot>,
 }
 
@@ -2763,9 +3268,9 @@ impl DenoWorkerRuntime {
         }};
       }}
 
-      return {{
-        status:
-          typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
+        return {{
+          status:
+            typeof rawResponse.status === "number" ? Math.trunc(rawResponse.status) : 200,
         headers: normalizeHeaders(rawResponse.headers),
         streamBody: false,
         bodyBytes: rawResponse._bridgeBufferedBytes(),
@@ -2799,7 +3304,7 @@ impl DenoWorkerRuntime {
         ? workerModule.default.fetch
         : null;
   const invokeWeb = async (requestBacking, env, ctxBase) => {{
-    const request = new Request(requestBacking);
+    const request = Request._fromBacking(requestBacking);
     const waitUntilPromises = [];
     const ctx = {{
       ...ctxBase,
@@ -2880,12 +3385,66 @@ impl DenoWorkerRuntime {
         Err("worker response body must be ArrayBuffer or ArrayBufferView".to_string())
     }
 
+    fn v8_string<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: &str,
+    ) -> Result<v8::Local<'s, v8::String>> {
+        v8::String::new(scope, value).context(format!("unable to allocate V8 string for `{value}`"))
+    }
+
+    fn set_object_property<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        name: &str,
+        value: v8::Local<'s, v8::Value>,
+    ) -> Result<()> {
+        let key = Self::v8_string(scope, name)?;
+        object
+            .set(scope, key.into(), value)
+            .context(format!("unable to set V8 object property `{name}`"))?;
+        Ok(())
+    }
+
+    fn string_map_to_v8_object<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Result<v8::Local<'s, v8::Object>> {
+        let object = v8::Object::new(scope);
+        for (key, value) in values {
+            let value = Self::v8_string(scope, value)?;
+            Self::set_object_property(scope, object, key, value.into())?;
+        }
+        Ok(object)
+    }
+
+    fn worker_env_to_v8<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        env: &WorkerEnv,
+    ) -> Result<v8::Local<'s, v8::Value>> {
+        let object = v8::Object::new(scope);
+        let worker_id = Self::v8_string(scope, &env.worker_id)?;
+        Self::set_object_property(scope, object, "worker_id", worker_id.into())?;
+        let vars = Self::string_map_to_v8_object(scope, &env.vars)?;
+        Self::set_object_property(scope, object, "vars", vars.into())?;
+        Ok(object.into())
+    }
+
+    fn worker_context_to_v8<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        ctx: &WorkerContext,
+    ) -> Result<v8::Local<'s, v8::Value>> {
+        let object = v8::Object::new(scope);
+        let metadata = Self::string_map_to_v8_object(scope, &ctx.metadata)?;
+        Self::set_object_property(scope, object, "metadata", metadata.into())?;
+        Ok(object.into())
+    }
+
     fn serialize_invocation_args(
         &mut self,
         request: GatewayRequest,
-        env: &impl Serialize,
-        ctx: &impl Serialize,
-    ) -> Result<Vec<v8::Global<v8::Value>>> {
+        env: &WorkerEnv,
+        ctx: &WorkerContext,
+    ) -> Result<[v8::Global<v8::Value>; 3]> {
         let runtime = &mut self.js_runtime;
         deno_core::scope!(scope, runtime);
 
@@ -2895,14 +3454,11 @@ impl DenoWorkerRuntime {
         ));
         let values = [
             request,
-            serde_v8::to_v8(scope, env)?,
-            serde_v8::to_v8(scope, ctx)?,
+            Self::worker_env_to_v8(scope, env)?,
+            Self::worker_context_to_v8(scope, ctx)?,
         ];
 
-        Ok(values
-            .into_iter()
-            .map(|value| v8::Global::new(scope, value))
-            .collect())
+        Ok(values.map(|value| v8::Global::new(scope, value)))
     }
 
     async fn read_next_response_chunk(
@@ -2934,10 +3490,13 @@ impl DenoWorkerRuntime {
         request: GatewayRequest,
         env: WorkerEnv,
         ctx: WorkerContext,
-    ) -> Result<PendingGatewayResponse, String> {
+    ) -> Result<(PendingGatewayResponse, InvokeTimings), String> {
+        let serialize_started_at = Instant::now();
         let args = self
             .serialize_invocation_args(request, &env, &ctx)
             .map_err(|error| error.to_string())?;
+        let arg_serialize_nanos = serialize_started_at.elapsed().as_nanos() as u64;
+        let js_call_started_at = Instant::now();
         #[allow(
             deprecated,
             reason = "good enough while migrating off the script bridge"
@@ -2947,7 +3506,9 @@ impl DenoWorkerRuntime {
             .call_with_args_and_await(&self.invoke_bridge, &args)
             .await
             .map_err(|error| error.to_string())?;
+        let js_call_nanos = js_call_started_at.elapsed().as_nanos() as u64;
 
+        let response_decode_started_at = Instant::now();
         let runtime = &mut self.js_runtime;
         deno_core::scope!(scope, runtime);
         let local = v8::Local::new(scope, resolved);
@@ -2976,10 +3537,18 @@ impl DenoWorkerRuntime {
                     next_chunk: v8::Global::new(scope, reader_function),
                 },
             );
-            return Ok(PendingGatewayResponse {
-                response,
-                runtime_body: Some(runtime_body),
-            });
+            let response_decode_nanos = response_decode_started_at.elapsed().as_nanos() as u64;
+            return Ok((
+                PendingGatewayResponse {
+                    response,
+                    runtime_body: Some(runtime_body),
+                },
+                InvokeTimings {
+                    arg_serialize_nanos,
+                    js_call_nanos,
+                    response_decode_nanos,
+                },
+            ));
         }
 
         let body_value = Self::object_property(scope, response_object, "bodyBytes")?;
@@ -2989,10 +3558,18 @@ impl DenoWorkerRuntime {
             Self::bytes_from_v8_value(body_value)?
         };
 
-        Ok(PendingGatewayResponse {
-            response: GatewayResponse::buffered(status, headers, body),
-            runtime_body: None,
-        })
+        let response_decode_nanos = response_decode_started_at.elapsed().as_nanos() as u64;
+        Ok((
+            PendingGatewayResponse {
+                response: GatewayResponse::buffered(status, headers, body),
+                runtime_body: None,
+            },
+            InvokeTimings {
+                arg_serialize_nanos,
+                js_call_nanos,
+                response_decode_nanos,
+            },
+        ))
     }
 }
 
@@ -3019,7 +3596,7 @@ impl DenoWorkerRuntime {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<WorkerResponse, String> {
-        let pending = self.start_gateway_response(request, env, ctx).await?;
+        let (pending, _) = self.start_gateway_response(request, env, ctx).await?;
         pending.into_worker_response(self).await
     }
 }
@@ -3337,6 +3914,73 @@ export async function fetch(request: Request) {
         assert_eq!(response.body.as_deref(), Some("abcdefghij"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_completion_does_not_deadlock_streaming_request_body() {
+        let worker_path = temp_worker_path(
+            "blocking-completion-streaming-body",
+            r#"
+export async function fetch(request: Request) {
+  return new Response(await request.text());
+}
+"#,
+        );
+        let pool = WorkerRuntimePool::new(
+            worker_path,
+            1,
+            4,
+            Duration::from_secs(5),
+            RuntimeCompletionMode::Blocking,
+        )
+        .expect("runtime pool should initialize");
+        let (request, mut ingress_body) = GatewayRequest::streaming(WorkerRequest {
+            method: "POST".to_string(),
+            url: "http://localhost/stream".to_string(),
+            headers: [("content-length".to_string(), "4".to_string())]
+                .into_iter()
+                .collect(),
+            body: None,
+        });
+
+        let response = tokio::time::timeout(Duration::from_secs(1), async {
+            let worker_future = pool.execute_gateway(
+                request,
+                WorkerEnv {
+                    worker_id: "streaming-worker".to_string(),
+                    vars: Default::default(),
+                },
+                WorkerContext::default(),
+            );
+            tokio::pin!(worker_future);
+
+            loop {
+                tokio::select! {
+                    result = &mut worker_future => break result,
+                    command = ingress_body.command_rx.recv() => match command {
+                        Some(RequestBodyCommand::ReadNext { response_tx }) => {
+                            if ingress_body.finished {
+                                let _ = response_tx.send(Ok(None));
+                            } else {
+                                ingress_body.finished = true;
+                                let _ = response_tx.send(Ok(Some(b"ping".to_vec())));
+                            }
+                        }
+                        None => panic!("streaming request body bridge should stay open until completion"),
+                    }
+                }
+            }
+        })
+        .await
+        .expect("streaming request body should not deadlock")
+        .expect("gateway response should complete successfully");
+
+        let response = response
+            .into_worker_response()
+            .await
+            .expect("gateway response should convert back to worker response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.as_deref(), Some("ping"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn worker_can_return_without_consuming_streaming_request_body() {
         let worker_path = temp_worker_path(
@@ -3401,8 +4045,14 @@ export async function fetch() {
 }
 "#,
         );
-        let pool = WorkerRuntimePool::new(worker_path, 1, 4, Duration::from_secs(5))
-            .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(
+            worker_path,
+            1,
+            4,
+            Duration::from_secs(5),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
 
         let mut response = pool
             .execute_gateway(
@@ -3445,6 +4095,81 @@ export async function fetch() {
             Some(b"gamma".to_vec())
         );
         assert_eq!(body.read_next_chunk().await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_pool_injects_runtime_shard_metadata_into_ctx() {
+        let worker_path = temp_worker_path(
+            "ctx-metadata",
+            r#"
+export async function fetch(_request: Request, _env: unknown, ctx: { metadata: Record<string, string> }) {
+  return new Response(JSON.stringify(ctx.metadata), {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+    },
+  });
+}
+"#,
+        );
+        let pool = WorkerRuntimePool::new(
+            worker_path,
+            1,
+            4,
+            Duration::from_secs(5),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
+
+        let response = pool
+            .execute(
+                WorkerRequest {
+                    method: "GET".to_string(),
+                    url: "http://localhost/ctx".to_string(),
+                    headers: Default::default(),
+                    body: None,
+                },
+                WorkerEnv {
+                    worker_id: "ctx-worker".to_string(),
+                    vars: Default::default(),
+                },
+                WorkerContext {
+                    metadata: [
+                        (
+                            HARDESS_REQUEST_TASK_ID_METADATA_KEY.to_string(),
+                            "42".to_string(),
+                        ),
+                        ("custom".to_string(), "value".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )
+            .await
+            .expect("runtime pool should execute");
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            response
+                .body
+                .as_deref()
+                .expect("worker should return metadata body"),
+        )
+        .expect("metadata body should be valid JSON");
+        assert_eq!(
+            metadata
+                .get(HARDESS_REQUEST_TASK_ID_METADATA_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            metadata
+                .get(HARDESS_RUNTIME_SHARD_METADATA_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get("custom").and_then(serde_json::Value::as_str),
+            Some("value")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3805,8 +4530,14 @@ export async function fetch() {
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_reuses_initialized_workers() {
-        let pool = WorkerRuntimePool::new(sample_worker_path(), 2, 8, Duration::from_secs(5))
-            .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(
+            sample_worker_path(),
+            2,
+            8,
+            Duration::from_secs(5),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
         assert_eq!(pool.size(), 2);
 
         let response = pool
@@ -3853,8 +4584,14 @@ export async function fetch() {
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_rejects_when_all_queues_are_full() {
-        let pool = WorkerRuntimePool::new(blocking_worker_path(), 1, 1, Duration::from_secs(5))
-            .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(
+            blocking_worker_path(),
+            1,
+            1,
+            Duration::from_secs(5),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
         let request_count = 6;
         let barrier = Arc::new(Barrier::new(request_count + 1));
         let mut tasks = Vec::with_capacity(request_count);
@@ -3917,8 +4654,14 @@ export async function fetch() {
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_pool_times_out_and_rebuilds_slot() {
-        let pool = WorkerRuntimePool::new(flaky_worker_path(), 1, 4, Duration::from_millis(100))
-            .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(
+            flaky_worker_path(),
+            1,
+            4,
+            Duration::from_millis(100),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
 
         let timed_out = pool
             .execute(
@@ -3977,8 +4720,14 @@ export async function fetch() {
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_requests_retry_cleanly_after_slot_recycles() {
-        let pool = WorkerRuntimePool::new(flaky_worker_path(), 1, 4, Duration::from_millis(100))
-            .expect("runtime pool should initialize");
+        let pool = WorkerRuntimePool::new(
+            flaky_worker_path(),
+            1,
+            4,
+            Duration::from_millis(100),
+            RuntimeCompletionMode::Auto,
+        )
+        .expect("runtime pool should initialize");
 
         let timed_out_task = tokio::spawn({
             let pool = pool.clone();

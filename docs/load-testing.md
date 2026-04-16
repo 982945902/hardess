@@ -20,6 +20,7 @@ Command summary:
 ```bash
 bun run verify
 bun run load:http
+bun run load:http:close
 bun run load:ws
 bun run load:cluster-ws
 bun run bench:ws
@@ -117,12 +118,30 @@ HTTP_LOAD_REQUESTS=2000 \
 bun run load:http
 ```
 
+Example forcing a brand-new TCP connection per request:
+```bash
+HTTP_LOAD_CONNECTION_MODE=close \
+HTTP_LOAD_CONCURRENCY=50 \
+HTTP_LOAD_REQUESTS=2000 \
+bun run load:http
+```
+
+Equivalent shortcut:
+```bash
+HTTP_LOAD_CONCURRENCY=50 HTTP_LOAD_REQUESTS=2000 bun run load:http:close
+```
+
 The script prints JSON including:
 - request counts
 - status distribution
 - error distribution
 - p50 / p90 / p99 latency
 - delta from runtime metrics snapshot when `__admin/metrics` is available
+
+Connection-mode note:
+- default is `HTTP_LOAD_CONNECTION_MODE=keepalive`
+- `HTTP_LOAD_CONNECTION_MODE=close` switches the load client to one-request-per-connection mode
+- use `close` when you want to expose connection-establishment cost separately from steady-state keep-alive reuse
 
 ## 4. Run WebSocket load
 
@@ -434,6 +453,7 @@ HTTP load:
 - `HTTP_LOAD_PEER_ID`
 - `HTTP_LOAD_PATHNAME`
 - `HTTP_LOAD_METHOD`
+- `HTTP_LOAD_CONNECTION_MODE`
 - `HTTP_LOAD_CONCURRENCY`
 - `HTTP_LOAD_REQUESTS`
 - `HTTP_LOAD_DURATION_MS`

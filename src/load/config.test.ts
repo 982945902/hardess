@@ -6,11 +6,13 @@ import { defaultClusterWsLoadTestConfig } from "./cluster-ws.ts";
 const CONFIG_ENV_KEYS = [
   "HTTP_LOAD_BASE_URL",
   "HTTP_LOAD_ADMIN_BASE_URL",
+  "HTTP_LOAD_CONNECTION_MODE",
   "HTTP_LOAD_CONCURRENCY",
   "HTTP_LOAD_REQUESTS",
   "HTTP_LOAD_REQUEST_BODY",
   "BASE_URL",
   "ADMIN_BASE_URL",
+  "CONNECTION_MODE",
   "CONCURRENCY",
   "REQUESTS",
   "REQUEST_BODY",
@@ -62,6 +64,15 @@ describe("load config env precedence", () => {
     expect(config.baseUrl).toBe("http://namespaced.example");
     expect(config.concurrency).toBe(9);
     expect(config.requestBody).toBe("{\"namespaced\":true}");
+  });
+
+  test("http load prefers namespaced connection mode over legacy alias", () => {
+    process.env.CONNECTION_MODE = "keepalive";
+    process.env.HTTP_LOAD_CONNECTION_MODE = "close";
+
+    const config = defaultHttpLoadTestConfig();
+
+    expect(config.connectionMode).toBe("close");
   });
 
   test("ws load still falls back to legacy aliases", () => {

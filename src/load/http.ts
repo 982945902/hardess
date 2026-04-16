@@ -1,3 +1,5 @@
+import * as http from "node:http";
+import * as https from "node:https";
 import {
   diffMetricsSnapshot,
   envNumberFirst,
@@ -9,12 +11,15 @@ import {
   type MetricsSnapshot
 } from "./shared.ts";
 
+export type HttpConnectionMode = "keepalive" | "close";
+
 export interface HttpLoadTestConfig {
   baseUrl: string;
   adminBaseUrl: string;
   peerId: string;
   pathname: string;
   method: string;
+  connectionMode: HttpConnectionMode;
   concurrency: number;
   totalRequests: number;
   durationMs: number;
@@ -28,6 +33,7 @@ export interface HttpLoadTestResult {
     adminBaseUrl: string;
     pathname: string;
     method: string;
+    connectionMode: HttpConnectionMode;
     concurrency: number;
     totalRequests: number;
     durationMs: number;
@@ -53,11 +59,79 @@ export function defaultHttpLoadTestConfig(): HttpLoadTestConfig {
     peerId: envStringFirst(["HTTP_LOAD_PEER_ID", "PEER_ID"], "alice"),
     pathname: envStringFirst(["HTTP_LOAD_PATHNAME", "PATHNAME"], "/demo/orders"),
     method: envStringFirst(["HTTP_LOAD_METHOD", "METHOD"], "GET").toUpperCase(),
+    connectionMode: parseHttpConnectionMode(
+      envStringFirst(["HTTP_LOAD_CONNECTION_MODE", "CONNECTION_MODE"], "keepalive")
+    ),
     concurrency: envNumberFirst(["HTTP_LOAD_CONCURRENCY", "CONCURRENCY"], 20),
     totalRequests: envNumberFirst(["HTTP_LOAD_REQUESTS", "REQUESTS"], 500),
     durationMs: envNumberFirst(["HTTP_LOAD_DURATION_MS", "DURATION_MS"], 0),
     requestBody: envOptionalStringFirst(["HTTP_LOAD_REQUEST_BODY", "REQUEST_BODY"])
   };
+}
+
+function parseHttpConnectionMode(value: string): HttpConnectionMode {
+  return value.toLowerCase() === "close" ? "close" : "keepalive";
+}
+
+async function sendFetchRequest(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  requestBody?: string
+): Promise<number> {
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: requestBody
+  });
+  return response.status;
+}
+
+async function sendFreshConnectionRequest(
+  urlText: string,
+  method: string,
+  headers: Record<string, string>,
+  requestBody?: string
+): Promise<number> {
+  const url = new URL(urlText);
+  const transport = url.protocol === "https:" ? https : http;
+  const requestHeaders = {
+    ...headers,
+    connection: "close",
+    ...(requestBody
+      ? {
+          "content-length": Buffer.byteLength(requestBody).toString()
+        }
+      : {})
+  };
+
+  return await new Promise<number>((resolve, reject) => {
+    const request = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port ? Number(url.port) : undefined,
+        path: `${url.pathname}${url.search}`,
+        method,
+        headers: requestHeaders,
+        agent: false
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => {
+          resolve(response.statusCode ?? 0);
+        });
+      }
+    );
+
+    request.on("error", reject);
+
+    if (requestBody) {
+      request.write(requestBody);
+    }
+
+    request.end();
+  });
 }
 
 export async function runHttpLoadTest(
@@ -88,15 +162,25 @@ export async function runHttpLoadTest(
 
   async function sendOne(): Promise<void> {
     const requestStartedAt = performance.now();
+    const requestUrl = `${config.baseUrl}${config.pathname}`;
 
     try {
-      const response = await fetch(`${config.baseUrl}${config.pathname}`, {
-        method: config.method,
-        headers: requestHeaders,
-        body: config.requestBody
-      });
+      const status =
+        config.connectionMode === "close"
+          ? await sendFreshConnectionRequest(
+              requestUrl,
+              config.method,
+              requestHeaders,
+              config.requestBody
+            )
+          : await sendFetchRequest(
+              requestUrl,
+              config.method,
+              requestHeaders,
+              config.requestBody
+            );
       latenciesMs.push(performance.now() - requestStartedAt);
-      incCounter(statusCounts, String(response.status));
+      incCounter(statusCounts, String(status));
     } catch (error) {
       latenciesMs.push(performance.now() - requestStartedAt);
       incCounter(errorCounts, error instanceof Error ? error.name : "unknown_error");
@@ -130,6 +214,7 @@ export async function runHttpLoadTest(
       adminBaseUrl: config.adminBaseUrl,
       pathname: config.pathname,
       method: config.method,
+      connectionMode: config.connectionMode,
       concurrency: config.concurrency,
       totalRequests: config.durationMs > 0 ? launched : config.totalRequests,
       durationMs: config.durationMs

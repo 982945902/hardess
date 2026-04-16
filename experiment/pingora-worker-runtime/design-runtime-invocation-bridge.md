@@ -99,6 +99,60 @@ Reason:
 - it only makes request field access fail later and less predictably
 - the safer first cut is a GC-managed host object with explicit runtime-scoped lifetime
 
+## Next Request Shape
+
+The next step for this bridge is not "add more JS wrapper code".
+
+It is:
+
+- move the current `Request` implementation closer to a real Rust-backed object
+  with a thinner JS policy layer
+
+The target internal shape is:
+
+- one Rust-backed request backing object
+- one JS-side internal request state object
+- one JS-facing `Request` wrapper with minimal policy logic
+
+More concretely:
+
+- Rust backing owns:
+  - request head source
+  - lazy body source
+- JS internal state owns:
+  - cached `method`
+  - cached `url`
+  - cached `headers`
+  - body state transitions
+  - `bodyUsed`
+- JS-facing `Request` owns:
+  - Web-compatible surface methods and getters
+  - very little transport logic
+
+This is intentionally closer to the `Deno` posture:
+
+- lazy first access
+- cached request fields
+- explicit body state machine
+
+and intentionally not closer to:
+
+- generic constructor-heavy wrapper logic
+- repeated bridge helper lookups
+- eager request normalization on the JS side
+
+The network/runtime policy still remains Hardess-owned:
+
+- ingress ownership
+- drain policy
+- timeout policy
+- generation lifecycle
+
+So the design goal is:
+
+- `borrow Deno's object/runtime shape`
+- `keep Hardess' transport/runtime policy`
+
 ## Warmup implications
 
 This design gives the experiment a meaningful structural warmup stage.

@@ -17,6 +17,7 @@
     "demo:client": "bun run src/demo/client.ts",
     "demo:http": "bun run src/demo/http-smoke.ts",
     "load:http": "bun run src/load/http.ts",
+    "load:http:close": "HTTP_LOAD_CONNECTION_MODE=close bun run src/load/http.ts",
     "load:ws": "bun run src/load/ws.ts",
     "load:cluster-ws": "bun run src/load/cluster-ws.ts",
     "smoke:local": "bash scripts/local-release-smoke.sh",

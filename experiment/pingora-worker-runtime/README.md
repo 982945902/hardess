@@ -13,8 +13,14 @@ Related docs:
 - [TS runtime selection note](./design-ts-runtime-selection.md)
 - [Package management design note](./design-package-management.md)
 - [Public error contract design note](./design-public-error-contract.md)
+- [Pingora / runtime event alignment note](./design-pingora-runtime-event-alignment.md)
 - [Runtime invocation bridge design note](./design-runtime-invocation-bridge.md)
 - [Low-copy response bridge note](./design-low-copy-response-bridge.md)
+- [v1 vs v2 comparison note](./design-v1-v2-comparison.md)
+- [Benchmark optimization log](./benchmark-optimization-log.md)
+- [Learning from Deno and Bun](./design-learning-from-deno-and-bun.md)
+- [Reusing Deno pieces](./design-reusing-deno-pieces.md)
+- [Next-phase plan](./plan-next-phase.md)
 - [Control Plane / Runtime Separation note](./design-control-plane-runtime-separation.md)
 - [Worker generation rollout design note](./design-worker-generation-rollout.md)
 - [Breadth-first TODO note](./TODO-breadth-first.md)
@@ -113,6 +119,13 @@ The current prototype now uses a mixed bridge:
 - request metadata crosses the Rust <-> V8 boundary as a native Rust-backed host object
 - inbound request body is now lazy and ingress-driven instead of being pre-read into a string
 - `env` and `ctx` still cross via `serde_v8`
+
+The execution model should now be read as:
+
+- host owns global lifecycle
+- Pingora session owns network lifecycle
+- request task is the execution unit
+- runtime shard is the async execution container
 - response head is normalized first, and response body can now stream back through an internal gateway bridge
 
 Current request path:
@@ -182,8 +195,25 @@ cargo run -p gateway-host --bin pingora_ingress -- \
   --runtime-threads 2 \
   --queue-capacity 64 \
   --exec-timeout-ms 5000 \
+  --completion-mode auto \
   --shutdown-drain-timeout-ms 30000
 ```
+
+`--completion-mode` currently supports:
+
+- `auto`
+- `async`
+- `blocking`
+
+Optional Pingora listener/socket tuning flags:
+
+- `--tcp-fastopen-backlog <N>`
+- `--tcp-keepalive-idle-secs <N>`
+- `--tcp-keepalive-interval-secs <N>`
+- `--tcp-keepalive-count <N>`
+- `--tcp-reuseport <true|false>`
+- Linux only:
+  - `--tcp-keepalive-user-timeout-ms <N>`
 
 Then send a request:
 
@@ -211,6 +241,21 @@ Inspect ingress drain state:
 ```bash
 curl 'http://127.0.0.1:6190/_hardess/ingress-state'
 ```
+
+`/_hardess/ingress-state` now also includes coarse ingress timing breakdowns:
+
+- `average_request_read_ms`
+- `average_request_build_ms`
+- `average_runtime_execute_ms`
+- `average_response_write_ms`
+- `average_finish_ms`
+- `average_request_total_ms`
+- `active_request_tasks`
+  - current inflight request-task count plus per-task method / uri / client /
+    body-mode / phase / age snapshot
+- `recent_request_tasks`
+  - a bounded recent-completion view with per-task outcome / last-phase /
+    duration snapshot
 
 Inspect worker generations:
 
@@ -381,6 +426,8 @@ The ingress-state snapshot includes:
 
 - `drain.draining`
 - `drain.inflight_requests`
+- `active_request_tasks`
+- `recent_request_tasks`
 - `runtime_pool` with the same runtime metrics as `/_hardess/runtime-pool`
 - `generations` with the same live project/cache metadata as `/_hardess/generations`
   and the runtime-side `version_state`

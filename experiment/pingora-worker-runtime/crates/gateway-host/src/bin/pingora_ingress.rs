@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -23,17 +25,25 @@ use gateway_host::IngressRequestBody;
 use gateway_host::PublicError;
 use gateway_host::RequestBodyCompletionPolicy;
 use gateway_host::RequestDrainController;
+use gateway_host::RuntimeCompletionMode;
 use gateway_host::RuntimePoolError;
 use gateway_host::RuntimePoolSnapshot;
 use gateway_host::WorkerProjectSnapshot;
 use gateway_host::WorkerRuntimePool;
+use gateway_host::HARDESS_CLIENT_ADDR_METADATA_KEY;
+use gateway_host::HARDESS_HTTP_VERSION_METADATA_KEY;
+use gateway_host::HARDESS_REQUEST_BODY_MODE_METADATA_KEY;
+use gateway_host::HARDESS_REQUEST_COMPLETION_POLICY_METADATA_KEY;
+use gateway_host::HARDESS_REQUEST_TASK_ID_METADATA_KEY;
 use http::Response;
 use http::StatusCode;
 use pingora::apps::HttpPersistentSettings;
 use pingora::apps::HttpServerApp;
 use pingora::apps::ReusedHttpStream;
 use pingora::http::ResponseHeader;
+use pingora::listeners::TcpSocketOptions;
 use pingora::protocols::http::ServerSession;
+use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt as PingoraOpt;
 use pingora::server::configuration::ServerConf;
 use pingora::server::RunArgs;
@@ -49,7 +59,6 @@ use serde::Serialize;
 use tokio::signal::unix;
 use worker_abi::WorkerContext;
 use worker_abi::WorkerEnv;
-use worker_abi::WorkerRequest;
 
 struct PingoraCliArgs {
     worker_entry: PathBuf,
@@ -58,6 +67,14 @@ struct PingoraCliArgs {
     runtime_threads: usize,
     queue_capacity: usize,
     exec_timeout_ms: u64,
+    completion_mode: RuntimeCompletionMode,
+    tcp_fastopen_backlog: Option<usize>,
+    tcp_keepalive_idle_secs: Option<u64>,
+    tcp_keepalive_interval_secs: Option<u64>,
+    tcp_keepalive_count: Option<usize>,
+    #[cfg(target_os = "linux")]
+    tcp_keepalive_user_timeout_ms: Option<u64>,
+    tcp_reuseport: Option<bool>,
     shutdown_drain_timeout_ms: u64,
     generation_drain_timeout_ms: u64,
 }
@@ -76,6 +93,14 @@ impl PingoraCliArgs {
             runtime_threads: 1,
             queue_capacity: 64,
             exec_timeout_ms: 5_000,
+            completion_mode: RuntimeCompletionMode::Auto,
+            tcp_fastopen_backlog: None,
+            tcp_keepalive_idle_secs: None,
+            tcp_keepalive_interval_secs: None,
+            tcp_keepalive_count: None,
+            #[cfg(target_os = "linux")]
+            tcp_keepalive_user_timeout_ms: None,
+            tcp_reuseport: None,
             shutdown_drain_timeout_ms: 30_000,
             generation_drain_timeout_ms: 30_000,
         };
@@ -109,12 +134,72 @@ impl PingoraCliArgs {
                         .parse()
                         .context("--exec-timeout-ms must be an integer")?;
                 }
+                "--completion-mode" => {
+                    let value = args.next().context("--completion-mode requires a value")?;
+                    parsed.completion_mode = match value.as_str() {
+                        "auto" => RuntimeCompletionMode::Auto,
+                        "async" => RuntimeCompletionMode::Async,
+                        "blocking" => RuntimeCompletionMode::Blocking,
+                        _ => {
+                            anyhow::bail!("--completion-mode must be one of: auto, async, blocking")
+                        }
+                    };
+                }
                 "--shutdown-drain-timeout-ms" => {
                     parsed.shutdown_drain_timeout_ms = args
                         .next()
                         .context("--shutdown-drain-timeout-ms requires a value")?
                         .parse()
                         .context("--shutdown-drain-timeout-ms must be an integer")?;
+                }
+                "--tcp-fastopen-backlog" => {
+                    parsed.tcp_fastopen_backlog = Some(
+                        args.next()
+                            .context("--tcp-fastopen-backlog requires a value")?
+                            .parse()
+                            .context("--tcp-fastopen-backlog must be an integer")?,
+                    );
+                }
+                "--tcp-keepalive-idle-secs" => {
+                    parsed.tcp_keepalive_idle_secs = Some(
+                        args.next()
+                            .context("--tcp-keepalive-idle-secs requires a value")?
+                            .parse()
+                            .context("--tcp-keepalive-idle-secs must be an integer")?,
+                    );
+                }
+                "--tcp-keepalive-interval-secs" => {
+                    parsed.tcp_keepalive_interval_secs = Some(
+                        args.next()
+                            .context("--tcp-keepalive-interval-secs requires a value")?
+                            .parse()
+                            .context("--tcp-keepalive-interval-secs must be an integer")?,
+                    );
+                }
+                "--tcp-keepalive-count" => {
+                    parsed.tcp_keepalive_count = Some(
+                        args.next()
+                            .context("--tcp-keepalive-count requires a value")?
+                            .parse()
+                            .context("--tcp-keepalive-count must be an integer")?,
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                "--tcp-keepalive-user-timeout-ms" => {
+                    parsed.tcp_keepalive_user_timeout_ms = Some(
+                        args.next()
+                            .context("--tcp-keepalive-user-timeout-ms requires a value")?
+                            .parse()
+                            .context("--tcp-keepalive-user-timeout-ms must be an integer")?,
+                    );
+                }
+                "--tcp-reuseport" => {
+                    parsed.tcp_reuseport = Some(
+                        args.next()
+                            .context("--tcp-reuseport requires a value")?
+                            .parse()
+                            .context("--tcp-reuseport must be true or false")?,
+                    );
                 }
                 "--generation-drain-timeout-ms" => {
                     parsed.generation_drain_timeout_ms = args
@@ -129,19 +214,377 @@ impl PingoraCliArgs {
 
         Ok(parsed)
     }
+
+    fn tcp_socket_options(&self) -> TcpSocketOptions {
+        let tcp_keepalive = match (
+            self.tcp_keepalive_idle_secs,
+            self.tcp_keepalive_interval_secs,
+            self.tcp_keepalive_count,
+        ) {
+            (Some(idle), Some(interval), Some(count)) => Some(TcpKeepalive {
+                idle: Duration::from_secs(idle),
+                interval: Duration::from_secs(interval),
+                count,
+                #[cfg(target_os = "linux")]
+                user_timeout: Duration::from_millis(
+                    self.tcp_keepalive_user_timeout_ms.unwrap_or(0),
+                ),
+            }),
+            _ => None,
+        };
+
+        let mut options = TcpSocketOptions::default();
+        options.tcp_fastopen = self.tcp_fastopen_backlog;
+        options.tcp_keepalive = tcp_keepalive;
+        options.so_reuseport = self.tcp_reuseport;
+        options
+    }
 }
 
 struct WorkerHttpApp {
     runtime_manager: Arc<RuntimeGenerationManager>,
     drain_controller: Arc<RequestDrainController>,
+    ingress_metrics: Arc<IngressMetrics>,
+    request_tasks: Arc<RequestTaskRegistry>,
+    next_request_task_id: AtomicU64,
     worker_id: String,
 }
 
 #[derive(Serialize)]
 struct IngressSnapshot {
     drain: DrainSnapshot,
+    active_request_tasks: ActiveRequestTasksSnapshot,
+    recent_request_tasks: RecentRequestTasksSnapshot,
+    ingress_metrics: IngressMetricsSnapshot,
     runtime_pool: RuntimePoolSnapshot,
     generations: RuntimeGenerationManagerSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct RequestTaskDescriptor {
+    request_task_id: u64,
+    method: String,
+    uri: String,
+    client_addr: Option<String>,
+    http_version: String,
+    request_body_mode: String,
+    completion_policy: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRequestTask {
+    descriptor: RequestTaskDescriptor,
+    started_at: std::time::Instant,
+    phase: RequestTaskPhase,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestTaskPhase {
+    RuntimeExecute,
+    RequestBodyFinalize,
+    ResponseWrite,
+    SessionFinish,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestTaskOutcome {
+    Succeeded,
+    ShutdownDraining,
+    BadRequest,
+    RuntimeError,
+    InternalError,
+    ResponseWriteError,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveRequestTaskSnapshot {
+    request_task_id: u64,
+    method: String,
+    uri: String,
+    client_addr: Option<String>,
+    http_version: String,
+    request_body_mode: String,
+    completion_policy: String,
+    phase: RequestTaskPhase,
+    age_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveRequestTasksSnapshot {
+    inflight_count: usize,
+    tasks: Vec<ActiveRequestTaskSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedRequestTask {
+    descriptor: RequestTaskDescriptor,
+    phase: RequestTaskPhase,
+    outcome: RequestTaskOutcome,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompletedRequestTaskSnapshot {
+    request_task_id: u64,
+    method: String,
+    uri: String,
+    client_addr: Option<String>,
+    http_version: String,
+    request_body_mode: String,
+    completion_policy: String,
+    last_phase: RequestTaskPhase,
+    outcome: RequestTaskOutcome,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecentRequestTasksSnapshot {
+    count: usize,
+    tasks: Vec<CompletedRequestTaskSnapshot>,
+}
+
+struct RequestTaskRegistry {
+    tasks: Mutex<BTreeMap<u64, ActiveRequestTask>>,
+    recent: Mutex<VecDeque<CompletedRequestTask>>,
+}
+
+impl RequestTaskRegistry {
+    const MAX_RECENT_TASKS: usize = 32;
+
+    fn new() -> Self {
+        Self {
+            tasks: Mutex::new(BTreeMap::new()),
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn track(self: &Arc<Self>, descriptor: RequestTaskDescriptor) -> RequestTaskGuard {
+        let request_task_id = descriptor.request_task_id;
+        self.tasks
+            .lock()
+            .expect("request task registry mutex should not be poisoned")
+            .insert(
+                request_task_id,
+                ActiveRequestTask {
+                    descriptor,
+                    started_at: std::time::Instant::now(),
+                    phase: RequestTaskPhase::RuntimeExecute,
+                },
+            );
+        RequestTaskGuard {
+            registry: Arc::clone(self),
+            request_task_id,
+            finished: false,
+        }
+    }
+
+    fn set_phase(&self, request_task_id: u64, phase: RequestTaskPhase) {
+        if let Some(task) = self
+            .tasks
+            .lock()
+            .expect("request task registry mutex should not be poisoned")
+            .get_mut(&request_task_id)
+        {
+            task.phase = phase;
+        }
+    }
+
+    fn finish(&self, request_task_id: u64, outcome: RequestTaskOutcome) {
+        let finished = self
+            .tasks
+            .lock()
+            .expect("request task registry mutex should not be poisoned")
+            .remove(&request_task_id);
+        if let Some(task) = finished {
+            let mut recent = self
+                .recent
+                .lock()
+                .expect("recent request task registry mutex should not be poisoned");
+            recent.push_front(CompletedRequestTask {
+                descriptor: task.descriptor,
+                phase: task.phase,
+                outcome,
+                duration_ms: task.started_at.elapsed().as_millis() as u64,
+            });
+            while recent.len() > Self::MAX_RECENT_TASKS {
+                recent.pop_back();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> ActiveRequestTasksSnapshot {
+        let now = std::time::Instant::now();
+        let tasks = self
+            .tasks
+            .lock()
+            .expect("request task registry mutex should not be poisoned");
+        ActiveRequestTasksSnapshot {
+            inflight_count: tasks.len(),
+            tasks: tasks
+                .values()
+                .map(|task| ActiveRequestTaskSnapshot {
+                    request_task_id: task.descriptor.request_task_id,
+                    method: task.descriptor.method.clone(),
+                    uri: task.descriptor.uri.clone(),
+                    client_addr: task.descriptor.client_addr.clone(),
+                    http_version: task.descriptor.http_version.clone(),
+                    request_body_mode: task.descriptor.request_body_mode.clone(),
+                    completion_policy: task.descriptor.completion_policy.clone(),
+                    phase: task.phase,
+                    age_ms: now.saturating_duration_since(task.started_at).as_millis() as u64,
+                })
+                .collect(),
+        }
+    }
+
+    fn recent_snapshot(&self) -> RecentRequestTasksSnapshot {
+        let recent = self
+            .recent
+            .lock()
+            .expect("recent request task registry mutex should not be poisoned");
+        RecentRequestTasksSnapshot {
+            count: recent.len(),
+            tasks: recent
+                .iter()
+                .map(|task| CompletedRequestTaskSnapshot {
+                    request_task_id: task.descriptor.request_task_id,
+                    method: task.descriptor.method.clone(),
+                    uri: task.descriptor.uri.clone(),
+                    client_addr: task.descriptor.client_addr.clone(),
+                    http_version: task.descriptor.http_version.clone(),
+                    request_body_mode: task.descriptor.request_body_mode.clone(),
+                    completion_policy: task.descriptor.completion_policy.clone(),
+                    last_phase: task.phase,
+                    outcome: task.outcome,
+                    duration_ms: task.duration_ms,
+                })
+                .collect(),
+        }
+    }
+}
+
+struct RequestTaskGuard {
+    registry: Arc<RequestTaskRegistry>,
+    request_task_id: u64,
+    finished: bool,
+}
+
+impl RequestTaskGuard {
+    fn set_phase(&self, phase: RequestTaskPhase) {
+        self.registry.set_phase(self.request_task_id, phase);
+    }
+
+    fn finish(mut self, outcome: RequestTaskOutcome) {
+        self.registry.finish(self.request_task_id, outcome);
+        self.finished = true;
+    }
+}
+
+struct HandleRequestResult {
+    response: GatewayResponse,
+    request_task_guard: Option<RequestTaskGuard>,
+    outcome: RequestTaskOutcome,
+}
+
+impl Drop for RequestTaskGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.registry
+                .finish(self.request_task_id, RequestTaskOutcome::Dropped);
+            self.finished = true;
+        }
+    }
+}
+
+struct IngressMetrics {
+    requests: AtomicU64,
+    total_request_read_nanos: AtomicU64,
+    total_request_build_nanos: AtomicU64,
+    total_runtime_execute_nanos: AtomicU64,
+    total_response_write_nanos: AtomicU64,
+    total_finish_nanos: AtomicU64,
+    total_request_nanos: AtomicU64,
+}
+
+impl IngressMetrics {
+    fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            total_request_read_nanos: AtomicU64::new(0),
+            total_request_build_nanos: AtomicU64::new(0),
+            total_runtime_execute_nanos: AtomicU64::new(0),
+            total_response_write_nanos: AtomicU64::new(0),
+            total_finish_nanos: AtomicU64::new(0),
+            total_request_nanos: AtomicU64::new(0),
+        }
+    }
+
+    fn record_request_read(&self, elapsed: Duration) {
+        self.total_request_read_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_request_build(&self, elapsed: Duration) {
+        self.total_request_build_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_runtime_execute(&self, elapsed: Duration) {
+        self.total_runtime_execute_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_response_write(&self, elapsed: Duration) {
+        self.total_response_write_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_finish(&self, elapsed: Duration) {
+        self.total_finish_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_request_total(&self, elapsed: Duration) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.total_request_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> IngressMetricsSnapshot {
+        let requests = self.requests.load(Ordering::Relaxed);
+        let avg = |total: u64| {
+            if requests == 0 {
+                0.0
+            } else {
+                (total as f64 / requests as f64) / 1_000_000.0
+            }
+        };
+        IngressMetricsSnapshot {
+            requests,
+            average_request_read_ms: avg(self.total_request_read_nanos.load(Ordering::Relaxed)),
+            average_request_build_ms: avg(self.total_request_build_nanos.load(Ordering::Relaxed)),
+            average_runtime_execute_ms: avg(self
+                .total_runtime_execute_nanos
+                .load(Ordering::Relaxed)),
+            average_response_write_ms: avg(self.total_response_write_nanos.load(Ordering::Relaxed)),
+            average_finish_ms: avg(self.total_finish_nanos.load(Ordering::Relaxed)),
+            average_request_total_ms: avg(self.total_request_nanos.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngressMetricsSnapshot {
+    requests: u64,
+    average_request_read_ms: f64,
+    average_request_build_ms: f64,
+    average_runtime_execute_ms: f64,
+    average_response_write_ms: f64,
+    average_finish_ms: f64,
+    average_request_total_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,6 +691,7 @@ struct RuntimeGenerationManagerConfig {
     runtime_threads: usize,
     queue_capacity: usize,
     exec_timeout: Duration,
+    completion_mode: RuntimeCompletionMode,
     generation_drain_timeout: Duration,
 }
 
@@ -377,12 +821,20 @@ impl RuntimeGenerationManager {
         env: WorkerEnv,
         ctx: WorkerContext,
     ) -> Result<GatewayResponse, RuntimePoolError> {
+        let mut request = Some(request);
+        let mut env = Some(env);
+        let mut ctx = Some(ctx);
+
         for _ in 0..4 {
             let generation = self.active_generation();
             if let Some(_guard) = generation.drain_controller.try_acquire() {
                 return generation
                     .runtime_pool
-                    .execute_gateway(request.clone(), env.clone(), ctx.clone())
+                    .execute_gateway(
+                        request.take().expect("request should be available"),
+                        env.take().expect("env should be available"),
+                        ctx.take().expect("ctx should be available"),
+                    )
                     .await;
             }
 
@@ -660,6 +1112,7 @@ impl RuntimeGenerationManager {
                 config.runtime_threads,
                 config.queue_capacity,
                 config.exec_timeout,
+                config.completion_mode,
             )?,
             drain_controller: Arc::new(RequestDrainController::new()),
         })
@@ -725,6 +1178,9 @@ impl WorkerHttpApp {
     fn ingress_state_response(&self) -> Response<Vec<u8>> {
         let snapshot = IngressSnapshot {
             drain: self.drain_controller.snapshot(),
+            active_request_tasks: self.request_tasks.snapshot(),
+            recent_request_tasks: self.request_tasks.recent_snapshot(),
+            ingress_metrics: self.ingress_metrics.snapshot(),
             runtime_pool: self.runtime_manager.active_runtime_pool_snapshot(),
             generations: self.runtime_manager.snapshot(),
         };
@@ -808,33 +1264,91 @@ impl WorkerHttpApp {
         let header = http_stream.req_header();
         let method = header.method.as_str().to_string();
         let uri = header.uri.to_string();
-        let headers: std::collections::BTreeMap<String, String> = header
-            .headers
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-            })
-            .collect();
-        let url = headers
-            .get("host")
+        let mut headers = Vec::with_capacity(header.headers.len());
+        let mut host = None::<String>;
+        let mut content_length = None::<u64>;
+        let mut has_transfer_encoding = false;
+
+        for (name, value) in header.headers.iter() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            let name = name.as_str().to_string();
+            let value = value.to_string();
+
+            if name.eq_ignore_ascii_case("host") {
+                host = Some(value.clone());
+            } else if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<u64>().ok();
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                has_transfer_encoding = true;
+            }
+
+            headers.push((name, value));
+        }
+
+        let url = host
             .map(|host| format!("http://{host}{uri}"))
             .unwrap_or(uri);
-        let request = WorkerRequest {
-            method,
-            url,
-            headers,
-            body: None,
-        };
 
-        if request_body_expected(&request) {
-            let (request, ingress_body) = GatewayRequest::streaming(request);
+        if request_body_expected(content_length, has_transfer_encoding) {
+            let completion_policy =
+                request_body_completion_policy(content_length, has_transfer_encoding);
+            let (request, ingress_body) =
+                GatewayRequest::streaming_parts(method, url, headers, completion_policy);
             Ok((request, Some(ingress_body)))
         } else {
-            Ok((GatewayRequest::buffered(request), None))
+            Ok((GatewayRequest::buffered_parts(method, url, headers), None))
         }
+    }
+
+    fn next_request_task_id(&self) -> u64 {
+        self.next_request_task_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn build_request_task_descriptor(
+        &self,
+        request_task_id: u64,
+        http_stream: &ServerSession,
+        has_ingress_body: bool,
+        completion_policy: RequestBodyCompletionPolicy,
+    ) -> RequestTaskDescriptor {
+        RequestTaskDescriptor {
+            request_task_id,
+            method: http_stream.req_header().method.as_str().to_string(),
+            uri: http_stream.req_header().uri.to_string(),
+            client_addr: http_stream.client_addr().map(|addr| addr.to_string()),
+            http_version: http_version_label(http_stream.req_header().version).to_string(),
+            request_body_mode: request_body_mode_label(has_ingress_body).to_string(),
+            completion_policy: completion_policy_label(completion_policy).to_string(),
+        }
+    }
+
+    fn build_worker_context(&self, descriptor: &RequestTaskDescriptor) -> WorkerContext {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            HARDESS_REQUEST_TASK_ID_METADATA_KEY.to_string(),
+            descriptor.request_task_id.to_string(),
+        );
+        if let Some(client_addr) = descriptor.client_addr.as_ref() {
+            metadata.insert(
+                HARDESS_CLIENT_ADDR_METADATA_KEY.to_string(),
+                client_addr.clone(),
+            );
+        }
+        metadata.insert(
+            HARDESS_HTTP_VERSION_METADATA_KEY.to_string(),
+            descriptor.http_version.clone(),
+        );
+        metadata.insert(
+            HARDESS_REQUEST_BODY_MODE_METADATA_KEY.to_string(),
+            descriptor.request_body_mode.clone(),
+        );
+        metadata.insert(
+            HARDESS_REQUEST_COMPLETION_POLICY_METADATA_KEY.to_string(),
+            descriptor.completion_policy.clone(),
+        );
+        WorkerContext { metadata }
     }
 
     fn response_from_worker(
@@ -986,71 +1500,122 @@ impl WorkerHttpApp {
         }
     }
 
-    async fn handle_request(&self, http_stream: &mut ServerSession) -> GatewayResponse {
+    async fn handle_request(&self, http_stream: &mut ServerSession) -> HandleRequestResult {
         let header = http_stream.req_header();
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/runtime-pool" {
-            return self.gateway_response_from_http_response(self.metrics_response());
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(self.metrics_response()),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/module-cache" {
-            return self.gateway_response_from_http_response(self.module_cache_response());
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(self.module_cache_response()),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/ingress-state" {
-            return self.gateway_response_from_http_response(self.ingress_state_response());
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(self.ingress_state_response()),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::GET && header.uri.path() == "/_hardess/generations" {
-            return self.gateway_response_from_http_response(self.generations_response());
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(self.generations_response()),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::POST && header.uri.path() == "/_hardess/cleanup-cache" {
-            return self.gateway_response_from_http_response(self.cleanup_cache_response());
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(self.cleanup_cache_response()),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::POST && header.uri.path() == "/_hardess/apply-worker" {
-            return self.gateway_response_from_http_response(
-                self.apply_worker_debug_response(http_stream).await,
-            );
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(
+                    self.apply_worker_debug_response(http_stream).await,
+                ),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
         if header.method == http::Method::POST && header.uri.path() == "/_hardess/reload-worker" {
-            return self.gateway_response_from_http_response(
-                match self.runtime_manager.apply_configured_worker_debug().await {
-                    Ok(snapshot) => match serde_json::to_vec_pretty(&snapshot) {
-                        Ok(body) => Response::builder()
-                            .status(StatusCode::OK)
-                            .header(
-                                http::header::CONTENT_TYPE,
-                                "application/json; charset=utf-8",
-                            )
-                            .header(http::header::CONTENT_LENGTH, body.len())
-                            .body(body)
-                            .expect("reload response should build"),
+            return HandleRequestResult {
+                response: self.gateway_response_from_http_response(
+                    match self.runtime_manager.apply_configured_worker_debug().await {
+                        Ok(snapshot) => match serde_json::to_vec_pretty(&snapshot) {
+                            Ok(body) => Response::builder()
+                                .status(StatusCode::OK)
+                                .header(
+                                    http::header::CONTENT_TYPE,
+                                    "application/json; charset=utf-8",
+                                )
+                                .header(http::header::CONTENT_LENGTH, body.len())
+                                .body(body)
+                                .expect("reload response should build"),
+                            Err(error) => self.public_error_http_response(internal_public_error(
+                                error.to_string(),
+                            )),
+                        },
                         Err(error) => self
                             .public_error_http_response(internal_public_error(error.to_string())),
                     },
-                    Err(error) => {
-                        self.public_error_http_response(internal_public_error(error.to_string()))
-                    }
-                },
-            );
+                ),
+                request_task_guard: None,
+                outcome: RequestTaskOutcome::Succeeded,
+            };
         }
 
         let _request_guard = match self.drain_controller.try_acquire() {
             Some(guard) => guard,
-            None => return self.draining_gateway_response(),
+            None => {
+                return HandleRequestResult {
+                    response: self.draining_gateway_response(),
+                    request_task_guard: None,
+                    outcome: RequestTaskOutcome::ShutdownDraining,
+                }
+            }
         };
 
+        let request_build_started_at = std::time::Instant::now();
         let (request, mut ingress_body) = match self.build_request(http_stream).await {
             Ok(request) => request,
             Err(error) => {
-                return self.public_error_gateway_response(bad_request_public_error(error));
+                return HandleRequestResult {
+                    response: self.public_error_gateway_response(bad_request_public_error(error)),
+                    request_task_guard: None,
+                    outcome: RequestTaskOutcome::BadRequest,
+                };
             }
         };
+        self.ingress_metrics
+            .record_request_build(request_build_started_at.elapsed());
         let completion_policy = request.completion_policy();
+        let request_task_id = self.next_request_task_id();
+        let request_task_descriptor = self.build_request_task_descriptor(
+            request_task_id,
+            http_stream,
+            ingress_body.is_some(),
+            completion_policy,
+        );
+        let request_task_guard = self.request_tasks.track(request_task_descriptor.clone());
+        let worker_context = self.build_worker_context(&request_task_descriptor);
         let worker_id = self.worker_id.clone();
+        let runtime_execute_started_at = std::time::Instant::now();
         let worker_future = self.runtime_manager.execute(
             request,
             WorkerEnv {
                 worker_id,
                 vars: Default::default(),
             },
-            WorkerContext::default(),
+            worker_context,
         );
         tokio::pin!(worker_future);
 
@@ -1068,33 +1633,87 @@ impl WorkerHttpApp {
                 break worker_future.await;
             }
         };
+        self.ingress_metrics
+            .record_runtime_execute(runtime_execute_started_at.elapsed());
 
         if let Some(body) = ingress_body.as_mut() {
+            request_task_guard.set_phase(RequestTaskPhase::RequestBodyFinalize);
             if let Err(error) = body.finish(http_stream, completion_policy).await {
-                return self.public_error_gateway_response(internal_public_error(error));
+                return HandleRequestResult {
+                    response: self.public_error_gateway_response(internal_public_error(error)),
+                    request_task_guard: Some(request_task_guard),
+                    outcome: RequestTaskOutcome::InternalError,
+                };
             }
             if completion_policy == RequestBodyCompletionPolicy::DisableKeepalive {
                 http_stream.set_keepalive(None);
             }
         }
 
-        match worker_result {
-            Ok(response) => response,
-            Err(error) => self.runtime_pool_gateway_response(error),
+        let (response, outcome) = match worker_result {
+            Ok(response) => (response, RequestTaskOutcome::Succeeded),
+            Err(error) => (
+                self.runtime_pool_gateway_response(error),
+                RequestTaskOutcome::RuntimeError,
+            ),
+        };
+        HandleRequestResult {
+            response,
+            request_task_guard: Some(request_task_guard),
+            outcome,
         }
     }
 }
 
-fn request_body_expected(request: &WorkerRequest) -> bool {
-    if let Some(content_length) = request.headers.get("content-length") {
-        if let Ok(length) = content_length.trim().parse::<u64>() {
-            if length > 0 {
-                return true;
-            }
+fn request_body_expected(content_length: Option<u64>, has_transfer_encoding: bool) -> bool {
+    matches!(content_length, Some(length) if length > 0) || has_transfer_encoding
+}
+
+fn http_version_label(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "http/0.9",
+        http::Version::HTTP_10 => "http/1.0",
+        http::Version::HTTP_11 => "http/1.1",
+        http::Version::HTTP_2 => "h2",
+        http::Version::HTTP_3 => "h3",
+        _ => "unknown",
+    }
+}
+
+fn request_body_mode_label(has_ingress_body: bool) -> &'static str {
+    if has_ingress_body {
+        "streaming"
+    } else {
+        "none"
+    }
+}
+
+fn completion_policy_label(policy: RequestBodyCompletionPolicy) -> &'static str {
+    match policy {
+        RequestBodyCompletionPolicy::AlreadyComplete => "already_complete",
+        RequestBodyCompletionPolicy::Drain => "drain",
+        RequestBodyCompletionPolicy::DisableKeepalive => "disable_keepalive",
+    }
+}
+
+fn request_body_completion_policy(
+    content_length: Option<u64>,
+    has_transfer_encoding: bool,
+) -> RequestBodyCompletionPolicy {
+    if let Some(length) = content_length {
+        if length == 0 {
+            return RequestBodyCompletionPolicy::AlreadyComplete;
+        }
+        if length <= 64 * 1024 {
+            return RequestBodyCompletionPolicy::Drain;
         }
     }
 
-    request.headers.contains_key("transfer-encoding")
+    if has_transfer_encoding {
+        return RequestBodyCompletionPolicy::DisableKeepalive;
+    }
+
+    RequestBodyCompletionPolicy::DisableKeepalive
 }
 
 async fn read_full_request_body(http_stream: &mut ServerSession) -> Result<Vec<u8>, String> {
@@ -1118,6 +1737,8 @@ impl HttpServerApp for WorkerHttpApp {
         mut http_stream: ServerSession,
         shutdown: &pingora::server::ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
+        let request_started_at = std::time::Instant::now();
+        let request_read_started_at = std::time::Instant::now();
         match http_stream.read_request().await {
             Ok(false) => return None,
             Ok(true) => {}
@@ -1126,6 +1747,8 @@ impl HttpServerApp for WorkerHttpApp {
                 return None;
             }
         }
+        self.ingress_metrics
+            .record_request_read(request_read_started_at.elapsed());
 
         if *shutdown.borrow() {
             http_stream.set_keepalive(None);
@@ -1133,21 +1756,48 @@ impl HttpServerApp for WorkerHttpApp {
             http_stream.set_keepalive(Some(60));
         }
 
-        let response = self.handle_request(&mut http_stream).await;
+        let HandleRequestResult {
+            response,
+            mut request_task_guard,
+            outcome,
+        } = self.handle_request(&mut http_stream).await;
+        let response_write_started_at = std::time::Instant::now();
+        if let Some(guard) = request_task_guard.as_ref() {
+            guard.set_phase(RequestTaskPhase::ResponseWrite);
+        }
         if let Err(error) = self
             .write_gateway_response(&mut http_stream, response)
             .await
         {
+            if let Some(guard) = request_task_guard.take() {
+                guard.finish(RequestTaskOutcome::ResponseWriteError);
+            }
             eprintln!("failed to write downstream response: {error}");
             return None;
         }
+        self.ingress_metrics
+            .record_response_write(response_write_started_at.elapsed());
+        self.ingress_metrics
+            .record_request_total(request_started_at.elapsed());
 
         let persistent_settings = HttpPersistentSettings::for_session(&http_stream);
+        let finish_started_at = std::time::Instant::now();
+        if let Some(guard) = request_task_guard.as_ref() {
+            guard.set_phase(RequestTaskPhase::SessionFinish);
+        }
         match http_stream.finish().await {
             Ok(connection) => {
+                if let Some(guard) = request_task_guard.take() {
+                    guard.finish(outcome);
+                }
+                self.ingress_metrics
+                    .record_finish(finish_started_at.elapsed());
                 connection.map(|stream| ReusedHttpStream::new(stream, Some(persistent_settings)))
             }
             Err(error) => {
+                if let Some(guard) = request_task_guard.take() {
+                    guard.finish(RequestTaskOutcome::InternalError);
+                }
                 eprintln!("failed to finish downstream request: {error}");
                 None
             }
@@ -1233,11 +1883,17 @@ impl ShutdownSignalWatch for DrainAwareShutdownSignalWatch {
 
 fn main() {
     let cli = PingoraCliArgs::parse().expect("pingora ingress cli should parse");
+    let tcp_socket_options = cli.tcp_socket_options();
+    let tcp_keepalive_display = tcp_socket_options
+        .tcp_keepalive
+        .as_ref()
+        .map(ToString::to_string);
     let runtime_manager = RuntimeGenerationManager::new(RuntimeGenerationManagerConfig {
         worker_entry: cli.worker_entry.clone(),
         runtime_threads: cli.runtime_threads,
         queue_capacity: cli.queue_capacity,
         exec_timeout: Duration::from_millis(cli.exec_timeout_ms),
+        completion_mode: cli.completion_mode,
         generation_drain_timeout: Duration::from_millis(cli.generation_drain_timeout_ms),
     })
     .expect("worker runtime generation manager should initialize");
@@ -1257,18 +1913,25 @@ fn main() {
         WorkerHttpApp {
             runtime_manager,
             drain_controller: drain_controller.clone(),
+            ingress_metrics: Arc::new(IngressMetrics::new()),
+            request_tasks: Arc::new(RequestTaskRegistry::new()),
+            next_request_task_id: AtomicU64::new(0),
             worker_id: cli.worker_id.clone(),
         },
     );
-    service.add_tcp(&cli.listen);
+    service.add_tcp_with_settings(&cli.listen, tcp_socket_options);
 
     println!(
-        "pingora ingress listening on http://{} for worker_id={} runtime_threads={} queue_capacity={} exec_timeout_ms={} shutdown_drain_timeout_ms={} generation_drain_timeout_ms={}",
+        "pingora ingress listening on http://{} for worker_id={} runtime_threads={} queue_capacity={} exec_timeout_ms={} completion_mode={:?} tcp_fastopen_backlog={:?} tcp_keepalive={:?} tcp_reuseport={:?} shutdown_drain_timeout_ms={} generation_drain_timeout_ms={}",
         cli.listen,
         cli.worker_id,
         cli.runtime_threads,
         cli.queue_capacity,
         cli.exec_timeout_ms,
+        cli.completion_mode,
+        cli.tcp_fastopen_backlog,
+        tcp_keepalive_display,
+        cli.tcp_reuseport,
         cli.shutdown_drain_timeout_ms,
         cli.generation_drain_timeout_ms
     );
@@ -1318,16 +1981,136 @@ mod tests {
                 runtime_threads: 1,
                 queue_capacity: 4,
                 exec_timeout: Duration::from_secs(5),
+                completion_mode: RuntimeCompletionMode::Auto,
                 generation_drain_timeout: Duration::from_millis(10),
             })
             .expect("runtime manager should initialize"),
             drain_controller: Arc::new(RequestDrainController::new()),
+            ingress_metrics: Arc::new(IngressMetrics::new()),
+            request_tasks: Arc::new(RequestTaskRegistry::new()),
+            next_request_task_id: AtomicU64::new(0),
             worker_id: "test-worker".to_string(),
         }
     }
 
     fn test_app() -> WorkerHttpApp {
         test_app_with_worker(sample_worker_path())
+    }
+
+    #[test]
+    fn request_task_registry_tracks_lifecycle() {
+        let registry = Arc::new(RequestTaskRegistry::new());
+        let descriptor = RequestTaskDescriptor {
+            request_task_id: 7,
+            method: "POST".to_string(),
+            uri: "/demo/orders".to_string(),
+            client_addr: Some("127.0.0.1:12345".to_string()),
+            http_version: "http/1.1".to_string(),
+            request_body_mode: "streaming".to_string(),
+            completion_policy: "drain".to_string(),
+        };
+        let guard = registry.track(descriptor);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.inflight_count, 1);
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].request_task_id, 7);
+        assert_eq!(snapshot.tasks[0].method, "POST");
+        assert_eq!(snapshot.tasks[0].uri, "/demo/orders");
+        assert_eq!(
+            snapshot.tasks[0].client_addr.as_deref(),
+            Some("127.0.0.1:12345")
+        );
+        assert_eq!(snapshot.tasks[0].http_version, "http/1.1");
+        assert_eq!(snapshot.tasks[0].request_body_mode, "streaming");
+        assert_eq!(snapshot.tasks[0].completion_policy, "drain");
+        assert!(matches!(
+            snapshot.tasks[0].phase,
+            RequestTaskPhase::RuntimeExecute
+        ));
+
+        drop(guard);
+
+        let settled = registry.snapshot();
+        assert_eq!(settled.inflight_count, 0);
+        assert!(settled.tasks.is_empty());
+
+        let recent = registry.recent_snapshot();
+        assert_eq!(recent.count, 1);
+        assert_eq!(recent.tasks[0].request_task_id, 7);
+        assert!(matches!(
+            recent.tasks[0].outcome,
+            RequestTaskOutcome::Dropped
+        ));
+    }
+
+    #[test]
+    fn helper_labels_match_public_metadata_shape() {
+        assert_eq!(http_version_label(http::Version::HTTP_11), "http/1.1");
+        assert_eq!(request_body_mode_label(true), "streaming");
+        assert_eq!(request_body_mode_label(false), "none");
+        assert_eq!(
+            completion_policy_label(RequestBodyCompletionPolicy::AlreadyComplete),
+            "already_complete"
+        );
+        assert_eq!(
+            completion_policy_label(RequestBodyCompletionPolicy::Drain),
+            "drain"
+        );
+        assert_eq!(
+            completion_policy_label(RequestBodyCompletionPolicy::DisableKeepalive),
+            "disable_keepalive"
+        );
+    }
+
+    #[test]
+    fn ingress_state_response_exposes_active_request_tasks() {
+        let app = test_app();
+        let _guard = app.request_tasks.track(RequestTaskDescriptor {
+            request_task_id: 9,
+            method: "GET".to_string(),
+            uri: "/benchmark/orders".to_string(),
+            client_addr: Some("127.0.0.1:54321".to_string()),
+            http_version: "http/1.1".to_string(),
+            request_body_mode: "none".to_string(),
+            completion_policy: "already_complete".to_string(),
+        });
+
+        let response = app.ingress_state_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: Value =
+            serde_json::from_slice(response.body()).expect("ingress-state response should be json");
+        assert_eq!(
+            body.pointer("/active_request_tasks/inflight_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            body.pointer("/active_request_tasks/tasks/0/request_task_id")
+                .and_then(Value::as_u64),
+            Some(9)
+        );
+        assert_eq!(
+            body.pointer("/active_request_tasks/tasks/0/method")
+                .and_then(Value::as_str),
+            Some("GET")
+        );
+        assert_eq!(
+            body.pointer("/active_request_tasks/tasks/0/uri")
+                .and_then(Value::as_str),
+            Some("/benchmark/orders")
+        );
+        assert_eq!(
+            body.pointer("/active_request_tasks/tasks/0/phase")
+                .and_then(Value::as_str),
+            Some("runtime_execute")
+        );
+        assert_eq!(
+            body.pointer("/recent_request_tasks/count")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1562,6 +2345,7 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
+            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");
@@ -1699,6 +2483,7 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
+            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");
@@ -1792,6 +2577,7 @@ mod tests {
             runtime_threads: 1,
             queue_capacity: 4,
             exec_timeout: Duration::from_secs(5),
+            completion_mode: RuntimeCompletionMode::Auto,
             generation_drain_timeout: Duration::from_millis(10),
         })
         .expect("runtime manager should initialize");
