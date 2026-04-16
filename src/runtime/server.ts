@@ -9,7 +9,15 @@ declare const Bun: {
     port: number;
     fetch(
       request: Request,
-      server: { upgrade(request: Request, options?: { data?: unknown }): boolean }
+      server: {
+        upgrade(
+          request: Request,
+          options?: {
+            headers?: HeadersInit;
+            data?: unknown;
+          }
+        ): boolean
+      }
     ): Promise<Response | undefined> | Response | undefined;
     websocket: Record<string, unknown>;
   }): {

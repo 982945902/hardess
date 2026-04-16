@@ -212,6 +212,7 @@ HTTP proxy contract:
 6. Upstream response status/body/headers are returned to caller unless worker short-circuits first.
 7. Upstream network failures are mapped to platform-defined gateway error codes.
 8. `AuthContext` may be propagated upstream through Hardess-owned headers rather than reusing the client bearer token directly.
+9. If a pipeline explicitly enables `downstream.websocket`, Hardess may also proxy websocket upgrade requests on that matched path to the downstream origin using the same auth and header-injection model.
 
 ### 6.2 WebSocket Hub
 Hub responsibilities:

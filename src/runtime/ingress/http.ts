@@ -10,6 +10,10 @@ import type { ConfigStore } from "../config/store.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { proxyUpstream } from "../proxy/upstream.ts";
+import {
+  isWebSocketUpgradeRequest,
+  UpstreamWebSocketProxyRuntime
+} from "../proxy/upstream-websocket.ts";
 import { runWorker } from "../workers/runner.ts";
 
 export interface HttpRuntimeDeps {
@@ -17,6 +21,16 @@ export interface HttpRuntimeDeps {
   authService: AuthService;
   logger: Logger;
   metrics?: Metrics;
+  serverRef: {
+    upgrade(
+      request: Request,
+      options?: {
+        headers?: HeadersInit;
+        data?: unknown;
+      }
+    ): boolean;
+  };
+  upstreamWebSocketProxy: UpstreamWebSocketProxyRuntime;
 }
 
 function findPipeline(pathname: string, pipelines: PipelineConfig[]): PipelineConfig | undefined {
@@ -28,7 +42,7 @@ function findPipeline(pathname: string, pipelines: PipelineConfig[]): PipelineCo
 export async function handleHttpRequest(
   request: Request,
   deps: HttpRuntimeDeps
-): Promise<Response> {
+): Promise<Response | undefined> {
   const traceId = request.headers.get("x-trace-id") ?? crypto.randomUUID();
   const metrics = deps.metrics ?? new NoopMetrics();
   const startedAt = Date.now();
@@ -44,6 +58,12 @@ export async function handleHttpRequest(
       throw new HardessError(ERROR_CODES.ROUTE_NO_RECIPIENT, `No pipeline for ${url.pathname}`);
     }
 
+    if (isWebSocketUpgradeRequest(request) && !pipeline.downstream.websocket) {
+      metrics.increment("http.ws_proxy_disabled");
+      metrics.timing("http.request_ms", Date.now() - startedAt);
+      return new Response("WebSocket proxy is not enabled for this pipeline", { status: 426 });
+    }
+
     const auth = pipeline.auth?.required === false
       ? await deps.authService.validateBearerToken("demo:anonymous")
       : await deps.authService.validateBearerToken(request.headers.get("authorization"));
@@ -57,6 +77,19 @@ export async function handleHttpRequest(
     }
 
     const upstreamRequest = workerResult.request ?? request;
+    if (isWebSocketUpgradeRequest(upstreamRequest)) {
+      const response = await deps.upstreamWebSocketProxy.upgrade(
+        upstreamRequest,
+        pipeline,
+        auth,
+        traceId,
+        deps.serverRef
+      );
+      metrics.increment("http.ws_proxy_ok");
+      metrics.timing("http.request_ms", Date.now() - startedAt);
+      return response;
+    }
+
     const response = await proxyUpstream(upstreamRequest, pipeline, auth, traceId, metrics);
     metrics.increment("http.proxy_ok");
     metrics.timing("http.request_ms", Date.now() - startedAt);

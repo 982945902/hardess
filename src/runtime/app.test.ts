@@ -88,6 +88,200 @@ describe("createRuntimeApp", () => {
     expect(response?.status).toBe(426);
   });
 
+  it("rejects business websocket upgrades when the pipeline does not enable upstream websocket proxy", async () => {
+    const app = await createRuntimeApp({
+      configModulePath: "./config/hardess.config.ts"
+    });
+    appDisposers.push(() => app.dispose());
+
+    const response = await app.fetch(
+      new Request("http://localhost/demo/socket", {
+        headers: {
+          authorization: "Bearer demo:alice",
+          connection: "Upgrade",
+          upgrade: "websocket"
+        }
+      }),
+      {
+        upgrade() {
+          return true;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+
+    expect(response?.status).toBe(426);
+    expect(await response?.text()).toContain("WebSocket proxy is not enabled");
+  });
+
+  it("proxies business websocket traffic to the configured upstream websocket", async () => {
+    class FakeUpstreamWebSocket {
+      static instances: FakeUpstreamWebSocket[] = [];
+
+      readonly listeners = {
+        open: [] as Array<() => void>,
+        message: [] as Array<(event: { data?: unknown }) => void>,
+        close: [] as Array<(event: { code?: number; reason?: string }) => void>,
+        error: [] as Array<() => void>
+      };
+      readonly sent: Array<string | ArrayBuffer | Uint8Array> = [];
+      readonly url: string;
+      readonly headers?: Record<string, string>;
+      readonly protocols?: string | string[];
+      protocol: string;
+      binaryType?: "nodebuffer" | "arraybuffer" | "uint8array";
+      closed?: {
+        code?: number;
+        reason?: string;
+      };
+
+      constructor(url: string | URL, options?: { headers?: Record<string, string>; protocols?: string | string[] }) {
+        this.url = String(url);
+        this.headers = options?.headers;
+        this.protocols = options?.protocols;
+        const offered = Array.isArray(options?.protocols)
+          ? options?.protocols[0]
+          : options?.protocols;
+        this.protocol = offered ?? "";
+        FakeUpstreamWebSocket.instances.push(this);
+        queueMicrotask(() => {
+          for (const listener of this.listeners.open) {
+            listener();
+          }
+        });
+      }
+
+      addEventListener(type: "open" | "message" | "close" | "error", listener: (...args: never[]) => void): void {
+        (this.listeners[type] as Array<(...args: never[]) => void>).push(listener);
+      }
+
+      send(data: string | ArrayBuffer | Uint8Array): void {
+        this.sent.push(data);
+      }
+
+      close(code?: number, reason?: string): void {
+        this.closed = { code, reason };
+      }
+
+      emitMessage(data: unknown): void {
+        for (const listener of this.listeners.message) {
+          listener({ data });
+        }
+      }
+
+      emitClose(code?: number, reason?: string): void {
+        for (const listener of this.listeners.close) {
+          listener({ code, reason });
+        }
+      }
+    }
+
+    interface ProxiedServerSocket {
+      data: Record<string, unknown> & { bridgeId: string };
+      sent: Array<string | ArrayBuffer | Uint8Array>;
+      closed?: {
+        code?: number;
+        reason?: string;
+      };
+      send(data: string | ArrayBuffer | Uint8Array): number;
+      close(code?: number, reason?: string): void;
+    }
+
+    const dir = await mkdtemp(join(tmpdir(), "hardess-app-upstream-ws-"));
+    cleanupPaths.push(dir);
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: [
+          {
+            id: "demo-upstream-ws",
+            matchPrefix: "/demo",
+            auth: { required: true },
+            downstream: {
+              origin: "ws://upstream.internal",
+              websocket: true,
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000,
+              forwardAuthContext: false,
+              injectedHeaders: {
+                "x-proxy-mode": "ws"
+              }
+            }
+          }
+        ]
+      };`
+    );
+
+    const app = await createRuntimeApp({
+      configModulePath: configPath,
+      upstreamWebSocket: {
+        socketFactory: (url, options) => new FakeUpstreamWebSocket(url, options)
+      }
+    });
+    appDisposers.push(() => app.dispose());
+
+    let upgradeData: unknown;
+    let upgradeHeaders: HeadersInit | undefined;
+    const response = await app.fetch(
+      new Request("http://localhost/demo/socket?room=alpha", {
+        headers: {
+          authorization: "Bearer demo:alice",
+          connection: "Upgrade",
+          upgrade: "websocket",
+          "sec-websocket-protocol": "chat.v1"
+        }
+      }),
+      {
+        upgrade(_request, options) {
+          upgradeData = options?.data;
+          upgradeHeaders = options?.headers;
+          return true;
+        }
+      },
+      {
+        listener: "public"
+      }
+    );
+
+    expect(response).toBeUndefined();
+    expect(FakeUpstreamWebSocket.instances).toHaveLength(1);
+    const upstreamSocket = FakeUpstreamWebSocket.instances[0]!;
+    expect(upstreamSocket.url).toBe("ws://upstream.internal/demo/socket?room=alpha");
+    expect(upstreamSocket.headers?.authorization).toBeUndefined();
+    expect(upstreamSocket.headers?.["x-hardess-peer-id"]).toBe("alice");
+    expect(upstreamSocket.headers?.["x-proxy-mode"]).toBe("ws");
+    expect(upstreamSocket.protocols).toEqual(["chat.v1"]);
+    expect(new Headers(upgradeHeaders).get("sec-websocket-protocol")).toBe("chat.v1");
+
+    const serverSocket: ProxiedServerSocket = {
+      data: upgradeData as ProxiedServerSocket["data"],
+      sent: [],
+      send(data) {
+        this.sent.push(data);
+        return typeof data === "string" ? data.length : data.byteLength;
+      },
+      close(code?: number, reason?: string) {
+        this.closed = { code, reason };
+      }
+    };
+    app.websocket.open(serverSocket);
+
+    await app.websocket.message(serverSocket, "client->upstream");
+    expect(upstreamSocket.sent).toEqual(["client->upstream"]);
+
+    upstreamSocket.emitMessage("upstream->client");
+    expect(serverSocket.sent).toEqual(["upstream->client"]);
+
+    upstreamSocket.emitClose(1000, "done");
+    expect(serverSocket.closed).toEqual({
+      code: 1000,
+      reason: "done"
+    });
+  });
+
   it("keeps the default listener unrestricted for backward compatibility", async () => {
     const app = await createRuntimeApp({
       configModulePath: "./config/hardess.config.ts",

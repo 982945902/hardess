@@ -13,6 +13,10 @@ import { createWebSocketHandlers } from "./ingress/websocket.ts";
 import { ConsoleLogger, type Logger } from "./observability/logger.ts";
 import { InMemoryMetrics, type Metrics, type MetricsSnapshotProvider } from "./observability/metrics.ts";
 import { renderPrometheusMetrics } from "./observability/prometheus.ts";
+import {
+  UpstreamWebSocketProxyRuntime,
+  type UpstreamWebSocketFactory
+} from "./proxy/upstream-websocket.ts";
 import { chatServerModule } from "./protocol/chat-module.ts";
 import { demoServerModule } from "./protocol/demo-module.ts";
 import { ServerProtocolRegistry } from "./protocol/registry.ts";
@@ -62,10 +66,19 @@ export interface RuntimeAppOptions {
       allowedPathPrefixes?: string[];
     };
   };
+  upstreamWebSocket?: {
+    socketFactory?: UpstreamWebSocketFactory;
+  };
 }
 
 export interface UpgradeServerRef {
-  upgrade(request: Request, options?: { data?: unknown }): boolean;
+  upgrade(
+    request: Request,
+    options?: {
+      headers?: HeadersInit;
+      data?: unknown;
+    }
+  ): boolean;
 }
 
 export type RuntimeListenerName = "default" | "public" | "internal";
@@ -153,7 +166,12 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     maxConnectionsPerPeer: options.websocket?.maxConnectionsPerPeer,
     rateLimit: options.websocket?.rateLimit,
     outbound: options.websocket?.outbound,
-    shutdownGraceMs: options.websocket?.shutdownGraceMs
+      shutdownGraceMs: options.websocket?.shutdownGraceMs
+  });
+  const upstreamWebSocketProxy = new UpstreamWebSocketProxyRuntime({
+    logger,
+    metrics,
+    socketFactory: options.upstreamWebSocket?.socketFactory
   });
   clusterNetwork.setServerHandlers({
     deliver(payload) {
@@ -170,6 +188,11 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
         return;
       }
 
+      if (socket.data?.kind === "upstream_proxy") {
+        upstreamWebSocketProxy.openClientSocket(socket as unknown as Parameters<typeof upstreamWebSocketProxy.openClientSocket>[0]);
+        return;
+      }
+
       websocket.open(socket as Parameters<typeof websocket.open>[0]);
     },
     async message(socket: { data?: Record<string, unknown> }, raw: string | ArrayBuffer | Uint8Array) {
@@ -178,11 +201,28 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
         return;
       }
 
+      if (socket.data?.kind === "upstream_proxy") {
+        upstreamWebSocketProxy.clientMessage(
+          socket as unknown as Parameters<typeof upstreamWebSocketProxy.clientMessage>[0],
+          raw
+        );
+        return;
+      }
+
       await websocket.message(socket as Parameters<typeof websocket.message>[0], raw);
     },
-    close(socket: { data?: Record<string, unknown> }) {
+    close(socket: { data?: Record<string, unknown> }, code?: number, reason?: string) {
       if (socket.data?.kind === "cluster") {
         clusterNetwork.closeServerSocket(socket as unknown as ClusterSocket);
+        return;
+      }
+
+      if (socket.data?.kind === "upstream_proxy") {
+        upstreamWebSocketProxy.clientClose(
+          socket as unknown as Parameters<typeof upstreamWebSocketProxy.clientClose>[0],
+          code,
+          reason
+        );
         return;
       }
 
@@ -282,6 +322,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       unsubscribeConfig();
       configStore.dispose();
       websocket.dispose();
+      upstreamWebSocketProxy.dispose();
       clusterNetwork.dispose();
     },
     async fetch(
@@ -494,7 +535,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           configStore,
           authService,
           logger,
-          metrics
+          metrics,
+          serverRef,
+          upstreamWebSocketProxy
         });
       } finally {
         inFlightHttpRequests -= 1;

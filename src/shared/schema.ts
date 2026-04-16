@@ -35,6 +35,7 @@ export const pipelineConfigSchema = z.object({
     origin: z.string().url("downstream.origin must be a valid absolute URL"),
     connectTimeoutMs: z.number().int().positive("connectTimeoutMs must be > 0"),
     responseTimeoutMs: z.number().int().positive("responseTimeoutMs must be > 0"),
+    websocket: z.boolean().optional(),
     forwardAuthContext: z.boolean().optional(),
     injectedHeaders: stringRecordSchema.optional()
   }),

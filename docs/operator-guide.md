@@ -41,6 +41,8 @@ Listener policy semantics:
 HTTP proxy timeout semantics:
 - `connectTimeoutMs`: budget until Hardess gets the upstream response
 - `responseTimeoutMs`: budget to read the upstream response body after headers are available
+- when a pipeline sets `downstream.websocket=true`, websocket upgrade requests on that matched path are proxied to the downstream origin instead of using the normal HTTP fetch path
+- for upstream websocket proxying, `connectTimeoutMs` still applies to the upstream websocket connect handshake; `responseTimeoutMs` remains HTTP-response specific
 
 WebSocket ingress / egress:
 

@@ -6,6 +6,7 @@ import { DemoBearerAuthProvider } from "../auth/provider.ts";
 import { RuntimeAuthService } from "../auth/service.ts";
 import { ConsoleLogger } from "../observability/logger.ts";
 import { InMemoryMetrics } from "../observability/metrics.ts";
+import { UpstreamWebSocketProxyRuntime } from "../proxy/upstream-websocket.ts";
 
 const config: HardessConfig = {
   pipelines: [
@@ -53,6 +54,24 @@ function createConfigStoreMock(nextConfig: HardessConfig): ConfigStore {
   };
 }
 
+function createHttpDeps(nextConfig: HardessConfig, metrics: InMemoryMetrics) {
+  return {
+    configStore: createConfigStoreMock(nextConfig),
+    authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
+    logger: new ConsoleLogger(),
+    metrics,
+    serverRef: {
+      upgrade() {
+        return false;
+      }
+    },
+    upstreamWebSocketProxy: new UpstreamWebSocketProxyRuntime({
+      logger: new ConsoleLogger(),
+      metrics
+    })
+  };
+}
+
 describe("handleHttpRequest", () => {
   it("proxies authenticated requests", async () => {
     const metrics = new InMemoryMetrics();
@@ -62,16 +81,12 @@ describe("handleHttpRequest", () => {
           authorization: "Bearer demo:alice"
         }
       }),
-      {
-        configStore: createConfigStoreMock(config),
-        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger(),
-        metrics
-      }
+      createHttpDeps(config, metrics)
     );
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toEqual({
       ok: true,
       url: "http://upstream.internal/demo/orders"
     });
@@ -93,15 +108,11 @@ describe("handleHttpRequest", () => {
           authorization: "Bearer demo:alice"
         }
       }),
-      {
-        configStore: createConfigStoreMock(config),
-        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger(),
-        metrics
-      }
+      createHttpDeps(config, metrics)
     );
 
-    expect(response.status).toBe(404);
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(404);
     expect(metrics.counter("http.request_in")).toBe(1);
     expect(metrics.counter("http.route_missing")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
@@ -123,26 +134,22 @@ describe("handleHttpRequest", () => {
           authorization: "Bearer demo:alice"
         }
       }),
-      {
-        configStore: createConfigStoreMock({
-          pipelines: [
-            {
-              ...config.pipelines[0]!,
-              downstream: {
-                ...config.pipelines[0]!.downstream,
-                connectTimeoutMs: 5,
-                responseTimeoutMs: 20
-              }
+      createHttpDeps({
+        pipelines: [
+          {
+            ...config.pipelines[0]!,
+            downstream: {
+              ...config.pipelines[0]!.downstream,
+              connectTimeoutMs: 5,
+              responseTimeoutMs: 20
             }
-          ]
-        }),
-        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger(),
-        metrics
-      }
+          }
+        ]
+      }, metrics)
     );
 
-    expect(response.status).toBe(504);
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(504);
     expect(metrics.counter("http.upstream_connect_timeout")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
   });
@@ -172,27 +179,23 @@ describe("handleHttpRequest", () => {
           authorization: "Bearer demo:alice"
         }
       }),
-      {
-        configStore: createConfigStoreMock({
-          pipelines: [
-            {
-              ...config.pipelines[0]!,
-              downstream: {
-                ...config.pipelines[0]!.downstream,
-                connectTimeoutMs: 5,
-                responseTimeoutMs: 20
-              }
+      createHttpDeps({
+        pipelines: [
+          {
+            ...config.pipelines[0]!,
+            downstream: {
+              ...config.pipelines[0]!.downstream,
+              connectTimeoutMs: 5,
+              responseTimeoutMs: 20
             }
-          ]
-        }),
-        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger(),
-        metrics
-      }
+          }
+        ]
+      }, metrics)
     );
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toEqual({ ok: true });
     expect(metrics.counter("http.upstream_connect_timeout")).toBe(0);
     expect(metrics.counter("http.upstream_timeout")).toBe(0);
     expect(metrics.counter("http.upstream_ok")).toBe(1);
@@ -223,26 +226,22 @@ describe("handleHttpRequest", () => {
           authorization: "Bearer demo:alice"
         }
       }),
-      {
-        configStore: createConfigStoreMock({
-          pipelines: [
-            {
-              ...config.pipelines[0]!,
-              downstream: {
-                ...config.pipelines[0]!.downstream,
-                connectTimeoutMs: 20,
-                responseTimeoutMs: 5
-              }
+      createHttpDeps({
+        pipelines: [
+          {
+            ...config.pipelines[0]!,
+            downstream: {
+              ...config.pipelines[0]!.downstream,
+              connectTimeoutMs: 20,
+              responseTimeoutMs: 5
             }
-          ]
-        }),
-        authService: new RuntimeAuthService([new DemoBearerAuthProvider()]),
-        logger: new ConsoleLogger(),
-        metrics
-      }
+          }
+        ]
+      }, metrics)
     );
 
-    expect(response.status).toBe(504);
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(504);
     expect(metrics.counter("http.upstream_connect_timeout")).toBe(0);
     expect(metrics.counter("http.upstream_timeout")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);

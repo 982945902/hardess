@@ -311,6 +311,7 @@ export interface PipelineConfig {
     origin: string;
     connectTimeoutMs: number;
     responseTimeoutMs: number;
+    websocket?: boolean;
     forwardAuthContext?: boolean;
     injectedHeaders?: Record<string, string>;
   };
