@@ -115,11 +115,15 @@ describe("admin planning helpers", () => {
       workerEntry: "workers/shared.ts",
       routeId: "route:shared",
       routePathPrefix: "/demo/shared",
-      denoJson: "https://admin.example/deno.json",
-      denoLock: "https://admin.example/deno.lock",
+      packageManagerKind: "bun",
+      packageJson: "https://admin.example/package.json",
+      bunLock: "https://admin.example/bun.lock",
       frozenLock: true
     });
-    expect(manifest.packageManager.denoJson).toBe("https://admin.example/deno.json");
+    expect(manifest.packageManager.kind).toBe("bun");
+    expect(manifest.packageManager.kind === "bun" ? manifest.packageManager.packageJson : undefined).toBe(
+      "https://admin.example/package.json"
+    );
 
     const summary = buildDeploymentRolloutSummary(
       [
@@ -228,6 +232,28 @@ describe("admin planning helpers", () => {
         pendingHosts: 1
       })
     ]);
+  });
+
+  it("builds deno manifests when deno package files are declared", () => {
+    const manifest = buildHttpWorkerArtifactManifest({
+      deploymentId: "deployment:shared-deno",
+      declaredVersion: "shared/v2",
+      manifestId: "manifest:shared-deno",
+      sourceUri: "https://admin.example/shared-deno.ts",
+      workerName: "shared-deno-worker",
+      workerEntry: "workers/shared-deno.ts",
+      routeId: "route:shared-deno",
+      routePathPrefix: "/demo/shared-deno",
+      packageManagerKind: "deno",
+      denoJson: "https://admin.example/deno.json",
+      denoLock: "https://admin.example/deno.lock",
+      frozenLock: true
+    });
+
+    expect(manifest.packageManager.kind).toBe("deno");
+    expect(manifest.packageManager.kind === "deno" ? manifest.packageManager.denoJson : undefined).toBe(
+      "https://admin.example/deno.json"
+    );
   });
 
   it("builds serve manifests and carries groupId into placement", () => {

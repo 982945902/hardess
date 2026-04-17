@@ -30,6 +30,7 @@ export interface RuntimeAppOptions {
   logger?: Logger;
   metrics?: Metrics;
   nodeId?: string;
+  hostGroupId?: string;
   prometheusPrefix?: string;
   cluster?: {
     peers?: ClusterPeerNode[];
@@ -202,6 +203,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
 
   const websocket = createWebSocketHandlers({
     nodeId,
+    hostGroupId: options.hostGroupId,
     authService,
     peerLocator: localPeerLocator,
     dispatcher,

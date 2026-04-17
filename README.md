@@ -21,13 +21,21 @@ PEER_ID=bob bun run demo:client
 PEER_ID=alice TARGET_PEER_ID=bob AUTO_SEND=true bun run demo:client
 
 # admin-projected path
+bun run demo:stack
+
+# or start the four processes manually
 bun run demo:upstream
 bun run demo:admin
 ADMIN_BASE_URL=http://127.0.0.1:9100 ADMIN_HOST_ID=host-demo-a PORT=3000 bun run dev
 ADMIN_BASE_URL=http://127.0.0.1:9100 ADMIN_HOST_ID=host-demo-b PORT=3001 bun run dev
 ```
 
-The admin-projected flow is the current better demo: it exercises host registration, desired-state reconcile, artifact staging, shared/per-host HTTP projection, `serve`, and placement `groupId`. See [docs/v1-admin-mock-demo.md](docs/v1-admin-mock-demo.md).
+The admin-projected flow is the current better demo: it exercises host registration, desired-state reconcile, artifact staging, shared/per-host HTTP projection, `serve`, and group-local placement/topology projection. See [docs/v1-admin-mock-demo.md](docs/v1-admin-mock-demo.md).
+
+Useful overrides for `demo:stack`:
+
+- `DEMO_STACK_RESET_ARTIFACTS=1` clears the two local artifact cache directories before boot
+- `DEMO_STACK_SHARED_DEPLOYMENT_REPLICAS=2` starts the mock admin with two shared owners
 
 Run verification:
 
@@ -173,26 +181,15 @@ Current `serve` behavior:
 - supports `app.use(...)`, nested router mount, per-method routes, and `:param`
 - adapts back into the current worker `fetch(request, env, ctx)` ABI at load time
 
-## WS Group Scope
+## Group Model
 
-WebSocket clients can now authenticate into one explicit `groupId`:
+The current `v1` group model is runtime-side, not client-side:
 
-```ts
-import { HardessClient } from "./src/sdk/index.ts";
-
-const client = new HardessClient("ws://127.0.0.1:3000/ws");
-client.connect("demo:alice", {
-  groupId: "group-chat"
-});
-await client.waitUntilReady();
-```
-
-Routing semantics:
-
-- same explicit `groupId` can locate and fan out to each other
-- missing `groupId` is treated as the default group, not a global wildcard
-- distributed peer locate is narrowed by topology when `groupId` is present
-- if you omit the connect option entirely, the client joins the default group
+- `admin` is global and can manage multiple groups
+- one `hardess` host belongs to exactly one group, decided at startup by `HOST_GROUP_ID`
+- if `HOST_GROUP_ID` is omitted, that host joins the default group
+- HTTP forwarding, WS peer locate, and cross-node relay stay inside the host's group-local topology
+- clients do not need to pass a `groupId`; upstream control-plane routing should send them to the correct host set
 
 ## Docs
 

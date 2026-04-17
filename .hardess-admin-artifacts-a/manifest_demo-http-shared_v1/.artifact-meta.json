@@ -1,0 +1,24 @@
+{
+  "sourceUri": "http://127.0.0.1:9100/artifacts/demo-http-worker.ts",
+  "digest": "sha256:10b69066cf9e729c499b7360a76cbdf53701b70e6481dd4a9ff276e200cb3b67",
+  "entry": "workers/demo-http-worker.ts",
+  "denoJson": "http://127.0.0.1:9100/artifacts/deno.json",
+  "denoLock": "http://127.0.0.1:9100/artifacts/deno.lock",
+  "inputs": [
+    {
+      "kind": "worker",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/demo-http-worker.ts",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-http-shared_v1/workers/demo-http-worker.ts"
+    },
+    {
+      "kind": "denoJson",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.json",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-http-shared_v1/deno.json"
+    },
+    {
+      "kind": "denoLock",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.lock",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-http-shared_v1/deno.lock"
+    }
+  ]
+}

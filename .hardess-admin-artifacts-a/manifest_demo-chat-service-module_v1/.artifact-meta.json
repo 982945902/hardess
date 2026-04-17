@@ -1,0 +1,24 @@
+{
+  "sourceUri": "http://127.0.0.1:9100/artifacts/demo-chat-service-module.ts",
+  "digest": "sha256:54bc410db32da6b69482f0d234970dc82dc48be24b869e4a9cfac9f16f6abc1d",
+  "entry": "services/demo-chat-service-module.ts",
+  "denoJson": "http://127.0.0.1:9100/artifacts/deno.json",
+  "denoLock": "http://127.0.0.1:9100/artifacts/deno.lock",
+  "inputs": [
+    {
+      "kind": "worker",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/demo-chat-service-module.ts",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-chat-service-module_v1/services/demo-chat-service-module.ts"
+    },
+    {
+      "kind": "denoJson",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.json",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-chat-service-module_v1/deno.json"
+    },
+    {
+      "kind": "denoLock",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.lock",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-a/manifest_demo-chat-service-module_v1/deno.lock"
+    }
+  ]
+}

@@ -100,6 +100,7 @@ Admin / host-agent control plane:
 - `ADMIN_BASE_URL`: when set, enable the optional host-agent reconcile loop against the admin service
 - `ADMIN_BEARER_TOKEN`: optional bearer token for admin HTTP requests
 - `ADMIN_HOST_ID`: admin-facing host id; defaults to `NODE_ID`, then `local`
+- `HOST_GROUP_ID`: optional host group identity; one runtime host belongs to exactly one group, and omitting it places the host in the default group
 - `HARDESS_RUNTIME_VERSION`: runtime version string reported during host registration, default `v1`
 - `ADMIN_BUSINESS_BASE_URL`: optional business base URL advertised in host registration; falls back to `ADMIN_PUBLIC_BASE_URL`
 - `ADMIN_CONTROL_BASE_URL`: optional control base URL advertised in host registration; falls back to `ADMIN_INTERNAL_BASE_URL`
@@ -118,11 +119,14 @@ Admin / host-agent control plane:
 Current implementation note:
 
 - the optional host-agent loop is now wired into runtime startup when `ADMIN_BASE_URL` is set
+- when `HOST_GROUP_ID` is set, runtime registers that host group to admin and uses it as the boundary for group-local HTTP / WS forwarding and cluster locate
 - the admin SDK, HTTP transport, mock transport, shared protocol types, and runtime-side reconcile loop all exist
 - `http_worker` assignments now compile into live `HardessConfig` pipelines and are applied through the runtime config store
 - for `http_worker`, the current artifact path treats `ArtifactManifest.source.uri` as the worker source file and stages it under `ADMIN_ARTIFACT_ROOT_DIR`
 - `service_module` assignments now stage their module source under `ADMIN_ARTIFACT_ROOT_DIR`, load the staged entry, validate the explicit `{ protocol, version, actions }` export shape, and register or replace those actions in the runtime WebSocket protocol registry
-- when `packageManager.denoJson` / `packageManager.denoLock` are present, runtime also stages those project files into the same local artifact directory using the worker source location as the resolution base
+- when `packageManager.kind=\"bun\"` and `packageJson` is present, runtime also runs `bun install` in the staged artifact directory before activation
+- when `packageManager` declares Bun or Deno project files, runtime stages those files into the same local artifact directory using the worker source location as the resolution base
+- Deno project files are currently staged only; the Bun host runtime does not yet run a Deno-native prepare step
 - remote artifact cache reuse is only considered stable when the main worker source carries a `digest`; without that, runtime will restage remote sources instead of trusting cached metadata
 
 ## Verification Env Vars

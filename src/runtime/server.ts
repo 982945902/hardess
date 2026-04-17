@@ -232,6 +232,7 @@ try {
   const app = await createRuntimeApp({
     configModulePath: processEnv.CONFIG_MODULE_PATH,
     nodeId: envString("NODE_ID") ?? "local",
+    hostGroupId: envString("HOST_GROUP_ID"),
     prometheusPrefix: envString("PROMETHEUS_METRIC_PREFIX") ?? "hardess",
     cluster: {
       peers: parseClusterPeers(),
@@ -329,6 +330,7 @@ try {
     metricsMode,
     configModulePath: processEnv.CONFIG_MODULE_PATH ?? "./config/hardess.config.ts",
     nodeId: envString("NODE_ID") ?? "local",
+    hostGroupId: envString("HOST_GROUP_ID"),
     clusterTransport: parseClusterTransport(),
     clusterPeers: parseClusterPeers().map((peer) => peer.nodeId),
     alertWindowMs: alertMonitor ? alertWindowMs : undefined
@@ -364,6 +366,7 @@ try {
             serviceModuleManager,
             topologyStore: app.topologyStore,
             hostId: envString("ADMIN_HOST_ID") ?? envString("NODE_ID") ?? "local",
+            groupId: envString("HOST_GROUP_ID"),
             nodeId: envString("NODE_ID") ?? "local",
             runtimeVersion: envString("HARDESS_RUNTIME_VERSION") ?? "v1",
             publicBaseUrl: envString("ADMIN_BUSINESS_BASE_URL") ?? envString("ADMIN_PUBLIC_BASE_URL"),
@@ -392,7 +395,8 @@ try {
     hostAgent.start();
     app.logger.info("hardess host agent enabled", {
       adminBaseUrl,
-      hostId: envString("ADMIN_HOST_ID") ?? envString("NODE_ID") ?? "local"
+      hostId: envString("ADMIN_HOST_ID") ?? envString("NODE_ID") ?? "local",
+      hostGroupId: envString("HOST_GROUP_ID")
     });
   }
   void app.clusterNetwork.warmConnections().catch((error) => {

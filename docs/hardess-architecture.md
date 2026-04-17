@@ -302,7 +302,7 @@ Current behavior:
 2. Cross-node message delivery and cross-node `sys.handleAck` forwarding use a long-lived control WebSocket channel at `GET /__cluster/ws`.
 3. The runtime server defaults `CLUSTER_TRANSPORT` to `ws`; `http` remains supported as a compatibility and fallback mode, and the `ws` mode can degrade individual requests back to the control HTTP endpoints when the WS channel is temporarily unavailable or backpressured.
 4. The optional shared secret is enforced on HTTP locate requests and during the control WebSocket `hello` handshake.
-5. When a connection authenticates with a `groupId`, distributed peer discovery is narrowed to that group on both the local connection table and the remote locate probe set derived from topology.
+5. Distributed peer discovery is narrowed by the host's group-local topology on both the local connection table and the remote locate probe set derived from topology; clients do not select that group directly.
 
 Why this shape exists:
 1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.

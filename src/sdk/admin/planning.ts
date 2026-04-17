@@ -15,6 +15,7 @@ export type HttpWorkerRouteScope = "shared" | "per_host";
 
 export interface PlacementCandidateHost {
   hostId: string;
+  groupId?: string;
   staticLabels?: Record<string, string>;
   staticCapabilities?: string[];
   staticCapacity?: {
@@ -42,6 +43,10 @@ export interface HttpWorkerDeploymentPlan {
   routeId: string;
   routePathPrefix: string;
   routeScope?: HttpWorkerRouteScope;
+  packageManagerKind?: "bun" | "deno";
+  packageJson?: string;
+  bunfigToml?: string;
+  bunLock?: string;
   denoJson?: string;
   denoLock?: string;
   frozenLock?: boolean;
@@ -95,6 +100,22 @@ export interface DeploymentRolloutSummary {
 }
 
 export function buildHttpWorkerArtifactManifest(plan: HttpWorkerDeploymentPlan): ArtifactManifest {
+  const packageManager =
+    plan.packageManagerKind === "deno" || plan.denoJson !== undefined || plan.denoLock !== undefined
+      ? {
+          kind: "deno" as const,
+          denoJson: plan.denoJson,
+          denoLock: plan.denoLock,
+          frozenLock: plan.frozenLock
+        }
+      : {
+          kind: "bun" as const,
+          packageJson: plan.packageJson,
+          bunfigToml: plan.bunfigToml,
+          bunLock: plan.bunLock,
+          frozenLock: plan.frozenLock
+        };
+
   return {
     manifestId: plan.manifestId,
     artifactKind: plan.deploymentKind ?? "http_worker",
@@ -105,12 +126,7 @@ export function buildHttpWorkerArtifactManifest(plan: HttpWorkerDeploymentPlan):
       digest: plan.sourceDigest
     },
     entry: plan.workerEntry,
-    packageManager: {
-      kind: "deno",
-      denoJson: plan.denoJson,
-      denoLock: plan.denoLock,
-      frozenLock: plan.frozenLock
-    },
+    packageManager,
     metadata: plan.metadataAnnotations
       ? {
           annotations: { ...plan.metadataAnnotations }
@@ -171,6 +187,11 @@ export function buildMembershipSnapshot(input: {
           : "ready";
         return {
           hostId: registration.hostId,
+          ...(registration.groupId !== undefined
+            ? {
+                groupId: registration.groupId
+              }
+            : {}),
           nodeId: registration.nodeId,
           publicBaseUrl: registration.network.publicBaseUrl,
           internalBaseUrl: registration.network.internalBaseUrl,
@@ -247,7 +268,11 @@ export function buildPlacementSnapshot(input: {
       .map((deployment) => ({
         deploymentId: deployment.deploymentId,
         deploymentKind: deployment.deploymentKind,
-        groupId: deployment.groupId,
+        ...(deployment.groupId !== undefined
+          ? {
+              groupId: deployment.groupId
+            }
+          : {}),
         ownerHostIds: Array.from(deployment.ownerHostIds).sort((left, right) => left.localeCompare(right)),
         routes: Array.from(deployment.routesById.values())
           .map((route) => ({
@@ -441,6 +466,7 @@ export function buildPlacementCandidateHosts(input: {
       const observed = observedByHostId.get(registration.hostId);
       return {
         hostId: registration.hostId,
+        groupId: registration.groupId,
         staticLabels: { ...registration.staticLabels },
         staticCapabilities: [...registration.staticCapabilities],
         staticCapacity: {
@@ -468,6 +494,10 @@ function isCandidateEligible(
   deployment: HttpWorkerDeploymentPlan,
   candidate: PlacementCandidateHost
 ): boolean {
+  if (deployment.groupId !== candidate.groupId) {
+    return false;
+  }
+
   if (candidate.ready === false || candidate.draining === true || candidate.schedulable === false) {
     return false;
   }
@@ -565,7 +595,11 @@ function buildAssignmentForHost(hostId: string, deployment: HttpWorkerDeployment
     hostId,
     deploymentId: deployment.deploymentId,
     deploymentKind: deployment.deploymentKind ?? "http_worker",
-    groupId: deployment.groupId,
+    ...(deployment.groupId !== undefined
+      ? {
+          groupId: deployment.groupId
+        }
+      : {}),
     declaredVersion: deployment.declaredVersion,
     declaredArtifactId: deployment.declaredArtifactId,
     artifact: {

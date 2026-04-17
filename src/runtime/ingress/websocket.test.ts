@@ -299,7 +299,7 @@ describe("createWebSocketHandlers", () => {
     expect(actions.slice(-2)).toEqual(["recvAck", "handleAck"]);
   });
 
-  it("scopes peer delivery to the sender groupId", async () => {
+  it("uses hostGroupId instead of trusting client-selected auth group", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
     const peerLocator = new InMemoryPeerLocator();
     const dispatcher = new Dispatcher(peerLocator);
@@ -308,6 +308,7 @@ describe("createWebSocketHandlers", () => {
 
     const handlers = createWebSocketHandlers({
       nodeId: "local",
+      hostGroupId: "group-a",
       authService,
       peerLocator,
       dispatcher,
@@ -316,12 +317,10 @@ describe("createWebSocketHandlers", () => {
     });
 
     const alice = createSocket("conn-alice");
-    const bobA = createSocket("conn-bob-a");
-    const bobB = createSocket("conn-bob-b");
+    const bob = createSocket("conn-bob");
 
     handlers.open(alice);
-    handlers.open(bobA);
-    handlers.open(bobB);
+    handlers.open(bob);
 
     await handlers.message(
       alice,
@@ -336,15 +335,15 @@ describe("createWebSocketHandlers", () => {
         payload: {
           provider: "bearer",
           payload: "demo:alice",
-          groupId: "group-a"
+          groupId: "group-client-wrong"
         }
       })
     );
 
     await handlers.message(
-      bobA,
+      bob,
       serializeEnvelope({
-        msgId: "m-auth-bob-a",
+        msgId: "m-auth-bob",
         kind: "system",
         src: { peerId: "anonymous", connId: "pending" },
         protocol: "sys",
@@ -354,31 +353,13 @@ describe("createWebSocketHandlers", () => {
         payload: {
           provider: "bearer",
           payload: "demo:bob",
-          groupId: "group-a"
+          groupId: "group-other-wrong"
         }
       })
     );
 
-    await handlers.message(
-      bobB,
-      serializeEnvelope({
-        msgId: "m-auth-bob-b",
-        kind: "system",
-        src: { peerId: "anonymous", connId: "pending" },
-        protocol: "sys",
-        version: "1.0",
-        action: "auth",
-        ts: Date.now(),
-        payload: {
-          provider: "bearer",
-          payload: "demo:bob",
-          groupId: "group-b"
-        }
-      })
-    );
-
-    bobA.sent.length = 0;
-    bobB.sent.length = 0;
+    expect(peerLocator.getByConnId("conn-alice")?.groupId).toBe("group-a");
+    expect(peerLocator.getByConnId("conn-bob")?.groupId).toBe("group-a");
 
     await handlers.message(
       alice,
@@ -397,12 +378,11 @@ describe("createWebSocketHandlers", () => {
       })
     );
 
-    expect(lastEnvelope(bobA)?.kind).toBe("biz");
-    expect(lastEnvelope(bobA)?.payload).toEqual({
+    expect(lastEnvelope(bob)?.kind).toBe("biz");
+    expect(lastEnvelope(bob)?.payload).toEqual({
       toPeerId: "bob",
       content: "hello-group-a"
     });
-    expect(bobB.sent).toEqual([]);
   });
 
   it("sends heartbeat ping and closes stale connections", async () => {

@@ -34,6 +34,7 @@ export interface RuntimeHostAdapterOptions {
   artifactStore?: ArtifactStore;
   artifactRootDir?: string;
   hostId: string;
+  groupId?: string;
   nodeId?: string;
   runtimeVersion: string;
   publicBaseUrl?: string;
@@ -87,6 +88,11 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
     const state = this.options.app.runtimeState();
     return {
       hostId: this.options.hostId,
+      ...(this.options.groupId !== undefined
+        ? {
+            groupId: this.options.groupId
+          }
+        : {}),
       nodeId: this.options.nodeId,
       startedAt: state.startedAt,
       runtime: {
@@ -333,7 +339,11 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
           pipelines.push({
             id: `${assignment.assignmentId}:${route.routeId}`,
             matchPrefix: route.match.pathPrefix,
-            groupId: assignment.groupId,
+            ...(assignment.groupId !== undefined
+              ? {
+                  groupId: assignment.groupId
+                }
+              : {}),
             auth: {
               required: true
             },

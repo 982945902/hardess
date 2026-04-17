@@ -11,6 +11,7 @@ describe("RuntimeTopologyStore", () => {
         hosts: [
           {
             hostId: "host-a",
+            groupId: "group-chat",
             nodeId: "node-a",
             internalBaseUrl: "http://node-a.internal",
             publicListenerEnabled: true,
@@ -22,6 +23,7 @@ describe("RuntimeTopologyStore", () => {
           },
           {
             hostId: "host-b",
+            groupId: "group-chat",
             nodeId: "node-b",
             internalBaseUrl: "http://node-b.internal",
             publicListenerEnabled: true,
@@ -104,6 +106,7 @@ describe("RuntimeTopologyStore", () => {
           },
           {
             hostId: "host-c",
+            groupId: "group-chat",
             nodeId: "node-c",
             publicBaseUrl: "http://node-c.public",
             publicListenerEnabled: true,
@@ -127,7 +130,7 @@ describe("RuntimeTopologyStore", () => {
     ]);
   });
 
-  it("narrows cluster peers by placement groupId when provided", () => {
+  it("narrows cluster peers by membership host groupId when provided", () => {
     const store = new RuntimeTopologyStore();
     store.setTopology({
       membership: {
@@ -136,6 +139,7 @@ describe("RuntimeTopologyStore", () => {
         hosts: [
           {
             hostId: "host-a",
+            groupId: "group-chat",
             nodeId: "node-a",
             internalBaseUrl: "http://node-a.internal",
             publicListenerEnabled: true,
@@ -147,6 +151,7 @@ describe("RuntimeTopologyStore", () => {
           },
           {
             hostId: "host-b",
+            groupId: "group-other",
             nodeId: "node-b",
             internalBaseUrl: "http://node-b.internal",
             publicListenerEnabled: true,
@@ -158,6 +163,7 @@ describe("RuntimeTopologyStore", () => {
           },
           {
             hostId: "host-c",
+            groupId: "group-chat",
             nodeId: "node-c",
             internalBaseUrl: "http://node-c.internal",
             publicListenerEnabled: true,
@@ -172,15 +178,7 @@ describe("RuntimeTopologyStore", () => {
       placement: {
         revision: "topology:3:placement",
         generatedAt: 1,
-        deployments: [
-          {
-            deploymentId: "deploy-chat",
-            deploymentKind: "service_module",
-            groupId: "group-chat",
-            ownerHostIds: ["host-c"],
-            routes: []
-          }
-        ]
+        deployments: []
       }
     });
 

@@ -58,6 +58,7 @@ type ClearTimeoutLike = (handle: TimeoutHandle) => void;
 
 export interface WebSocketRuntimeDeps {
   nodeId: string;
+  hostGroupId?: string;
   authService: AuthService;
   peerLocator: InMemoryPeerLocator;
   dispatcher: Dispatcher;
@@ -580,13 +581,13 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
         connection.auth = {
           ...auth,
-          groupId: authPayload.groupId
+          groupId: deps.hostGroupId
         };
         deps.peerLocator.register({
           nodeId: deps.nodeId,
           connId: connection.socket.data.connId,
           peerId: auth.peerId,
-          groupId: authPayload.groupId
+          groupId: deps.hostGroupId
         });
         enqueueOutbound(
           connection,

@@ -80,21 +80,19 @@ export class RuntimeTopologyStore {
   }
 
   private resolveAllowedHostIdsForGroup(groupId?: string): Set<string> | undefined {
-    const deployments = this.topology?.placement.deployments ?? [];
-    if (deployments.length === 0) {
+    const hosts = this.topology?.membership.hosts ?? [];
+    if (hosts.length === 0) {
       return undefined;
     }
 
     const ownerHostIds = new Set<string>();
     let matched = false;
-    for (const deployment of deployments) {
-      if (deployment.groupId !== groupId) {
+    for (const host of hosts) {
+      if (host.groupId !== groupId) {
         continue;
       }
       matched = true;
-      for (const hostId of deployment.ownerHostIds) {
-        ownerHostIds.add(hostId);
-      }
+      ownerHostIds.add(host.hostId);
     }
 
     if (!matched) {

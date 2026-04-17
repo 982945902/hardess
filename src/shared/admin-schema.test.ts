@@ -167,7 +167,7 @@ describe("admin protocol schemas", () => {
     ).toThrow("Invalid Assignment");
   });
 
-  it("parses observed host state and artifact manifest", () => {
+  it("parses observed host state and bun artifact manifest", () => {
     const observed = parseObservedHostState({
       hostId: "host-a",
       observedAt: Date.now(),
@@ -221,9 +221,9 @@ describe("admin protocol schemas", () => {
       },
       entry: "workers/demo-worker.ts",
       packageManager: {
-        kind: "deno",
-        denoJson: "deno.json",
-        denoLock: "deno.lock",
+        kind: "bun",
+        packageJson: "package.json",
+        bunLock: "bun.lock",
         frozenLock: true
       },
       metadata: {
@@ -235,6 +235,26 @@ describe("admin protocol schemas", () => {
 
     expect(observed.assignmentStatuses[0]?.state).toBe("active");
     expect(observed.dynamicState.appliedTopology?.membershipRevision).toBe("topology:42:membership");
+    expect(manifest.packageManager.kind).toBe("bun");
+  });
+
+  it("parses a deno artifact manifest", () => {
+    const manifest = parseArtifactManifest({
+      manifestId: "manifest-http-2",
+      artifactKind: "http_worker",
+      declaredVersion: "worker-v4",
+      source: {
+        uri: "https://admin.example/artifacts/http-worker.ts"
+      },
+      entry: "workers/demo-worker.ts",
+      packageManager: {
+        kind: "deno",
+        denoJson: "deno.json",
+        denoLock: "deno.lock",
+        frozenLock: true
+      }
+    });
+
     expect(manifest.packageManager.kind).toBe("deno");
   });
 });

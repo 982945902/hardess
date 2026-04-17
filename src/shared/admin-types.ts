@@ -9,6 +9,7 @@ export interface HostStaticCapacity {
 
 export interface HostRegistration {
   hostId: string;
+  groupId?: string;
   nodeId?: string;
   startedAt: number;
   runtime: {
@@ -92,6 +93,7 @@ export type MembershipHostState = "ready" | "draining" | "offline";
 
 export interface MembershipHost {
   hostId: string;
+  groupId?: string;
   nodeId?: string;
   publicBaseUrl?: string;
   internalBaseUrl?: string;
@@ -198,6 +200,21 @@ export interface ObservedHostState {
   }>;
 }
 
+export type ArtifactPackageManager =
+  | {
+      kind: "bun";
+      packageJson?: string;
+      bunfigToml?: string;
+      bunLock?: string;
+      frozenLock?: boolean;
+    }
+  | {
+      kind: "deno";
+      denoJson?: string;
+      denoLock?: string;
+      frozenLock?: boolean;
+    };
+
 export interface ArtifactManifest {
   manifestId: string;
   artifactKind: DeploymentKind;
@@ -208,12 +225,7 @@ export interface ArtifactManifest {
     digest?: string;
   };
   entry: string;
-  packageManager: {
-    kind: "deno";
-    denoJson?: string;
-    denoLock?: string;
-    frozenLock?: boolean;
-  };
+  packageManager: ArtifactPackageManager;
   metadata?: {
     annotations?: Record<string, string>;
   };

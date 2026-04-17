@@ -49,10 +49,6 @@ export interface HardessClientOptions {
   };
 }
 
-export interface HardessClientConnectOptions {
-  groupId?: string;
-}
-
 interface PendingStageWaiter {
   resolve(event: ClientDeliveryEvent): void;
   reject(error: Error): void;
@@ -108,7 +104,6 @@ export class HardessClient {
   private readonly pendingDeliveries = new Map<string, PendingDelivery>();
   private readonly readyWaiters = new Set<ReadyWaiter>();
   private readyState: ClientReadyState = "idle";
-  private connectOptions?: HardessClientConnectOptions;
 
   constructor(
     private readonly websocketUrl: string,
@@ -142,14 +137,13 @@ export class HardessClient {
     this.registry.unregister(protocol, version);
   }
 
-  connect(token: string, options: HardessClientConnectOptions = {}): void {
+  connect(token: string): void {
     this.token = token;
-    this.connectOptions = options;
     this.readyState = "connecting";
     this.transport.connect(this.websocketUrl, {
       onOpen: () => {
         this.readyState = "authenticating";
-        this.sendAuth(token, this.connectOptions);
+        this.sendAuth(token);
         this.startHeartbeat();
       },
       onClose: (info) => {
@@ -242,7 +236,6 @@ export class HardessClient {
     this.stopHeartbeat();
     this.readyState = "closed";
     this.token = undefined;
-    this.connectOptions = undefined;
     this.rejectReadyWaiters(
       createClientSdkError(CLIENT_ERROR_CODES.CLIENT_TRANSPORT_CLOSED, "Client closed before becoming ready", {
         close: {
@@ -406,7 +399,7 @@ export class HardessClient {
     }
   }
 
-  private sendAuth(token: string, options?: HardessClientConnectOptions): void {
+  private sendAuth(token: string): void {
     const authEnvelope = createEnvelope({
       kind: "system",
       src: { peerId: "anonymous", connId: "pending" },
@@ -415,8 +408,7 @@ export class HardessClient {
       action: "auth",
       payload: {
         provider: "bearer",
-        payload: token,
-        groupId: options?.groupId
+        payload: token
       }
     });
     this.transport.send(serializeEnvelope(authEnvelope));

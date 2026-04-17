@@ -1,0 +1,24 @@
+{
+  "sourceUri": "http://127.0.0.1:9100/artifacts/demo-serve-app.ts",
+  "digest": "sha256:e4938f3f30ed950ba2ff80bff4abc7162c5371d431773d1c224c7e4e20c8fe9a",
+  "entry": "apps/demo-serve-app.ts",
+  "denoJson": "http://127.0.0.1:9100/artifacts/deno.json",
+  "denoLock": "http://127.0.0.1:9100/artifacts/deno.lock",
+  "inputs": [
+    {
+      "kind": "worker",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/demo-serve-app.ts",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-b/manifest_demo-personnel-serve_v1/apps/demo-serve-app.ts"
+    },
+    {
+      "kind": "denoJson",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.json",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-b/manifest_demo-personnel-serve_v1/deno.json"
+    },
+    {
+      "kind": "denoLock",
+      "sourceRef": "http://127.0.0.1:9100/artifacts/deno.lock",
+      "targetPath": "/Users/lishuo121/hardess/.hardess-admin-artifacts-b/manifest_demo-personnel-serve_v1/deno.lock"
+    }
+  ]
+}

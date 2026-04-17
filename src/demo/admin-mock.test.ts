@@ -16,6 +16,7 @@ function createRegistrationRequest(
     },
     body: JSON.stringify({
       hostId,
+      groupId: "group-personnel",
       startedAt: Date.now(),
       runtime: {
         kind: "hardess-v1",

@@ -8,6 +8,7 @@ Use [../README.md](../README.md) as the repo entrypoint. This document stays foc
 bun run dev
 bun run demo:upstream
 bun run demo:admin
+bun run demo:stack
 bun run demo:client
 bun run demo:http
 bun run verify
@@ -26,7 +27,7 @@ bun run test:sdk
 There are now two useful local flows:
 
 - quick single-node path: direct runtime config, good for smoke-testing the basic HTTP / WS path
-- admin-projected path: mock control-plane, good for exercising `DesiredHostState`, artifact staging, `serve`, rollout, and `groupId` placement
+- admin-projected path: mock control-plane, good for exercising `DesiredHostState`, artifact staging, `serve`, rollout, and host-group-scoped placement/topology
 
 ## 1. Quick Single-Node Flow
 
@@ -90,7 +91,21 @@ This flow is the better fit when you want to observe the current `v1` runtime bo
 - artifact manifest fetch and local staging
 - shared vs host-local HTTP deployment projection
 - `serve` deployment projection
-- placement `groupId` projection
+- host registration with `HOST_GROUP_ID`
+- group-local topology projection
+
+### 2.0 One-Command Start
+
+```bash
+bun run demo:stack
+```
+
+Useful overrides:
+
+- `DEMO_STACK_RESET_ARTIFACTS=1 bun run demo:stack`
+- `DEMO_STACK_SHARED_DEPLOYMENT_REPLICAS=2 bun run demo:stack`
+
+The script starts `upstream`, `admin`, `host-demo-a`, and `host-demo-b`, waits for readiness, prints useful URLs, and shuts the full stack down on `Ctrl+C`.
 
 ### 2.1 Start Upstream And Mock Admin
 
@@ -114,6 +129,7 @@ Terminal 3:
 ADMIN_BASE_URL=http://127.0.0.1:9100 \
 ADMIN_HOST_ID=host-demo-a \
 ADMIN_ARTIFACT_ROOT_DIR=.hardess-admin-artifacts-a \
+HOST_GROUP_ID=group-personnel \
 PORT=3000 \
 bun run dev
 ```
@@ -124,6 +140,7 @@ Terminal 4:
 ADMIN_BASE_URL=http://127.0.0.1:9100 \
 ADMIN_HOST_ID=host-demo-b \
 ADMIN_ARTIFACT_ROOT_DIR=.hardess-admin-artifacts-b \
+HOST_GROUP_ID=group-personnel \
 PORT=3001 \
 bun run dev
 ```
@@ -146,7 +163,7 @@ curl -s \
   http://127.0.0.1:3000/demo/hosts/host-demo-a | jq .
 ```
 
-Serve route with explicit placement group:
+Serve route inside the host group:
 
 ```bash
 curl -i \
@@ -158,7 +175,7 @@ Expected:
 
 - `/demo/shared` only exists on the selected owner host when `sharedDeploymentReplicas=1`
 - `/demo/hosts/<hostId>` is projected per host
-- `/demo/serve/health` is projected to both hosts
+- `/demo/serve/health` is projected to both hosts in `group-personnel`
 - serve response includes `x-hardess-admin-scope=serve`
 - serve response includes `x-hardess-group-id=group-personnel`
 

@@ -42,12 +42,13 @@ interface DemoArtifactFiles {
   hostWorker: DemoWorkerArtifactFiles;
   serveApp: DemoWorkerArtifactFiles;
   serviceModule: DemoWorkerArtifactFiles;
-  denoJson: string;
-  denoLock: string;
+  packageJson: string;
+  bunLock: string;
 }
 
 interface DemoServiceModuleDeploymentPlan {
   deploymentId: string;
+  groupId?: string;
   declaredArtifactId?: string;
   declaredVersion: string;
   manifestId: string;
@@ -82,8 +83,9 @@ const sharedWorkerArtifactUrl = new URL("./admin-artifacts/demo-http-worker.ts",
 const hostWorkerArtifactUrl = new URL("./admin-artifacts/demo-host-worker.ts", import.meta.url);
 const serveAppArtifactUrl = new URL("./admin-artifacts/demo-serve-app.ts", import.meta.url);
 const serviceModuleArtifactUrl = new URL("./admin-artifacts/demo-chat-service-module.ts", import.meta.url);
-const denoJsonArtifactUrl = new URL("./admin-artifacts/deno.json", import.meta.url);
-const denoLockArtifactUrl = new URL("./admin-artifacts/deno.lock", import.meta.url);
+const packageJsonArtifactUrl = new URL("./admin-artifacts/package.json", import.meta.url);
+const bunLockArtifactUrl = new URL("./admin-artifacts/bun.lock", import.meta.url);
+const DEMO_GROUP_ID = "group-personnel";
 
 export async function createDemoAdminApp(
   options: DemoAdminAppOptions = {}
@@ -276,8 +278,8 @@ async function loadArtifactFiles(): Promise<DemoArtifactFiles> {
   const hostWorkerSource = await readFile(hostWorkerArtifactUrl, "utf8");
   const serveAppSource = await readFile(serveAppArtifactUrl, "utf8");
   const serviceModuleSource = await readFile(serviceModuleArtifactUrl, "utf8");
-  const denoJson = await readFile(denoJsonArtifactUrl, "utf8");
-  const denoLock = await readFile(denoLockArtifactUrl, "utf8");
+  const packageJson = await readFile(packageJsonArtifactUrl, "utf8");
+  const bunLock = await readFile(bunLockArtifactUrl, "utf8");
   return {
     sharedWorker: {
       source: sharedWorkerSource,
@@ -295,8 +297,8 @@ async function loadArtifactFiles(): Promise<DemoArtifactFiles> {
       source: serviceModuleSource,
       digest: `sha256:${createHash("sha256").update(serviceModuleSource).digest("hex")}`
     },
-    denoJson,
-    denoLock
+    packageJson,
+    bunLock
   };
 }
 
@@ -307,6 +309,7 @@ function buildDemoHttpDeployments(
   return [
     {
       deploymentId: "deployment:demo-http-shared",
+      groupId: DEMO_GROUP_ID,
       declaredArtifactId: "demo-http-shared-worker",
       declaredVersion: "demo-http-shared/v1",
       manifestId: "manifest:demo-http-shared:v1",
@@ -326,6 +329,7 @@ function buildDemoHttpDeployments(
     },
     {
       deploymentId: "deployment:demo-http-host",
+      groupId: DEMO_GROUP_ID,
       declaredArtifactId: "demo-http-host-worker",
       declaredVersion: "demo-http-host/v1",
       manifestId: "manifest:demo-http-host:v1",
@@ -341,7 +345,7 @@ function buildDemoHttpDeployments(
     {
       deploymentId: "deployment:demo-personnel-serve",
       deploymentKind: "serve",
-      groupId: "group-personnel",
+      groupId: DEMO_GROUP_ID,
       declaredArtifactId: "demo-personnel-serve",
       declaredVersion: "demo-personnel-serve/v1",
       manifestId: "manifest:demo-personnel-serve:v1",
@@ -360,6 +364,7 @@ function buildDemoServiceModuleDeployments(): DemoServiceModuleDeploymentPlan[] 
   return [
     {
       deploymentId: "deployment:demo-chat-service-module",
+      groupId: DEMO_GROUP_ID,
       declaredArtifactId: "demo-chat-service-module",
       declaredVersion: "demo-chat-service-module/v1",
       manifestId: "manifest:demo-chat-service-module:v1",
@@ -402,8 +407,9 @@ function buildHttpArtifactManifest(
         : Number.MAX_SAFE_INTEGER,
     sourceUri: new URL(sourcePath, origin).toString(),
     sourceDigest: workerArtifact.digest,
-    denoJson: new URL("/artifacts/deno.json", origin).toString(),
-    denoLock: new URL("/artifacts/deno.lock", origin).toString(),
+    packageManagerKind: "bun",
+    packageJson: new URL("/artifacts/package.json", origin).toString(),
+    bunLock: new URL("/artifacts/bun.lock", origin).toString(),
     frozenLock: true,
     metadataAnnotations: {
       demo: "true",
@@ -428,9 +434,9 @@ function buildServiceModuleArtifactManifest(
     },
     entry: deployment.serviceEntry,
     packageManager: {
-      kind: "deno",
-      denoJson: new URL("/artifacts/deno.json", origin).toString(),
-      denoLock: new URL("/artifacts/deno.lock", origin).toString(),
+      kind: "bun",
+      packageJson: new URL("/artifacts/package.json", origin).toString(),
+      bunLock: new URL("/artifacts/bun.lock", origin).toString(),
       frozenLock: true
     },
     metadata: deployment.metadataAnnotations
@@ -446,6 +452,7 @@ function buildDesiredProjection(input: {
   upstreamBaseUrl: string;
   httpDeployments: HttpWorkerDeploymentPlan[];
   serviceModuleDeployments: DemoServiceModuleDeploymentPlan[];
+  registrationsByHostId: Map<string, HostRegistration>;
   manifestsById: Map<string, ArtifactManifest>;
   registeredHostIds: string[];
   candidateHosts: PlacementCandidateHost[];
@@ -468,8 +475,12 @@ function buildDesiredProjection(input: {
             : Number.MAX_SAFE_INTEGER,
         sourceUri: manifest.source.uri,
         sourceDigest: manifest.source.digest,
-        denoJson: manifest.packageManager.denoJson,
-        denoLock: manifest.packageManager.denoLock,
+        packageManagerKind: manifest.packageManager.kind,
+        packageJson: manifest.packageManager.kind === "bun" ? manifest.packageManager.packageJson : undefined,
+        bunfigToml: manifest.packageManager.kind === "bun" ? manifest.packageManager.bunfigToml : undefined,
+        bunLock: manifest.packageManager.kind === "bun" ? manifest.packageManager.bunLock : undefined,
+        denoJson: manifest.packageManager.kind === "deno" ? manifest.packageManager.denoJson : undefined,
+        denoLock: manifest.packageManager.kind === "deno" ? manifest.packageManager.denoLock : undefined,
         frozenLock: manifest.packageManager.frozenLock
       };
     }),
@@ -479,7 +490,7 @@ function buildDesiredProjection(input: {
   });
 
   const serviceAssignments = input.serviceModuleDeployments.flatMap((deployment) =>
-    shouldAssignServiceModuleToHost(deployment, input.hostId)
+    shouldAssignServiceModuleToHost(deployment, input.hostId, input.registrationsByHostId)
       ? [buildServiceModuleAssignmentForHost(input.hostId, deployment, input.manifestsById)]
       : []
   );
@@ -587,71 +598,103 @@ function buildDesiredHostStates(input: {
   extraHostIds?: string[];
 }): DesiredHostState[] {
   const registrations = collectTopologyRegistrations(input.transport, input.extraHostIds);
-  const hostIds = registrations.map((registration) => registration.hostId);
   const observedHostStates = registrations
     .map((registration) => input.transport.getObservedHostState(registration.hostId))
     .filter((value): value is Exclude<typeof value, undefined> => value !== undefined);
-  const candidateHosts = buildPlacementCandidateHosts({
-    registrations,
-    observedHostStates
-  });
-  const stickyHostIdsByDeployment = new Map<string, string[]>();
+  const observedByHostId = new Map(
+    observedHostStates.map((observed) => [observed.hostId, observed] as const)
+  );
+  const desiredHostStates: DesiredHostState[] = [];
+
+  const registrationsByGroup = new Map<string, HostRegistration[]>();
   for (const registration of registrations) {
-    const currentDesired = input.transport.getDesiredHostStateSnapshot(registration.hostId);
-    for (const assignment of currentDesired.assignments) {
-      const owners = stickyHostIdsByDeployment.get(assignment.deploymentId) ?? [];
-      if (!owners.includes(registration.hostId)) {
-        owners.push(registration.hostId);
-      }
-      stickyHostIdsByDeployment.set(assignment.deploymentId, owners);
-    }
+    const key = registration.groupId ?? "__default__";
+    const values = registrationsByGroup.get(key) ?? [];
+    values.push(registration);
+    registrationsByGroup.set(key, values);
   }
-  const ownerHostIdsByDeployment = new Map<string, string[]>();
-  for (const deployment of input.httpDeployments) {
-    if ((deployment.assignmentMode ?? "select-first-n-hosts") === "all-hosts") {
-      continue;
+
+  for (const [groupKey, groupRegistrations] of registrationsByGroup) {
+    const groupId = groupKey === "__default__" ? undefined : groupKey;
+    const groupObservedHostStates = groupRegistrations
+      .map((registration) => observedByHostId.get(registration.hostId))
+      .filter((value): value is Exclude<typeof value, undefined> => value !== undefined);
+    const groupHostIds = groupRegistrations.map((registration) => registration.hostId);
+    const candidateHosts = buildPlacementCandidateHosts({
+      registrations: groupRegistrations,
+      observedHostStates: groupObservedHostStates
+    });
+    const groupHttpDeployments = input.httpDeployments.filter((deployment) => deployment.groupId === groupId);
+    const groupServiceModuleDeployments = input.serviceModuleDeployments.filter(
+      (deployment) => deployment.groupId === groupId
+    );
+    const stickyHostIdsByDeployment = new Map<string, string[]>();
+    for (const registration of groupRegistrations) {
+      const currentDesired = input.transport.getDesiredHostStateSnapshot(registration.hostId);
+      for (const assignment of currentDesired.assignments) {
+        if (assignment.groupId !== groupId) {
+          continue;
+        }
+        const owners = stickyHostIdsByDeployment.get(assignment.deploymentId) ?? [];
+        if (!owners.includes(registration.hostId)) {
+          owners.push(registration.hostId);
+        }
+        stickyHostIdsByDeployment.set(assignment.deploymentId, owners);
+      }
+    }
+    const ownerHostIdsByDeployment = new Map<string, string[]>();
+    for (const deployment of groupHttpDeployments) {
+      if ((deployment.assignmentMode ?? "select-first-n-hosts") === "all-hosts") {
+        continue;
+      }
+
+      const currentDesiredOwnerHostIds = stickyHostIdsByDeployment.get(deployment.deploymentId) ?? [];
+      ownerHostIdsByDeployment.set(
+        deployment.deploymentId,
+        planHttpWorkerDeploymentOwners({
+          deployment: {
+            ...deployment,
+            stickyHostIds: currentDesiredOwnerHostIds
+          },
+          candidateHosts,
+          currentDesiredOwnerHostIds,
+          observedHostStates: groupObservedHostStates
+        })
+      );
     }
 
-    const currentDesiredOwnerHostIds = stickyHostIdsByDeployment.get(deployment.deploymentId) ?? [];
-    ownerHostIdsByDeployment.set(
-      deployment.deploymentId,
-      planHttpWorkerDeploymentOwners({
-        deployment: {
+    const groupDesiredHostStates = groupHostIds.map((hostId) =>
+      buildDesiredProjection({
+        hostId,
+        upstreamBaseUrl: input.upstreamBaseUrl,
+        httpDeployments: groupHttpDeployments.map((deployment) => ({
           ...deployment,
-          stickyHostIds: currentDesiredOwnerHostIds
-        },
+          stickyHostIds: stickyHostIdsByDeployment.get(deployment.deploymentId),
+          ownerHostIds: ownerHostIdsByDeployment.get(deployment.deploymentId)
+        })),
+        serviceModuleDeployments: groupServiceModuleDeployments,
+        registrationsByHostId: new Map(groupRegistrations.map((registration) => [registration.hostId, registration] as const)),
+        manifestsById: input.manifestsById,
+        registeredHostIds: groupHostIds,
         candidateHosts,
-        currentDesiredOwnerHostIds,
-        observedHostStates
+        revisionToken: input.revisionToken
       })
     );
+    const topology = buildDesiredTopology(
+      input.revisionToken,
+      groupRegistrations,
+      groupDesiredHostStates,
+      groupObservedHostStates
+    );
+    desiredHostStates.push(
+      ...groupDesiredHostStates.map((desired) => ({
+        ...desired,
+        topology
+      }))
+    );
   }
-  const desiredHostStates = hostIds.map((hostId) =>
-    buildDesiredProjection({
-      hostId,
-      upstreamBaseUrl: input.upstreamBaseUrl,
-      httpDeployments: input.httpDeployments.map((deployment) => ({
-        ...deployment,
-        stickyHostIds: stickyHostIdsByDeployment.get(deployment.deploymentId),
-        ownerHostIds: ownerHostIdsByDeployment.get(deployment.deploymentId)
-      })),
-      serviceModuleDeployments: input.serviceModuleDeployments,
-      manifestsById: input.manifestsById,
-      registeredHostIds: hostIds,
-      candidateHosts,
-      revisionToken: input.revisionToken
-    })
-  );
-  const topology = buildDesiredTopology(
-    input.revisionToken,
-    registrations,
-    desiredHostStates,
-    observedHostStates
-  );
-  return desiredHostStates.map((desired) => ({
-    ...desired,
-    topology
-  }));
+
+  return desiredHostStates.sort((left, right) => left.hostId.localeCompare(right.hostId));
 }
 
 function collectTopologyRegistrations(
@@ -675,6 +718,7 @@ function collectTopologyRegistrations(
     }
     registrations.push({
       hostId,
+      groupId: undefined,
       startedAt: 0,
       runtime: {
         kind: "hardess-v1",
@@ -732,12 +776,12 @@ function serveArtifactRequest(
     return textResponse(artifactFiles.serviceModule.source, "text/typescript; charset=utf-8");
   }
 
-  if (pathname === "/artifacts/deno.json") {
-    return textResponse(artifactFiles.denoJson, "application/json; charset=utf-8");
+  if (pathname === "/artifacts/package.json") {
+    return textResponse(artifactFiles.packageJson, "application/json; charset=utf-8");
   }
 
-  if (pathname === "/artifacts/deno.lock") {
-    return textResponse(artifactFiles.denoLock, "application/json; charset=utf-8");
+  if (pathname === "/artifacts/bun.lock") {
+    return textResponse(artifactFiles.bunLock, "application/json; charset=utf-8");
   }
 
   return undefined;
@@ -745,9 +789,14 @@ function serveArtifactRequest(
 
 function shouldAssignServiceModuleToHost(
   deployment: DemoServiceModuleDeploymentPlan,
-  _hostId: string
+  hostId: string,
+  registrationsByHostId: Map<string, HostRegistration>
 ): boolean {
-  return (deployment.assignmentMode ?? "all-hosts") === "all-hosts";
+  if ((deployment.assignmentMode ?? "all-hosts") !== "all-hosts") {
+    return false;
+  }
+
+  return registrationsByHostId.get(hostId)?.groupId === deployment.groupId;
 }
 
 function buildServiceModuleAssignmentForHost(
@@ -765,6 +814,7 @@ function buildServiceModuleAssignmentForHost(
     hostId,
     deploymentId: deployment.deploymentId,
     deploymentKind: "service_module",
+    groupId: deployment.groupId,
     declaredVersion: deployment.declaredVersion,
     declaredArtifactId: deployment.declaredArtifactId,
     artifact: {

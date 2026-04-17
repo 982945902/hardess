@@ -133,7 +133,7 @@ describe("HardessClient", () => {
     expect(pingEnvelope?.action).toBe("ping");
   });
 
-  it("includes groupId in the auth envelope when provided", () => {
+  it("sends bearer auth payload without client-selected group", () => {
     let socket: FakeSocket | undefined;
 
     const client = new HardessClient("ws://localhost/ws", {
@@ -152,14 +152,13 @@ describe("HardessClient", () => {
       }
     });
 
-    client.connect("demo:alice", { groupId: "group-chat" });
+    client.connect("demo:alice");
     socket?.emit("open");
 
     const authEnvelope = parseEnvelope(socket?.sent[0] ?? "");
     expect(authEnvelope?.payload).toEqual({
       provider: "bearer",
-      payload: "demo:alice",
-      groupId: "group-chat"
+      payload: "demo:alice"
     });
   });
 

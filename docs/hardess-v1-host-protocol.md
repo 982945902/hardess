@@ -67,6 +67,7 @@ Recommended shape:
 ```ts
 type HostRegistration = {
   host_id: string;
+  group_id?: string;
   node_id?: string;
   started_at: number;
   runtime: {
@@ -95,6 +96,8 @@ type HostRegistration = {
 Notes:
 
 - `host_id` is the admin-facing stable identity
+- `group_id` is the host's group boundary; one runtime host belongs to exactly
+  one group, chosen at startup by `HOST_GROUP_ID`
 - `node_id` may mirror runtime/node naming already present in cluster mode
 - `dynamic_fields` exists on purpose so the contract can grow without churn
 
@@ -140,12 +143,9 @@ type Deployment = {
 Notes:
 
 - `replicas` is global desired count
-- `group_id` is the explicit grouping field for forwarding / probe scope and
-  future admin policy; `v1` does not introduce a separate `service` or
-  `selector` object
-- for WebSocket runtime, `group_id` is applied as a connection-scoped routing
-  scope: clients authenticate into one group, and peer locate / fanout stays
-  within that group when the sender carries one
+- `group_id` is the deployment's target group; admin only places that
+  deployment onto hosts with the same `group_id`
+- `v1` does not introduce a separate `service` or `selector` object
 - `scheduling` leaves room for future affinity / anti-affinity policy
 - `rollout` stays intentionally simple in `v1`
 
@@ -224,6 +224,7 @@ type DesiredHostState = {
       generated_at: number;
       hosts: Array<{
         host_id: string;
+        group_id?: string;
         node_id?: string;
         public_base_url?: string;
         internal_base_url?: string;
@@ -237,7 +238,8 @@ type DesiredHostState = {
       generated_at: number;
       deployments: Array<{
         deployment_id: string;
-        deployment_kind: "http_worker" | "service_module";
+        deployment_kind: "http_worker" | "service_module" | "serve";
+        group_id?: string;
         owner_host_ids: string[];
         routes: Array<{
           route_id: string;
@@ -266,8 +268,8 @@ Notes:
 
 - `revision` is the admin-side monotonic desired-state token
 - hosts should treat `revision` as an opaque value
-- `topology.membership` is the global slow-changing host view
-- `topology.placement` is the global slow-changing deployment-owner view
+- `topology.membership` is the slow-changing host view for the current host group
+- `topology.placement` is the slow-changing deployment-owner view for the current host group
 - `topology.placement.routes` is the minimal routing table needed for host-to-host
   HTTP forwarding and business WebSocket upgrade forwarding
 - hot `connId` location is still runtime-owned and should not be pushed through
@@ -361,7 +363,10 @@ type ArtifactManifest = {
   };
   entry: string;
   package_manager: {
-    kind: "deno";
+    kind: "bun" | "deno";
+    package_json?: string;
+    bunfig_toml?: string;
+    bun_lock?: string;
     deno_json?: string;
     deno_lock?: string;
     frozen_lock?: boolean;
@@ -386,12 +391,14 @@ Current `v1` implementation boundary:
   exports the `serve` module shape, and adapts it into the worker fetch ABI
   before attaching it to the generated HTTP pipeline
 - for `service_module`, runtime stages the module source into the same local artifact cache, loads the staged entry, validates that it exports `{ protocol, version, actions }`, and registers it into the runtime WebSocket protocol registry
-- when `package_manager.deno_json` or `package_manager.deno_lock` are present, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
+- when Bun or Deno project files are present in `package_manager`, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
 - for remote `source.uri`, a `digest` is the boundary for reliable cache reuse; without it, runtime should prefer restaging over assuming the cached remote source is still current
-- `package_manager.deno_json` and `package_manager.deno_lock` are already part of the protocol, but runtime-side dependency materialization is still incremental
-- cluster peer locate now accepts an optional connection `group_id` scope and
-  runtime narrows both local lookup and remote peer probing with that scope when
-  available
+- `v1` keeps Bun as the host runtime, but the worker artifact protocol now allows both Bun and Deno project metadata
+- for Bun projects, runtime now runs `bun install` during prepare before activation
+- Deno project metadata is still staging-only on the current Bun host runtime; full Deno dependency materialization/execution remains future work
+- cluster peer locate still accepts an optional `group_id` scope internally, but
+  in the current `v1` runtime that scope comes from the host group boundary
+  rather than a client-selected field
 
 ## 10. Baseline Operations
 

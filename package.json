@@ -15,6 +15,7 @@
     "clean:runtime-artifacts": "rm -f config/.*.hardess-config-*.ts workers/.*.hardess-worker-*.ts",
     "demo:upstream": "bun run src/demo/upstream.ts",
     "demo:admin": "bun run src/demo/admin-mock.ts",
+    "demo:stack": "bun run src/demo/local-stack.ts",
     "demo:client": "bun run src/demo/client.ts",
     "demo:http": "bun run src/demo/http-smoke.ts",
     "load:http": "bun run src/load/http.ts",

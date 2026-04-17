@@ -129,28 +129,80 @@ describe("ArtifactStore", () => {
     expect(await readFile(result.localEntry, "utf8")).toContain('protocol: "chat"');
   });
 
-  it("stages deno.json and deno.lock beside the worker when declared by the manifest", async () => {
+  it("stages bun package files beside the worker and prepares once", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-project-"));
     cleanupPaths.push(dir);
 
     const sourcePath = join(dir, "remote-worker.ts");
     await writeFile(sourcePath, `export default { fetch() { return new Response("ok"); } };`, "utf8");
     await writeFile(
-      join(dir, "deno.json"),
+      join(dir, "package.json"),
       JSON.stringify({
-        imports: {
-          "@lib/": "./lib/"
-        }
+        name: "demo-worker",
+        type: "module"
       }),
       "utf8"
     );
-    await writeFile(join(dir, "deno.lock"), JSON.stringify({ version: "4" }), "utf8");
+    await writeFile(join(dir, "bun.lock"), JSON.stringify({ lockfileVersion: 1 }), "utf8");
 
+    const prepareRunner = mock(async () => {});
     const store = new ArtifactStore({
-      rootDir: join(dir, "cache")
+      rootDir: join(dir, "cache"),
+      prepareRunner
     });
 
     const result = await store.stageHttpWorker(createAssignment(sourcePath), {
+      ...createManifest(`file://${sourcePath}`),
+      packageManager: {
+        kind: "bun",
+        packageJson: "package.json",
+        bunLock: "bun.lock",
+        frozenLock: true
+      }
+    });
+    await store.stageHttpWorker(createAssignment(sourcePath), {
+      ...createManifest(`file://${sourcePath}`),
+      packageManager: {
+        kind: "bun",
+        packageJson: "package.json",
+        bunLock: "bun.lock",
+        frozenLock: true
+      }
+    });
+
+    expect(await readFile(join(dir, "cache", "manifest-http-1", "package.json"), "utf8")).toContain(
+      '"name":"demo-worker"'
+    );
+    expect(await readFile(join(dir, "cache", "manifest-http-1", "bun.lock"), "utf8")).toContain(
+      '"lockfileVersion":1'
+    );
+    expect(result.localEntry.endsWith("workers/demo-worker.ts")).toBe(true);
+    expect(prepareRunner).toHaveBeenCalledTimes(1);
+    expect(prepareRunner).toHaveBeenCalledWith(
+      "bun",
+      expect.arrayContaining(["install", "--frozen-lockfile"]),
+      {
+        cwd: join(dir, "cache", "manifest-http-1")
+      }
+    );
+  });
+
+  it("stages deno project files when declared by the manifest", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-deno-project-"));
+    cleanupPaths.push(dir);
+
+    const sourcePath = join(dir, "remote-worker.ts");
+    await writeFile(sourcePath, `export default { fetch() { return new Response("ok"); } };`, "utf8");
+    await writeFile(join(dir, "deno.json"), JSON.stringify({ imports: { "@lib/": "./lib/" } }), "utf8");
+    await writeFile(join(dir, "deno.lock"), JSON.stringify({ version: "4" }), "utf8");
+
+    const prepareRunner = mock(async () => {});
+    const store = new ArtifactStore({
+      rootDir: join(dir, "cache"),
+      prepareRunner
+    });
+
+    await store.stageHttpWorker(createAssignment(sourcePath), {
       ...createManifest(`file://${sourcePath}`),
       packageManager: {
         kind: "deno",
@@ -166,7 +218,7 @@ describe("ArtifactStore", () => {
     expect(await readFile(join(dir, "cache", "manifest-http-1", "deno.lock"), "utf8")).toContain(
       '"version":"4"'
     );
-    expect(result.localEntry.endsWith("workers/demo-worker.ts")).toBe(true);
+    expect(prepareRunner).not.toHaveBeenCalled();
   });
 
   it("reuses staged artifact metadata for remote worker sources when a digest is present", async () => {

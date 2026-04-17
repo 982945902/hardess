@@ -204,8 +204,8 @@ So the split for `v1` is:
 - admin owns `deployment`, `assignment`, `membership`, and `placement`
 - runtime owns hot `connId -> hostId` knowledge and peer-to-peer locate behavior
 
-That means admin should distribute global slow-changing topology, while runtime
-continues to discover hot connection location at runtime.
+That means admin should distribute slow-changing topology projections, while
+runtime continues to discover hot connection location at runtime.
 
 ## 8. Desired Host State
 
@@ -297,13 +297,16 @@ The important point is:
 
 - admin publishes global deployments
 - admin chooses placement by replica count and host state
-- admin also distributes the slow-changing global topology snapshot
+- admin also distributes the slow-changing topology snapshot relevant to that host group
 - each host receives only its own assignments
 - runtime reconciles one coherent host-local desired state
 - `group_id` is an explicit grouping field carried by deployment / assignment /
-  placement; `v1` does not add a separate `service + selector` object model
-- in the current runtime, `group_id` is already consumed beyond admin state: it
-  scopes WebSocket connection auth context and distributed peer-locate fanout
+  placement, while host registration also carries the host's own group; `v1`
+  does not add a separate `service + selector` object model
+- admin is global across many groups, but one runtime host belongs to exactly
+  one group chosen at startup by `HOST_GROUP_ID`
+- runtime does not let clients choose their own group; WebSocket locate /
+  fanout and host-to-host forwarding inherit the host group boundary
 - runtime can use `placement.routes` to forward HTTP requests to the correct
   owner host when the current host is not assigned that route
 - runtime can use the same route ownership to forward business WebSocket upgrade

@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { ArtifactManifest, Assignment } from "../../shared/index.ts";
+import type { ArtifactManifest, ArtifactPackageManager, Assignment } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+type PrepareRunner = (command: string, args: string[], options: { cwd: string }) => Promise<void>;
 
 interface PreparedArtifactInputMetadata {
-  kind: "worker" | "denoJson" | "denoLock";
+  kind: "worker" | "projectFile";
+  logicalName?: string;
   sourceRef: string;
   targetPath: string;
   fingerprint?: string;
@@ -17,25 +20,27 @@ interface PreparedArtifactMetadata {
   sourceUri: string;
   digest?: string;
   entry: string;
-  denoJson?: string;
-  denoLock?: string;
+  packageManager: ArtifactPackageManager;
   inputs: PreparedArtifactInputMetadata[];
 }
 
 export interface ArtifactStoreOptions {
   rootDir: string;
   fetchFn?: FetchLike;
+  prepareRunner?: PrepareRunner;
   logger?: Logger;
 }
 
 export class ArtifactStore {
   private readonly rootDir: string;
   private readonly fetchFn: FetchLike;
+  private readonly prepareRunner: PrepareRunner;
   private readonly logger?: Logger;
 
   constructor(options: ArtifactStoreOptions) {
     this.rootDir = resolve(options.rootDir);
     this.fetchFn = options.fetchFn ?? fetch;
+    this.prepareRunner = options.prepareRunner ?? defaultPrepareRunner;
     this.logger = options.logger;
   }
 
@@ -53,26 +58,22 @@ export class ArtifactStore {
     const manifestId = manifest?.manifestId ?? assignment.artifact.manifestId;
     const sourceUri = manifest?.source.uri ?? assignment.artifact.sourceUri;
     const digest = manifest?.source.digest ?? assignment.artifact.digest;
-    const denoJson = manifest?.packageManager.denoJson;
-    const denoLock = manifest?.packageManager.denoLock;
+    const packageManager = manifest?.packageManager ?? { kind: "bun" as const };
     const artifactDir = join(this.rootDir, sanitizePathSegment(manifestId));
     const localEntry = join(artifactDir, entry);
     const metadataPath = join(artifactDir, ".artifact-meta.json");
-    const localDenoJson = denoJson ? resolveLocalPackageFilePath(artifactDir, denoJson, "deno.json") : undefined;
-    const localDenoLock = denoLock ? resolveLocalPackageFilePath(artifactDir, denoLock, "deno.lock") : undefined;
     const stagePlan = await this.buildStagePlan({
       sourceUri,
       digest,
       entry,
       localEntry,
-      denoJson,
-      localDenoJson,
-      denoLock,
-      localDenoLock
+      packageManager,
+      artifactDir
     });
 
     const currentMetadata = await readPreparedMetadata(metadataPath);
     if (await this.canReusePreparedArtifact(currentMetadata, stagePlan)) {
+      await this.ensureProjectPrepared(stagePlan);
       return { localEntry };
     }
 
@@ -92,10 +93,10 @@ export class ArtifactStore {
           sourceUri,
           digest,
           entry,
-          denoJson,
-          denoLock,
+          packageManager,
           inputs: stagePlan.inputs.map((input) => ({
             kind: input.kind,
+            logicalName: input.logicalName,
             sourceRef: input.sourceRef,
             targetPath: input.targetPath,
             fingerprint: input.fingerprint
@@ -106,6 +107,8 @@ export class ArtifactStore {
       ),
       "utf8"
     );
+
+    await this.ensureProjectPrepared(stagePlan);
 
     this.logger?.info("artifact staged", {
       manifestId,
@@ -130,26 +133,22 @@ export class ArtifactStore {
     const manifestId = manifest?.manifestId ?? assignment.artifact.manifestId;
     const sourceUri = manifest?.source.uri ?? assignment.artifact.sourceUri;
     const digest = manifest?.source.digest ?? assignment.artifact.digest;
-    const denoJson = manifest?.packageManager.denoJson;
-    const denoLock = manifest?.packageManager.denoLock;
+    const packageManager = manifest?.packageManager ?? { kind: "bun" as const };
     const artifactDir = join(this.rootDir, sanitizePathSegment(manifestId));
     const localEntry = join(artifactDir, entry);
     const metadataPath = join(artifactDir, ".artifact-meta.json");
-    const localDenoJson = denoJson ? resolveLocalPackageFilePath(artifactDir, denoJson, "deno.json") : undefined;
-    const localDenoLock = denoLock ? resolveLocalPackageFilePath(artifactDir, denoLock, "deno.lock") : undefined;
     const stagePlan = await this.buildStagePlan({
       sourceUri,
       digest,
       entry,
       localEntry,
-      denoJson,
-      localDenoJson,
-      denoLock,
-      localDenoLock
+      packageManager,
+      artifactDir
     });
 
     const currentMetadata = await readPreparedMetadata(metadataPath);
     if (await this.canReusePreparedArtifact(currentMetadata, stagePlan)) {
+      await this.ensureProjectPrepared(stagePlan);
       return { localEntry };
     }
 
@@ -169,10 +168,10 @@ export class ArtifactStore {
           sourceUri,
           digest,
           entry,
-          denoJson,
-          denoLock,
+          packageManager,
           inputs: stagePlan.inputs.map((input) => ({
             kind: input.kind,
+            logicalName: input.logicalName,
             sourceRef: input.sourceRef,
             targetPath: input.targetPath,
             fingerprint: input.fingerprint
@@ -183,6 +182,8 @@ export class ArtifactStore {
       ),
       "utf8"
     );
+
+    await this.ensureProjectPrepared(stagePlan);
 
     this.logger?.info("artifact staged", {
       manifestId,
@@ -198,17 +199,15 @@ export class ArtifactStore {
     digest?: string;
     entry: string;
     localEntry: string;
-    denoJson?: string;
-    localDenoJson?: string;
-    denoLock?: string;
-    localDenoLock?: string;
+    packageManager: ArtifactPackageManager;
+    artifactDir: string;
   }): Promise<{
     sourceUri: string;
     digest?: string;
     entry: string;
     localEntry: string;
-    denoJson?: string;
-    denoLock?: string;
+    artifactDir: string;
+    packageManager: ArtifactPackageManager;
     inputs: Array<PreparedArtifactInputMetadata>;
   }> {
     const inputs: PreparedArtifactInputMetadata[] = [
@@ -220,23 +219,13 @@ export class ArtifactStore {
       }
     ];
 
-    if (input.denoJson && input.localDenoJson) {
-      const sourceRef = resolveCompanionSourceRef(input.sourceUri, input.denoJson);
+    for (const projectFile of listProjectFiles(input.packageManager, input.artifactDir, input.sourceUri)) {
       inputs.push({
-        kind: "denoJson",
-        sourceRef,
-        targetPath: input.localDenoJson,
-        fingerprint: await computeSourceFingerprint(sourceRef)
-      });
-    }
-
-    if (input.denoLock && input.localDenoLock) {
-      const sourceRef = resolveCompanionSourceRef(input.sourceUri, input.denoLock);
-      inputs.push({
-        kind: "denoLock",
-        sourceRef,
-        targetPath: input.localDenoLock,
-        fingerprint: await computeSourceFingerprint(sourceRef)
+        kind: "projectFile",
+        logicalName: projectFile.logicalName,
+        sourceRef: projectFile.sourceRef,
+        targetPath: projectFile.targetPath,
+        fingerprint: await computeSourceFingerprint(projectFile.sourceRef)
       });
     }
 
@@ -245,8 +234,8 @@ export class ArtifactStore {
       digest: input.digest,
       entry: input.entry,
       localEntry: input.localEntry,
-      denoJson: input.denoJson,
-      denoLock: input.denoLock,
+      artifactDir: input.artifactDir,
+      packageManager: input.packageManager,
       inputs
     };
   }
@@ -258,8 +247,8 @@ export class ArtifactStore {
       digest?: string;
       entry: string;
       localEntry: string;
-      denoJson?: string;
-      denoLock?: string;
+      artifactDir: string;
+      packageManager: ArtifactPackageManager;
       inputs: Array<PreparedArtifactInputMetadata>;
     }
   ): Promise<boolean> {
@@ -276,8 +265,7 @@ export class ArtifactStore {
     }
 
     if (
-      currentMetadata.denoJson !== stagePlan.denoJson ||
-      currentMetadata.denoLock !== stagePlan.denoLock ||
+      !samePackageManager(currentMetadata.packageManager, stagePlan.packageManager) ||
       currentMetadata.inputs.length !== stagePlan.inputs.length
     ) {
       return false;
@@ -291,6 +279,7 @@ export class ArtifactStore {
       }
       if (
         cachedInput.kind !== stagedInput.kind ||
+        cachedInput.logicalName !== stagedInput.logicalName ||
         cachedInput.sourceRef !== stagedInput.sourceRef ||
         cachedInput.targetPath !== stagedInput.targetPath
       ) {
@@ -305,6 +294,64 @@ export class ArtifactStore {
     }
 
     return true;
+  }
+
+  private async ensureProjectPrepared(stagePlan: {
+    sourceUri: string;
+    digest?: string;
+    entry: string;
+    localEntry: string;
+    artifactDir: string;
+    packageManager: ArtifactPackageManager;
+    inputs: Array<PreparedArtifactInputMetadata>;
+  }): Promise<void> {
+    if (stagePlan.packageManager.kind !== "bun" || !stagePlan.packageManager.packageJson) {
+      return;
+    }
+
+    const prepareKey = createProjectPrepareKey(stagePlan.packageManager, stagePlan.inputs);
+    const prepareMetadataPath = join(stagePlan.artifactDir, ".artifact-prepare-meta.json");
+    const currentPrepared = await readPreparedProjectState(prepareMetadataPath);
+    if (currentPrepared?.key === prepareKey) {
+      return;
+    }
+
+    const args = [
+      "install",
+      "--cwd",
+      stagePlan.artifactDir,
+      "--silent",
+      "--no-progress",
+      "--no-summary",
+      "--ignore-scripts"
+    ];
+    if (stagePlan.packageManager.frozenLock) {
+      args.push("--frozen-lockfile");
+    }
+
+    await this.prepareRunner("bun", args, {
+      cwd: stagePlan.artifactDir
+    });
+
+    await writeFile(
+      prepareMetadataPath,
+      JSON.stringify(
+        {
+          key: prepareKey,
+          packageManagerKind: "bun",
+          preparedAt: Date.now()
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    this.logger?.info("artifact project prepared", {
+      packageManager: "bun",
+      artifactDir: stagePlan.artifactDir,
+      entry: stagePlan.localEntry
+    });
   }
 
   private async readSource(sourceUri: string): Promise<string> {
@@ -324,6 +371,53 @@ export class ArtifactStore {
 
     return await readFile(resolve(sourceUri), "utf8");
   }
+}
+
+function listProjectFiles(
+  packageManager: ArtifactPackageManager,
+  artifactDir: string,
+  workerSourceUri: string
+): Array<{
+  logicalName: string;
+  sourceRef: string;
+  targetPath: string;
+}> {
+  if (packageManager.kind === "deno") {
+    return [
+      buildProjectFile("denoJson", packageManager.denoJson, artifactDir, workerSourceUri, "deno.json"),
+      buildProjectFile("denoLock", packageManager.denoLock, artifactDir, workerSourceUri, "deno.lock")
+    ].filter((value): value is NonNullable<typeof value> => value !== undefined);
+  }
+
+  return [
+    buildProjectFile("packageJson", packageManager.packageJson, artifactDir, workerSourceUri, "package.json"),
+    buildProjectFile("bunfigToml", packageManager.bunfigToml, artifactDir, workerSourceUri, "bunfig.toml"),
+    buildProjectFile("bunLock", packageManager.bunLock, artifactDir, workerSourceUri, "bun.lock")
+  ].filter((value): value is NonNullable<typeof value> => value !== undefined);
+}
+
+function buildProjectFile(
+  logicalName: string,
+  fileRef: string | undefined,
+  artifactDir: string,
+  workerSourceUri: string,
+  fallbackName: string
+):
+  | {
+      logicalName: string;
+      sourceRef: string;
+      targetPath: string;
+    }
+  | undefined {
+  if (!fileRef) {
+    return undefined;
+  }
+
+  return {
+    logicalName,
+    sourceRef: resolveCompanionSourceRef(workerSourceUri, fileRef),
+    targetPath: resolveLocalPackageFilePath(artifactDir, fileRef, fallbackName)
+  };
 }
 
 function resolveLocalPackageFilePath(
@@ -387,6 +481,31 @@ async function readPreparedMetadata(path: string): Promise<PreparedArtifactMetad
   }
 }
 
+async function readPreparedProjectState(path: string): Promise<{
+  key: string;
+  packageManagerKind: "bun";
+  preparedAt: number;
+} | null> {
+  try {
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw) as {
+      key?: string;
+      packageManagerKind?: "bun";
+      preparedAt?: number;
+    };
+    if (typeof parsed?.key !== "string" || parsed.packageManagerKind !== "bun") {
+      return null;
+    }
+    return {
+      key: parsed.key,
+      packageManagerKind: "bun",
+      preparedAt: typeof parsed.preparedAt === "number" ? parsed.preparedAt : 0
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await access(path);
@@ -394,6 +513,43 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function samePackageManager(left: ArtifactPackageManager, right: ArtifactPackageManager): boolean {
+  if (left.kind !== right.kind || left.frozenLock !== right.frozenLock) {
+    return false;
+  }
+
+  if (left.kind === "deno" && right.kind === "deno") {
+    return left.denoJson === right.denoJson && left.denoLock === right.denoLock;
+  }
+
+  if (left.kind === "bun" && right.kind === "bun") {
+    return (
+      left.packageJson === right.packageJson &&
+      left.bunfigToml === right.bunfigToml &&
+      left.bunLock === right.bunLock
+    );
+  }
+
+  return false;
+}
+
+function createProjectPrepareKey(
+  packageManager: ArtifactPackageManager,
+  inputs: PreparedArtifactInputMetadata[]
+): string {
+  return JSON.stringify({
+    packageManager,
+    projectInputs: inputs
+      .filter((input) => input.kind === "projectFile")
+      .map((input) => ({
+        logicalName: input.logicalName,
+        sourceRef: input.sourceRef,
+        targetPath: input.targetPath,
+        fingerprint: input.fingerprint
+      }))
+  });
 }
 
 function canReusePreparedInput(
@@ -444,4 +600,37 @@ function verifyDigest(source: string, digest?: string): void {
   if (actual !== expected) {
     throw new Error(`Artifact digest mismatch for ${algorithm}`);
   }
+}
+
+async function defaultPrepareRunner(
+  command: string,
+  args: string[],
+  options: { cwd: string }
+): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      rejectPromise(error);
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolvePromise();
+        return;
+      }
+
+      rejectPromise(
+        new Error(
+          `Prepare command failed (${command} ${args.join(" ")}): ${stderr.trim() || `exit code ${code}`}`
+        )
+      );
+    });
+  });
 }

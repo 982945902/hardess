@@ -117,6 +117,7 @@ describe("createRuntimeApp", () => {
         hosts: [
           {
             hostId: "host-a",
+            groupId: "group-chat",
             nodeId: "node-a",
             internalBaseUrl: "http://node-a.internal",
             publicListenerEnabled: true,
@@ -261,6 +262,7 @@ describe("createRuntimeApp", () => {
           },
           {
             hostId: "host-c",
+            groupId: "group-chat",
             nodeId: "node-c",
             internalBaseUrl: "http://node-c.internal",
             publicListenerEnabled: true,

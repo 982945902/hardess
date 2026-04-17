@@ -38,6 +38,7 @@ const hostStaticCapacitySchema = z.object({
 
 export const hostRegistrationSchema = z.object({
   hostId: z.string().min(1, "hostId is required"),
+  groupId: z.string().min(1).optional(),
   nodeId: z.string().min(1).optional(),
   startedAt: z.number().finite().nonnegative(),
   runtime: z.object({
@@ -199,6 +200,7 @@ export const assignmentSchema = z.object({
 
 const membershipHostSchema = z.object({
   hostId: z.string().min(1, "hostId is required"),
+  groupId: z.string().min(1).optional(),
   nodeId: z.string().min(1).optional(),
   publicBaseUrl: z.string().url().optional(),
   internalBaseUrl: z.string().url().optional(),
@@ -319,12 +321,21 @@ export const artifactManifestSchema = z.object({
     digest: z.string().min(1).optional()
   }),
   entry: z.string().min(1, "entry is required"),
-  packageManager: z.object({
-    kind: z.literal("deno"),
-    denoJson: z.string().min(1).optional(),
-    denoLock: z.string().min(1).optional(),
-    frozenLock: z.boolean().optional()
-  }),
+  packageManager: z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("bun"),
+      packageJson: z.string().min(1).optional(),
+      bunfigToml: z.string().min(1).optional(),
+      bunLock: z.string().min(1).optional(),
+      frozenLock: z.boolean().optional()
+    }),
+    z.object({
+      kind: z.literal("deno"),
+      denoJson: z.string().min(1).optional(),
+      denoLock: z.string().min(1).optional(),
+      frozenLock: z.boolean().optional()
+    })
+  ]),
   metadata: z.object({
     annotations: stringRecordSchema.optional()
   }).optional()

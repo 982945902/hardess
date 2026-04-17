@@ -9,8 +9,8 @@ This demo wires the current `v1` control-plane slice end to end:
 - live HTTP pipeline apply
 - `serve` deployment staging and route projection
 - per-host desired-state projection
-- global topology snapshot projection (`membership` + `placement`)
-- placement `groupId` projection for scoped runtime traffic
+- group-local topology snapshot projection (`membership` + `placement`)
+- host-single-group runtime scoping via `HOST_GROUP_ID`
 
 ## Start The Demo
 
@@ -40,6 +40,7 @@ Terminal 3, runtime `host-demo-a`:
 ADMIN_BASE_URL=http://127.0.0.1:9100 \
 ADMIN_HOST_ID=host-demo-a \
 ADMIN_ARTIFACT_ROOT_DIR=.hardess-admin-artifacts-a \
+HOST_GROUP_ID=group-personnel \
 PORT=3000 \
 bun run dev
 ```
@@ -50,6 +51,7 @@ Terminal 4, runtime `host-demo-b`:
 ADMIN_BASE_URL=http://127.0.0.1:9100 \
 ADMIN_HOST_ID=host-demo-b \
 ADMIN_ARTIFACT_ROOT_DIR=.hardess-admin-artifacts-b \
+HOST_GROUP_ID=group-personnel \
 PORT=3001 \
 bun run dev
 ```
@@ -59,13 +61,14 @@ Each runtime will:
 - register the host to the mock admin
 - fetch `DesiredHostState`
 - fetch `ArtifactManifest`
-- stage the remote worker source plus `deno.json` / `deno.lock`
+- stage the remote worker source plus `package.json` / `bun.lock`
+- run Bun project prepare for staged demo artifacts before activation
 - apply the shared HTTP pipeline only if this host is selected by the deployment replica placement
 - apply one host-specific HTTP pipeline derived from its own `hostId`
-- stage and activate one demo `serve` app projected with `groupId=group-personnel`
+- stage and activate one demo `serve` app assigned to the same host group `group-personnel`
 - stage and activate one demo `service_module` artifact through the runtime
   WebSocket protocol registry
-- update its cluster peer scope from `topology.membership`
+- update its cluster peer scope from the group-local `topology.membership`
 
 ## Verify The Flow
 
@@ -124,7 +127,7 @@ Expected:
 - runtime on `3000` should not have the `host-demo-b` route
 - the request should fail with the normal "no pipeline" behavior
 
-Serve deployment with explicit `groupId`:
+Serve deployment inside the host group:
 
 ```bash
 curl -i \
@@ -141,7 +144,7 @@ Expected:
 - both runtimes serve `/demo/serve/health`
 - response JSON includes `"scope":"serve"` and `"groupId":"group-personnel"`
 - response headers include `x-hardess-admin-scope=serve` and `x-hardess-group-id=group-personnel`
-- in topology placement, this deployment is projected with `groupId=group-personnel`, so later cluster locate / probe can scope to that owner set
+- both demo hosts join `group-personnel`, so admin projects the same group-local placement to both hosts in this demo
 
 ## Simulate A Rollout
 
@@ -227,8 +230,8 @@ The mock admin serves:
 - `GET /artifacts/demo-host-worker.ts`
 - `GET /artifacts/demo-serve-app.ts`
 - `GET /artifacts/demo-chat-service-module.ts`
-- `GET /artifacts/deno.json`
-- `GET /artifacts/deno.lock`
+- `GET /artifacts/package.json`
+- `GET /artifacts/bun.lock`
 - `GET /__admin/mock/state`
 - `POST /__admin/mock/rollouts/shared-deployment`
 
@@ -241,12 +244,13 @@ Current fixed control-plane shape:
   and artifact-manifest path
 - four artifact manifests with remote source digests
 - the same global deployment set, but different `DesiredHostState` per host
-- the same `topology.membership` and `topology.placement` snapshot is attached to every host projection for that revision
+- topology is projected per host group; in this demo both hosts are in `group-personnel`, so they currently receive the same group-local topology snapshot
 - `topology.placement.routes` carries `pathPrefix -> ownerHostIds`, so a host can
   internally forward HTTP traffic to the correct owner when that route is not
   local
-- `topology.placement.deployments[*].groupId` carries the runtime scoping key;
-  in this demo only the `serve` deployment is explicitly grouped, while
+- `topology.membership.hosts[*].groupId` carries the host group boundary
+- `topology.placement.deployments[*].groupId` carries deployment group intent;
+  admin only places a deployment onto hosts in the same group, while
   deployments without `groupId` stay in the default group
 - the same route ownership can also be used to internally forward business
   WebSocket upgrade traffic to the correct owner host
@@ -270,8 +274,9 @@ Current fixed control-plane shape:
 This is intentionally still small. The point is to make the `v1` boundary concrete:
 
 - admin owns global deployment intent
-- admin owns slow-changing topology
+- admin owns slow-changing topology and projects it per host group
 - admin projects host-local desired state
-- runtime only reconciles its own assignments, narrows WS locate scope from
-  topology, internally forwards non-local HTTP / business WS traffic, and
-  reports which topology revision it has applied
+- runtime only reconciles its own assignments, treats the host group as the WS /
+  HTTP forwarding boundary, internally forwards non-local HTTP / business WS
+  traffic inside that boundary, and reports which topology revision it has
+  applied
