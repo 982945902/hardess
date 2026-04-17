@@ -28,6 +28,8 @@ export interface PlacementCandidateHost {
 
 export interface HttpWorkerDeploymentPlan {
   deploymentId: string;
+  deploymentKind?: "http_worker" | "serve";
+  groupId?: string;
   declaredArtifactId?: string;
   declaredVersion: string;
   manifestId: string;
@@ -95,7 +97,7 @@ export interface DeploymentRolloutSummary {
 export function buildHttpWorkerArtifactManifest(plan: HttpWorkerDeploymentPlan): ArtifactManifest {
   return {
     manifestId: plan.manifestId,
-    artifactKind: "http_worker",
+    artifactKind: plan.deploymentKind ?? "http_worker",
     declaredArtifactId: plan.declaredArtifactId,
     declaredVersion: plan.declaredVersion,
     source: {
@@ -195,6 +197,7 @@ export function buildPlacementSnapshot(input: {
     {
       deploymentId: string;
       deploymentKind: Assignment["deploymentKind"];
+      groupId?: string;
       ownerHostIds: Set<string>;
       routesById: Map<
         string,
@@ -215,11 +218,12 @@ export function buildPlacementSnapshot(input: {
       const entry = deployments.get(assignment.deploymentId) ?? {
         deploymentId: assignment.deploymentId,
         deploymentKind: assignment.deploymentKind,
+        groupId: assignment.groupId,
         ownerHostIds: new Set<string>(),
         routesById: new Map()
       };
       entry.ownerHostIds.add(desired.hostId);
-      for (const routeId of assignment.httpWorker?.routeRefs ?? []) {
+      for (const routeId of assignment.httpWorker?.routeRefs ?? assignment.serveApp?.routeRefs ?? []) {
         const route = routesById.get(routeId);
         if (!route) {
           continue;
@@ -243,6 +247,7 @@ export function buildPlacementSnapshot(input: {
       .map((deployment) => ({
         deploymentId: deployment.deploymentId,
         deploymentKind: deployment.deploymentKind,
+        groupId: deployment.groupId,
         ownerHostIds: Array.from(deployment.ownerHostIds).sort((left, right) => left.localeCompare(right)),
         routes: Array.from(deployment.routesById.values())
           .map((route) => ({
@@ -559,7 +564,8 @@ function buildAssignmentForHost(hostId: string, deployment: HttpWorkerDeployment
     assignmentId: `assign:${hostId}:${deployment.deploymentId}`,
     hostId,
     deploymentId: deployment.deploymentId,
-    deploymentKind: "http_worker",
+    deploymentKind: deployment.deploymentKind ?? "http_worker",
+    groupId: deployment.groupId,
     declaredVersion: deployment.declaredVersion,
     declaredArtifactId: deployment.declaredArtifactId,
     artifact: {
@@ -567,11 +573,20 @@ function buildAssignmentForHost(hostId: string, deployment: HttpWorkerDeployment
       sourceUri: manifest.source.uri,
       digest: manifest.source.digest
     },
-    httpWorker: {
-      name: deployment.workerName,
-      entry: deployment.workerEntry,
-      routeRefs: [buildRouteIdForHost(hostId, deployment)]
-    }
+    httpWorker: (deployment.deploymentKind ?? "http_worker") === "http_worker"
+      ? {
+          name: deployment.workerName,
+          entry: deployment.workerEntry,
+          routeRefs: [buildRouteIdForHost(hostId, deployment)]
+        }
+      : undefined,
+    serveApp: (deployment.deploymentKind ?? "http_worker") === "serve"
+      ? {
+          name: deployment.workerName,
+          entry: deployment.workerEntry,
+          routeRefs: [buildRouteIdForHost(hostId, deployment)]
+        }
+      : undefined
   };
 }
 

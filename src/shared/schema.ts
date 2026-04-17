@@ -5,6 +5,7 @@ import type {
   ConnRef,
   Envelope,
   HardessConfig,
+  HardessServeModule,
   HardessServiceModule,
   HardessWorkerModule,
   HardessWorkerResult,
@@ -29,6 +30,7 @@ export const pipelineConfigSchema = z.object({
     .string()
     .min(1, "matchPrefix is required")
     .refine((value) => value.startsWith("/"), "matchPrefix must start with '/'"),
+  groupId: z.string().min(1, "groupId must be non-empty").optional(),
   auth: z.object({
     required: z.boolean()
   }).optional(),
@@ -69,12 +71,14 @@ export const envelopeSchema = z.object({
 
 export const sysAuthPayloadSchema = z.object({
   provider: z.string().min(1, "provider is required"),
-  payload: z.unknown()
+  payload: z.unknown(),
+  groupId: z.string().min(1, "groupId must be non-empty").optional()
 });
 
 export const bearerSysAuthPayloadSchema = z.object({
   provider: z.literal("bearer"),
-  payload: z.string().min(1, "payload is required")
+  payload: z.string().min(1, "payload is required"),
+  groupId: z.string().min(1, "groupId must be non-empty").optional()
 });
 
 export const sysAuthOkPayloadSchema = z.object({
@@ -108,7 +112,8 @@ export const sysHandleAckEventPayloadSchema = z.object({
 const connRefSchema = z.object({
   nodeId: z.string().min(1, "nodeId is required"),
   connId: z.string().min(1, "connId is required"),
-  peerId: z.string().min(1, "peerId is required")
+  peerId: z.string().min(1, "peerId is required"),
+  groupId: z.string().min(1, "groupId must be non-empty").optional()
 });
 
 export const sysRoutePayloadSchema = z.object({
@@ -165,6 +170,64 @@ export const serviceModuleExportSchema = z.custom<HardessServiceModule>(
     );
   },
   "service module must export { protocol, version, actions }"
+);
+
+export const serveModuleExportSchema = z.custom<HardessServeModule>(
+  (value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    const moduleValue = value as {
+      kind?: unknown;
+      routes?: unknown;
+      middleware?: unknown;
+    };
+    if (moduleValue.kind !== "serve") {
+      return false;
+    }
+    if (!Array.isArray(moduleValue.routes)) {
+      return false;
+    }
+    if (
+      moduleValue.middleware !== undefined &&
+      !Array.isArray(moduleValue.middleware)
+    ) {
+      return false;
+    }
+
+    return moduleValue.routes.every((route) => {
+      if (!route || typeof route !== "object") {
+        return false;
+      }
+      const routeValue = route as {
+        method?: unknown;
+        path?: unknown;
+        handler?: unknown;
+      };
+      return (
+        typeof routeValue.method === "string" &&
+        typeof routeValue.path === "string" &&
+        routeValue.path.startsWith("/") &&
+        typeof routeValue.handler === "function"
+      );
+    }) && (moduleValue.middleware ?? []).every((middleware) => {
+      if (!middleware || typeof middleware !== "object") {
+        return false;
+      }
+      const middlewareValue = middleware as {
+        pathPrefix?: unknown;
+        handler?: unknown;
+      };
+      return (
+        (middlewareValue.pathPrefix === undefined ||
+          (typeof middlewareValue.pathPrefix === "string" &&
+            middlewareValue.pathPrefix.startsWith("/"))) &&
+        typeof middlewareValue.handler === "function"
+      );
+    });
+  },
+  "serve module must export { kind: \"serve\", routes, middleware? }"
 );
 
 export function formatZodError(error: ZodError): string {
@@ -313,6 +376,18 @@ export function parseServiceModuleExport(
   const result = serviceModuleExportSchema.safeParse(value);
   if (!result.success) {
     throw new Error(`Invalid service module ${entry}: ${formatZodError(result.error)}`);
+  }
+
+  return result.data;
+}
+
+export function parseServeModuleExport(
+  value: unknown,
+  entry = "serve module"
+): HardessServeModule {
+  const result = serveModuleExportSchema.safeParse(value);
+  if (!result.success) {
+    throw new Error(`Invalid serve module ${entry}: ${formatZodError(result.error)}`);
   }
 
   return result.data;

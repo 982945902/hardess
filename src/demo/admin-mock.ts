@@ -40,6 +40,7 @@ interface DemoWorkerArtifactFiles {
 interface DemoArtifactFiles {
   sharedWorker: DemoWorkerArtifactFiles;
   hostWorker: DemoWorkerArtifactFiles;
+  serveApp: DemoWorkerArtifactFiles;
   serviceModule: DemoWorkerArtifactFiles;
   denoJson: string;
   denoLock: string;
@@ -79,6 +80,7 @@ export interface DemoAdminApp {
 const DEFAULT_PORT = 9100;
 const sharedWorkerArtifactUrl = new URL("./admin-artifacts/demo-http-worker.ts", import.meta.url);
 const hostWorkerArtifactUrl = new URL("./admin-artifacts/demo-host-worker.ts", import.meta.url);
+const serveAppArtifactUrl = new URL("./admin-artifacts/demo-serve-app.ts", import.meta.url);
 const serviceModuleArtifactUrl = new URL("./admin-artifacts/demo-chat-service-module.ts", import.meta.url);
 const denoJsonArtifactUrl = new URL("./admin-artifacts/deno.json", import.meta.url);
 const denoLockArtifactUrl = new URL("./admin-artifacts/deno.lock", import.meta.url);
@@ -272,6 +274,7 @@ export async function createDemoAdminApp(
 async function loadArtifactFiles(): Promise<DemoArtifactFiles> {
   const sharedWorkerSource = await readFile(sharedWorkerArtifactUrl, "utf8");
   const hostWorkerSource = await readFile(hostWorkerArtifactUrl, "utf8");
+  const serveAppSource = await readFile(serveAppArtifactUrl, "utf8");
   const serviceModuleSource = await readFile(serviceModuleArtifactUrl, "utf8");
   const denoJson = await readFile(denoJsonArtifactUrl, "utf8");
   const denoLock = await readFile(denoLockArtifactUrl, "utf8");
@@ -283,6 +286,10 @@ async function loadArtifactFiles(): Promise<DemoArtifactFiles> {
     hostWorker: {
       source: hostWorkerSource,
       digest: `sha256:${createHash("sha256").update(hostWorkerSource).digest("hex")}`
+    },
+    serveApp: {
+      source: serveAppSource,
+      digest: `sha256:${createHash("sha256").update(serveAppSource).digest("hex")}`
     },
     serviceModule: {
       source: serviceModuleSource,
@@ -330,6 +337,21 @@ function buildDemoHttpDeployments(
       routePathPrefix: `${routePrefix}/hosts`,
       routeScope: "per_host",
       assignmentMode: "all-hosts"
+    },
+    {
+      deploymentId: "deployment:demo-personnel-serve",
+      deploymentKind: "serve",
+      groupId: "group-personnel",
+      declaredArtifactId: "demo-personnel-serve",
+      declaredVersion: "demo-personnel-serve/v1",
+      manifestId: "manifest:demo-personnel-serve:v1",
+      replicas: Number.MAX_SAFE_INTEGER,
+      sourceUri: "",
+      workerName: "demo-personnel-serve",
+      workerEntry: "apps/demo-serve-app.ts",
+      routeId: "route:demo-personnel-serve",
+      routePathPrefix: `${routePrefix}/serve`,
+      assignmentMode: "all-hosts"
     }
   ];
 }
@@ -362,7 +384,15 @@ function buildHttpArtifactManifest(
   const workerArtifact =
     deployment.deploymentId === "deployment:demo-http-shared"
       ? artifactFiles.sharedWorker
-      : artifactFiles.hostWorker;
+      : deployment.deploymentId === "deployment:demo-http-host"
+        ? artifactFiles.hostWorker
+        : artifactFiles.serveApp;
+  const sourcePath =
+    deployment.deploymentId === "deployment:demo-http-shared"
+      ? "/artifacts/demo-http-worker.ts"
+      : deployment.deploymentId === "deployment:demo-http-host"
+        ? "/artifacts/demo-host-worker.ts"
+        : "/artifacts/demo-serve-app.ts";
 
   return buildHttpWorkerArtifactManifest({
     ...deployment,
@@ -370,12 +400,7 @@ function buildHttpArtifactManifest(
       deployment.deploymentId === "deployment:demo-http-shared"
         ? sharedDeploymentReplicas
         : Number.MAX_SAFE_INTEGER,
-    sourceUri: new URL(
-      deployment.deploymentId === "deployment:demo-http-shared"
-        ? "/artifacts/demo-http-worker.ts"
-        : "/artifacts/demo-host-worker.ts",
-      origin
-    ).toString(),
+    sourceUri: new URL(sourcePath, origin).toString(),
     sourceDigest: workerArtifact.digest,
     denoJson: new URL("/artifacts/deno.json", origin).toString(),
     denoLock: new URL("/artifacts/deno.lock", origin).toString(),
@@ -697,6 +722,10 @@ function serveArtifactRequest(
 
   if (pathname === "/artifacts/demo-host-worker.ts") {
     return textResponse(artifactFiles.hostWorker.source, "text/typescript; charset=utf-8");
+  }
+
+  if (pathname === "/artifacts/demo-serve-app.ts") {
+    return textResponse(artifactFiles.serveApp.source, "text/typescript; charset=utf-8");
   }
 
   if (pathname === "/artifacts/demo-chat-service-module.ts") {

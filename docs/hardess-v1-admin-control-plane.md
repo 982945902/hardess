@@ -230,7 +230,8 @@ type DesiredHostState = {
   assignments: Array<{
     assignment_id: string;
     deployment_id: string;
-    deployment_kind: "http_worker" | "service_module";
+    deployment_kind: "http_worker" | "service_module" | "serve";
+    group_id?: string;
     declared_version: string;
     declared_artifact_id?: string;
     artifact: {
@@ -245,6 +246,11 @@ type DesiredHostState = {
     service_module?: {
       name: string;
       entry: string;
+    };
+    serve_app?: {
+      name: string;
+      entry: string;
+      route_refs?: string[];
     };
     auth_policy_ref?: string;
     secret_refs?: string[];
@@ -268,7 +274,8 @@ type DesiredHostState = {
       generated_at: number;
       deployments: Array<{
         deployment_id: string;
-        deployment_kind: "http_worker" | "service_module";
+        deployment_kind: "http_worker" | "service_module" | "serve";
+        group_id?: string;
         owner_host_ids: string[];
         routes: Array<{
           route_id: string;
@@ -293,6 +300,10 @@ The important point is:
 - admin also distributes the slow-changing global topology snapshot
 - each host receives only its own assignments
 - runtime reconciles one coherent host-local desired state
+- `group_id` is an explicit grouping field carried by deployment / assignment /
+  placement; `v1` does not add a separate `service + selector` object model
+- in the current runtime, `group_id` is already consumed beyond admin state: it
+  scopes WebSocket connection auth context and distributed peer-locate fanout
 - runtime can use `placement.routes` to forward HTTP requests to the correct
   owner host when the current host is not assigned that route
 - runtime can use the same route ownership to forward business WebSocket upgrade
@@ -496,6 +507,11 @@ For the current `v1` runtime, the concrete execution ABI now diverges by
 protocol surface, but not by deployment lifecycle:
 
 - `http_worker` exports `fetch(request, env, ctx)`
+- `serve` is a higher-level HTTP app abstraction authored in TypeScript with
+  app/router style APIs such as `createApp()`, `app.use()`, and `app.get()`
+- runtime adapts `serve` to the same `fetch(request, env, ctx)` worker ABI at
+  load time, so `worker` remains the primitive and `serve` is sugar plus a
+  structured route/middleware model
 - `serviceModule` exports the explicit `ServerProtocolModule` object shape:
 
 ```ts
@@ -533,6 +549,13 @@ That means `serviceModule` is aligned with `http_worker` at the control-plane
 layer, but its runtime activation path is "stage artifact -> load module ->
 register protocol actions into the WebSocket registry", not "compile into HTTP
 pipeline config".
+
+For HTTP specifically, the current `v1` layering is therefore:
+
+- `worker` is the lowest-level runtime primitive
+- `serve` is a higher-level authoring form for one HTTP app
+- admin still deploys and scales both through the same deployment / assignment
+  lifecycle
 
 One important `serviceModule` semantic is now fixed for `v1`:
 

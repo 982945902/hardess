@@ -109,7 +109,8 @@ Recommended shape:
 ```ts
 type Deployment = {
   deployment_id: string;
-  deployment_kind: "http_worker" | "service_module";
+  deployment_kind: "http_worker" | "service_module" | "serve";
+  group_id?: string;
   name: string;
   declared_version: string;
   declared_artifact_id?: string;
@@ -139,6 +140,12 @@ type Deployment = {
 Notes:
 
 - `replicas` is global desired count
+- `group_id` is the explicit grouping field for forwarding / probe scope and
+  future admin policy; `v1` does not introduce a separate `service` or
+  `selector` object
+- for WebSocket runtime, `group_id` is applied as a connection-scoped routing
+  scope: clients authenticate into one group, and peer locate / fanout stays
+  within that group when the sender carries one
 - `scheduling` leaves room for future affinity / anti-affinity policy
 - `rollout` stays intentionally simple in `v1`
 
@@ -158,7 +165,8 @@ type Assignment = {
   assignment_id: string;
   host_id: string;
   deployment_id: string;
-  deployment_kind: "http_worker" | "service_module";
+  deployment_kind: "http_worker" | "service_module" | "serve";
+  group_id?: string;
   declared_version: string;
   declared_artifact_id?: string;
   artifact: {
@@ -174,6 +182,11 @@ type Assignment = {
   service_module?: {
     name: string;
     entry: string;
+  };
+  serve_app?: {
+    name: string;
+    entry: string;
+    route_refs?: string[];
   };
   auth_policy_ref?: string;
   secret_refs?: string[];
@@ -339,7 +352,7 @@ Recommended shape:
 ```ts
 type ArtifactManifest = {
   manifest_id: string;
-  artifact_kind: "http_worker" | "service_module";
+  artifact_kind: "http_worker" | "service_module" | "serve";
   declared_artifact_id?: string;
   declared_version: string;
   source: {
@@ -369,10 +382,16 @@ Current `v1` implementation boundary:
 
 - for `http_worker`, runtime currently treats `source.uri` as the worker source file
 - runtime stages that file into a local artifact cache and points the live pipeline `worker.entry` at the staged path
+- for `serve`, runtime stages the app entry the same way, validates that it
+  exports the `serve` module shape, and adapts it into the worker fetch ABI
+  before attaching it to the generated HTTP pipeline
 - for `service_module`, runtime stages the module source into the same local artifact cache, loads the staged entry, validates that it exports `{ protocol, version, actions }`, and registers it into the runtime WebSocket protocol registry
 - when `package_manager.deno_json` or `package_manager.deno_lock` are present, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
 - for remote `source.uri`, a `digest` is the boundary for reliable cache reuse; without it, runtime should prefer restaging over assuming the cached remote source is still current
 - `package_manager.deno_json` and `package_manager.deno_lock` are already part of the protocol, but runtime-side dependency materialization is still incremental
+- cluster peer locate now accepts an optional connection `group_id` scope and
+  runtime narrows both local lookup and remote peer probing with that scope when
+  available
 
 ## 10. Baseline Operations
 

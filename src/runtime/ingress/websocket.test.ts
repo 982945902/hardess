@@ -299,6 +299,112 @@ describe("createWebSocketHandlers", () => {
     expect(actions.slice(-2)).toEqual(["recvAck", "handleAck"]);
   });
 
+  it("scopes peer delivery to the sender groupId", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    const bobA = createSocket("conn-bob-a");
+    const bobB = createSocket("conn-bob-b");
+
+    handlers.open(alice);
+    handlers.open(bobA);
+    handlers.open(bobB);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice",
+          groupId: "group-a"
+        }
+      })
+    );
+
+    await handlers.message(
+      bobA,
+      serializeEnvelope({
+        msgId: "m-auth-bob-a",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob",
+          groupId: "group-a"
+        }
+      })
+    );
+
+    await handlers.message(
+      bobB,
+      serializeEnvelope({
+        msgId: "m-auth-bob-b",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob",
+          groupId: "group-b"
+        }
+      })
+    );
+
+    bobA.sent.length = 0;
+    bobB.sent.length = 0;
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-biz-group-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello-group-a"
+        }
+      })
+    );
+
+    expect(lastEnvelope(bobA)?.kind).toBe("biz");
+    expect(lastEnvelope(bobA)?.payload).toEqual({
+      toPeerId: "bob",
+      content: "hello-group-a"
+    });
+    expect(bobB.sent).toEqual([]);
+  });
+
   it("sends heartbeat ping and closes stale connections", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
     const peerLocator = new InMemoryPeerLocator();

@@ -6,7 +6,7 @@ import { StaticClusterNetwork } from "./network.ts";
 describe("DistributedPeerLocator", () => {
   it("merges local and remote results and caches remote lookups", async () => {
     const local = new InMemoryPeerLocator();
-    local.register({ nodeId: "node-a", connId: "conn-local", peerId: "alice" });
+    local.register({ nodeId: "node-a", connId: "conn-local", peerId: "alice", groupId: "group-chat" });
 
     const fetchFn = mock(async () => {
       return new Response(
@@ -27,13 +27,13 @@ describe("DistributedPeerLocator", () => {
     );
     const locator = new DistributedPeerLocator(local, network, 10_000);
 
-    const first = await locator.find("alice");
+    const first = await locator.find("alice", { groupId: "group-chat" });
     expect(first).toEqual([
-      { nodeId: "node-a", connId: "conn-local", peerId: "alice" },
+      { nodeId: "node-a", connId: "conn-local", peerId: "alice", groupId: "group-chat" },
       { nodeId: "node-b", connId: "conn-remote", peerId: "alice" }
     ]);
 
-    const second = await locator.find("alice");
+    const second = await locator.find("alice", { groupId: "group-chat" });
     expect(second).toEqual(first);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
@@ -68,5 +68,49 @@ describe("DistributedPeerLocator", () => {
       { nodeId: "node-b", connId: "conn-remote", peerId: "alice" }
     ]);
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("passes groupId and topology-scoped node ids into remote locate", async () => {
+    const local = new InMemoryPeerLocator();
+    let requestedUrl: string | undefined;
+    let requestedBody: unknown;
+    const fetchSpy = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestedUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      requestedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+      return new Response(
+        JSON.stringify({
+          peers: {
+            alice: [{ nodeId: "node-c", connId: "conn-remote", peerId: "alice", groupId: "group-chat" }]
+          }
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        }
+      );
+    });
+    const network = new StaticClusterNetwork(
+      [
+        { nodeId: "node-b", baseUrl: "http://node-b.internal" },
+        { nodeId: "node-c", baseUrl: "http://node-c.internal" }
+      ],
+      { nodeId: "node-a", fetchFn: fetchSpy as unknown as typeof fetch }
+    );
+    const locator = new DistributedPeerLocator(
+      local,
+      network,
+      10_000,
+      undefined,
+      () => ["node-c"]
+    );
+
+    await locator.find("alice", { groupId: "group-chat" });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(requestedUrl).toBe("http://node-c.internal/__cluster/locate");
+    expect(requestedBody).toEqual({
+      peerIds: ["alice"],
+      groupId: "group-chat"
+    });
   });
 });

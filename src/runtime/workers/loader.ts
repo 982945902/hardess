@@ -1,6 +1,11 @@
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { parseWorkerModuleExport, type HardessWorkerModule } from "../../shared/index.ts";
+import {
+  parseServeModuleExport,
+  parseWorkerModuleExport,
+  type HardessWorkerModule
+} from "../../shared/index.ts";
+import { createWorkerFromServeModule } from "../serve/worker.ts";
 
 interface CachedWorker {
   mtimeMs: number;
@@ -28,7 +33,17 @@ export async function loadWorker(entry: string): Promise<HardessWorkerModule> {
     await writeFile(shadowCopyPath, source, "utf8");
     const moduleUrl = new URL(`file://${shadowCopyPath}`);
     const loaded = await import(moduleUrl.href);
-    const workerModule = parseWorkerModuleExport(loaded.default ?? loaded, entry);
+    const exportedValue = loaded.default ?? loaded;
+    let workerModule: HardessWorkerModule;
+    try {
+      workerModule = parseWorkerModuleExport(exportedValue, entry);
+    } catch (workerError) {
+      try {
+        workerModule = createWorkerFromServeModule(parseServeModuleExport(exportedValue, entry));
+      } catch {
+        throw workerError;
+      }
+    }
 
     if (cached?.shadowCopyPath) {
       await rm(cached.shadowCopyPath, { force: true });

@@ -289,14 +289,15 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
         continue;
       }
 
-      if (!assignment.httpWorker) {
+      const httpExecutable = assignment.httpWorker ?? assignment.serveApp;
+      if (!httpExecutable) {
         const state = assignmentStates.get(assignment.assignmentId);
         if (state) {
           state.state = "failed";
           state.failedAt = Date.now();
           state.lastError = {
-            code: "HTTP_WORKER_PAYLOAD_MISSING",
-            message: "Assignment is missing httpWorker payload",
+            code: "HTTP_EXECUTABLE_PAYLOAD_MISSING",
+            message: "Assignment is missing httpWorker or serveApp payload",
             retryable: false
           };
         }
@@ -304,7 +305,7 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
       }
 
       try {
-        const routeRefs = assignment.httpWorker.routeRefs ?? [];
+        const routeRefs = httpExecutable.routeRefs ?? [];
         const artifactManifest = artifacts.get(assignment.artifact.manifestId);
         const prepared = await this.artifactStore.stageHttpWorker(assignment, artifactManifest);
         for (const routeRef of routeRefs) {
@@ -332,6 +333,7 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
           pipelines.push({
             id: `${assignment.assignmentId}:${route.routeId}`,
             matchPrefix: route.match.pathPrefix,
+            groupId: assignment.groupId,
             auth: {
               required: true
             },

@@ -174,18 +174,30 @@ export class StaticClusterNetwork {
     this.serverHandlers = handlers;
   }
 
-  async locate(peerIds: string[]): Promise<Map<string, ConnRef[]>> {
+  async locate(
+    peerIds: string[],
+    options: {
+      groupId?: string;
+      nodeIds?: string[];
+    } = {}
+  ): Promise<Map<string, ConnRef[]>> {
     const merged = new Map<string, ConnRef[]>();
     for (const peerId of peerIds) {
       merged.set(peerId, []);
     }
 
+    const allowedNodeIds = options.nodeIds ? new Set(options.nodeIds) : undefined;
     await Promise.all(
-      this.listPeers().map(async (peer) => {
+      this.listPeers()
+        .filter((peer) => !allowedNodeIds || allowedNodeIds.has(peer.nodeId))
+        .map(async (peer) => {
         try {
           const response = await this.request(peer, "/__cluster/locate", {
             method: "POST",
-            body: JSON.stringify({ peerIds })
+            body: JSON.stringify({
+              peerIds,
+              groupId: options.groupId
+            })
           });
           const payload = parseClusterLocateResponse(await response.json());
           for (const peerId of peerIds) {

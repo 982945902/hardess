@@ -119,8 +119,8 @@ describe("createDemoAdminApp", () => {
 
     expect(desiredA.changed).toBe(true);
     expect(desiredB.changed).toBe(true);
-    expect(desiredA.desired.assignments).toHaveLength(3);
-    expect(desiredB.desired.assignments).toHaveLength(2);
+    expect(desiredA.desired.assignments).toHaveLength(4);
+    expect(desiredB.desired.assignments).toHaveLength(3);
     expect(desiredA.desired.topology.membership.hosts.map((host: { hostId: string }) => host.hostId)).toEqual([
       "host-demo-a",
       "host-demo-b"
@@ -135,12 +135,14 @@ describe("createDemoAdminApp", () => {
     ).toEqual([
       "deployment:demo-http-shared",
       "deployment:demo-http-host",
+      "deployment:demo-personnel-serve",
       "deployment:demo-chat-service-module"
     ]);
     expect(
       desiredB.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
     ).toEqual([
       "deployment:demo-http-host",
+      "deployment:demo-personnel-serve",
       "deployment:demo-chat-service-module"
     ]);
     expect(
@@ -149,15 +151,22 @@ describe("createDemoAdminApp", () => {
       )
     ).toEqual([
       "/demo/shared",
-      "/demo/hosts/host-demo-a"
+      "/demo/hosts/host-demo-a",
+      "/demo/serve"
     ]);
     expect(
       desiredB.desired.sharedHttpForwardConfig.routes.map(
         (route: { match: { pathPrefix: string } }) => route.match.pathPrefix
       )
     ).toEqual([
-      "/demo/hosts/host-demo-b"
+      "/demo/hosts/host-demo-b",
+      "/demo/serve"
     ]);
+    const servePlacement = desiredA.desired.topology.placement.deployments.find(
+      (deployment: { deploymentId: string }) => deployment.deploymentId === "deployment:demo-personnel-serve"
+    );
+    expect(servePlacement.groupId).toBe("group-personnel");
+    expect(servePlacement.ownerHostIds).toEqual(["host-demo-a", "host-demo-b"]);
     expect(desiredA.desired.revision).toContain("demo-rev:1:");
     expect(desiredB.desired.revision).toContain("demo-rev:1:");
 
@@ -178,6 +187,13 @@ describe("createDemoAdminApp", () => {
           state: "active"
         },
         {
+          assignmentId: "assign:host-demo-a:deployment:demo-personnel-serve",
+          deploymentId: "deployment:demo-personnel-serve",
+          declaredVersion: "demo-personnel-serve/v1",
+          generationId: "gen-a-1",
+          state: "active"
+        },
+        {
           assignmentId: "assign:host-demo-a:deployment:demo-chat-service-module",
           deploymentId: "deployment:demo-chat-service-module",
           declaredVersion: "demo-chat-service-module/v1",
@@ -192,6 +208,13 @@ describe("createDemoAdminApp", () => {
           assignmentId: "assign:host-demo-b:deployment:demo-http-host",
           deploymentId: "deployment:demo-http-host",
           declaredVersion: "demo-http-host/v1",
+          generationId: "gen-b-1",
+          state: "active"
+        },
+        {
+          assignmentId: "assign:host-demo-b:deployment:demo-personnel-serve",
+          deploymentId: "deployment:demo-personnel-serve",
+          declaredVersion: "demo-personnel-serve/v1",
           generationId: "gen-b-1",
           state: "active"
         },
@@ -234,6 +257,7 @@ describe("createDemoAdminApp", () => {
     ).toEqual([
       "deployment:demo-http-shared",
       "deployment:demo-http-host",
+      "deployment:demo-personnel-serve",
       "deployment:demo-chat-service-module"
     ]);
     expect(
@@ -242,7 +266,8 @@ describe("createDemoAdminApp", () => {
       )
     ).toEqual([
       "/demo/shared",
-      "/demo/hosts/host-demo-b"
+      "/demo/hosts/host-demo-b",
+      "/demo/serve"
     ]);
 
     const stateDuringRolloutResponse = await app.fetch(
@@ -279,6 +304,13 @@ describe("createDemoAdminApp", () => {
           assignmentId: "assign:host-demo-b:deployment:demo-http-host",
           deploymentId: "deployment:demo-http-host",
           declaredVersion: "demo-http-host/v1",
+          generationId: "gen-b-2",
+          state: "active"
+        },
+        {
+          assignmentId: "assign:host-demo-b:deployment:demo-personnel-serve",
+          deploymentId: "deployment:demo-personnel-serve",
+          declaredVersion: "demo-personnel-serve/v1",
           generationId: "gen-b-2",
           state: "active"
         },
@@ -325,18 +357,37 @@ describe("createDemoAdminApp", () => {
         })
       })
     );
+    const serveManifestResponse = await app.fetch(
+      new Request("http://127.0.0.1:9100/v1/admin/artifacts/manifest", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          manifestId: "manifest:demo-personnel-serve:v1"
+        })
+      })
+    );
     const sharedManifest = await sharedManifestResponse.json();
     const hostManifest = await hostManifestResponse.json();
     const serviceManifest = await serviceManifestResponse.json();
+    const serveManifest = await serveManifestResponse.json();
     expect(sharedManifest.source.uri).toBe("http://127.0.0.1:9100/artifacts/demo-http-worker.ts");
     expect(hostManifest.source.uri).toBe("http://127.0.0.1:9100/artifacts/demo-host-worker.ts");
     expect(serviceManifest.source.uri).toBe("http://127.0.0.1:9100/artifacts/demo-chat-service-module.ts");
+    expect(serveManifest.source.uri).toBe("http://127.0.0.1:9100/artifacts/demo-serve-app.ts");
+    expect(serveManifest.artifactKind).toBe("serve");
 
     const hostWorkerResponse = await app.fetch(
       new Request("http://127.0.0.1:9100/artifacts/demo-host-worker.ts")
     );
     expect(hostWorkerResponse.status).toBe(200);
     expect(await hostWorkerResponse.text()).toContain("x-hardess-admin-scope");
+    const serveArtifactResponse = await app.fetch(
+      new Request("http://127.0.0.1:9100/artifacts/demo-serve-app.ts")
+    );
+    expect(serveArtifactResponse.status).toBe(200);
+    expect(await serveArtifactResponse.text()).toContain('kind: "serve"');
     const serviceModuleResponse = await app.fetch(
       new Request("http://127.0.0.1:9100/artifacts/demo-chat-service-module.ts")
     );
@@ -349,9 +400,9 @@ describe("createDemoAdminApp", () => {
     const state = await stateResponse.json();
     expect(state.registeredHosts).toHaveLength(2);
     expect(state.desiredHostStates).toHaveLength(2);
-    expect(state.artifactManifests).toHaveLength(3);
+    expect(state.artifactManifests).toHaveLength(4);
     expect(state.topology.membership.hosts).toHaveLength(2);
-    expect(state.topology.placement.deployments).toHaveLength(3);
+    expect(state.topology.placement.deployments).toHaveLength(4);
     expect(state.rolloutState.sharedDeploymentReplicas).toBe(2);
     expect(state.rolloutState.revisionToken).toBe(2);
     const sharedDeploymentSummary = state.rolloutSummary.find(
@@ -363,6 +414,10 @@ describe("createDemoAdminApp", () => {
       (summary: { deploymentId: string }) => summary.deploymentId === "deployment:demo-http-host"
     );
     expect(hostDeploymentSummary.activeHosts).toBe(2);
+    const serveDeploymentSummary = state.rolloutSummary.find(
+      (summary: { deploymentId: string }) => summary.deploymentId === "deployment:demo-personnel-serve"
+    );
+    expect(serveDeploymentSummary.activeHosts).toBe(2);
     const serviceModuleSummary = state.rolloutSummary.find(
       (summary: { deploymentId: string }) => summary.deploymentId === "deployment:demo-chat-service-module"
     );
@@ -396,6 +451,7 @@ describe("createDemoAdminApp", () => {
       )
     ).toEqual([
       "deployment:demo-http-host",
+      "deployment:demo-personnel-serve",
       "deployment:demo-chat-service-module"
     ]);
 
@@ -423,6 +479,13 @@ describe("createDemoAdminApp", () => {
           assignmentId: "assign:host-demo-b:deployment:demo-http-host",
           deploymentId: "deployment:demo-http-host",
           declaredVersion: "demo-http-host/v1",
+          generationId: "gen-b-2",
+          state: "active"
+        },
+        {
+          assignmentId: "assign:host-demo-b:deployment:demo-personnel-serve",
+          deploymentId: "deployment:demo-personnel-serve",
+          declaredVersion: "demo-personnel-serve/v1",
           generationId: "gen-b-2",
           state: "active"
         },
@@ -467,6 +530,13 @@ describe("createDemoAdminApp", () => {
           state: "active"
         },
         {
+          assignmentId: "assign:host-demo-b:deployment:demo-personnel-serve",
+          deploymentId: "deployment:demo-personnel-serve",
+          declaredVersion: "demo-personnel-serve/v1",
+          generationId: "gen-b-3",
+          state: "active"
+        },
+        {
           assignmentId: "assign:host-demo-b:deployment:demo-chat-service-module",
           deploymentId: "deployment:demo-chat-service-module",
           declaredVersion: "demo-chat-service-module/v1",
@@ -507,10 +577,16 @@ describe("createDemoAdminApp", () => {
     ).toContain("deployment:demo-http-shared");
     expect(
       initialDesiredA.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
+    ).toContain("deployment:demo-personnel-serve");
+    expect(
+      initialDesiredA.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
     ).toContain("deployment:demo-chat-service-module");
     expect(
       initialDesiredB.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
     ).not.toContain("deployment:demo-http-shared");
+    expect(
+      initialDesiredB.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
+    ).toContain("deployment:demo-personnel-serve");
     expect(
       initialDesiredB.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
     ).toContain("deployment:demo-chat-service-module");

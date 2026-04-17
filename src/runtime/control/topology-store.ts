@@ -34,9 +34,34 @@ export class RuntimeTopologyStore {
   }
 
   listClusterPeers(selfNodeId?: string): ClusterPeerNode[] {
+    return this.buildClusterPeers(selfNodeId);
+  }
+
+  listClusterPeerNodeIds(
+    selfNodeId?: string,
+    scope?: {
+      groupId?: string;
+    }
+  ): string[] | undefined {
+    const allowedHostIds = scope ? this.resolveAllowedHostIdsForGroup(scope.groupId) : undefined;
+    const peers = this.buildClusterPeers(selfNodeId, allowedHostIds);
+    if (peers.length > 0) {
+      return peers.map((peer) => peer.nodeId);
+    }
+
+    return allowedHostIds === undefined ? undefined : [];
+  }
+
+  private buildClusterPeers(
+    selfNodeId?: string,
+    allowedHostIds?: Set<string>
+  ): ClusterPeerNode[] {
     const peers = new Map<string, ClusterPeerNode>();
     for (const host of this.topology?.membership.hosts ?? []) {
       if (!host.nodeId || host.state === "offline" || host.nodeId === selfNodeId) {
+        continue;
+      }
+      if (allowedHostIds && !allowedHostIds.has(host.hostId)) {
         continue;
       }
 
@@ -52,6 +77,31 @@ export class RuntimeTopologyStore {
     }
 
     return Array.from(peers.values()).sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  }
+
+  private resolveAllowedHostIdsForGroup(groupId?: string): Set<string> | undefined {
+    const deployments = this.topology?.placement.deployments ?? [];
+    if (deployments.length === 0) {
+      return undefined;
+    }
+
+    const ownerHostIds = new Set<string>();
+    let matched = false;
+    for (const deployment of deployments) {
+      if (deployment.groupId !== groupId) {
+        continue;
+      }
+      matched = true;
+      for (const hostId of deployment.ownerHostIds) {
+        ownerHostIds.add(hostId);
+      }
+    }
+
+    if (!matched) {
+      return new Set<string>();
+    }
+
+    return ownerHostIds;
   }
 
   resolveHttpRouteTarget(input: {

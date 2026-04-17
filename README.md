@@ -13,13 +13,21 @@ bun install
 Run the local demo stack:
 
 ```bash
+# quick single-node path
 bun run demo:upstream
-bun run demo:admin
 PORT=3000 bun run dev
 bun run demo:http
 PEER_ID=bob bun run demo:client
 PEER_ID=alice TARGET_PEER_ID=bob AUTO_SEND=true bun run demo:client
+
+# admin-projected path
+bun run demo:upstream
+bun run demo:admin
+ADMIN_BASE_URL=http://127.0.0.1:9100 ADMIN_HOST_ID=host-demo-a PORT=3000 bun run dev
+ADMIN_BASE_URL=http://127.0.0.1:9100 ADMIN_HOST_ID=host-demo-b PORT=3001 bun run dev
 ```
+
+The admin-projected flow is the current better demo: it exercises host registration, desired-state reconcile, artifact staging, shared/per-host HTTP projection, `serve`, and placement `groupId`. See [docs/v1-admin-mock-demo.md](docs/v1-admin-mock-demo.md).
 
 Run verification:
 
@@ -125,6 +133,66 @@ SDK behavior notes:
 - `send(...)` rejects with a structured SDK error carrying `code`, `source`, and `retryable`
 - pending tracked sends fail immediately on transport close, including shutdown-driven `1001 / server shutting down`
 - server-side `sys.err` surfaces as `source="remote"`; SDK-local state failures surface as `source="client"`
+
+## HTTP Authoring
+
+`worker` is still the lowest-level HTTP primitive:
+
+```ts
+export default {
+  async fetch(request, env, ctx) {
+    return new Response("ok");
+  }
+};
+```
+
+`serve` is the higher-level HTTP app form now supported by runtime:
+
+```ts
+import { createApp, createRouter, defineServe } from "./src/sdk/index.ts";
+
+const users = createRouter();
+users.get("/:id", (_request, _env, ctx) => {
+  return Response.json({
+    userId: ctx.params.id,
+    path: ctx.path,
+    originalPath: ctx.originalPath
+  });
+});
+
+const app = createApp();
+app.get("/health", () => new Response("ok"));
+app.use("/users", users);
+
+export default defineServe(app);
+```
+
+Current `serve` behavior:
+
+- runtime strips the pipeline `matchPrefix` before route matching
+- supports `app.use(...)`, nested router mount, per-method routes, and `:param`
+- adapts back into the current worker `fetch(request, env, ctx)` ABI at load time
+
+## WS Group Scope
+
+WebSocket clients can now authenticate into one explicit `groupId`:
+
+```ts
+import { HardessClient } from "./src/sdk/index.ts";
+
+const client = new HardessClient("ws://127.0.0.1:3000/ws");
+client.connect("demo:alice", {
+  groupId: "group-chat"
+});
+await client.waitUntilReady();
+```
+
+Routing semantics:
+
+- same explicit `groupId` can locate and fan out to each other
+- missing `groupId` is treated as the default group, not a global wildcard
+- distributed peer locate is narrowed by topology when `groupId` is present
+- if you omit the connect option entirely, the client joins the default group
 
 ## Docs
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadWorker } from "./loader.ts";
 
 const cleanupPaths: string[] = [];
@@ -96,5 +96,64 @@ describe("loadWorker", () => {
     await expect(loadWorker(workerPath)).rejects.toThrow(
       "worker module must export fetch(request, env, ctx)"
     );
+  });
+
+  it("loads serve modules and adapts them into worker fetch handlers", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-serve-module-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "personnel-serve.ts");
+    const sdkPath = resolve(process.cwd(), "src/sdk/index.ts");
+    await writeFile(
+      workerPath,
+      `
+        import { createApp, createRouter, defineServe } from ${JSON.stringify(sdkPath)};
+
+        const users = createRouter();
+        users.get("/:id", (_request, _env, ctx) => Response.json({
+          kind: "user",
+          id: ctx.params.id,
+          path: ctx.path,
+          originalPath: ctx.originalPath
+        }));
+
+        const app = createApp();
+        app.use("/users", users);
+        app.get("/health", () => new Response("ok"));
+
+        export default defineServe(app);
+      `
+    );
+
+    const worker = await loadWorker(workerPath);
+    const env = {
+      auth: {
+        peerId: "alice",
+        tokenId: "demo:alice",
+        capabilities: [],
+        expiresAt: Date.now() + 1000
+      },
+      pipeline: {
+        id: "personnel",
+        matchPrefix: "/personnel",
+        downstreamOrigin: "http://127.0.0.1:9000"
+      }
+    };
+    const ctx = {
+      waitUntil() {}
+    };
+
+    const health = await worker.fetch(new Request("http://localhost/personnel/health"), env, ctx);
+    const healthResponse = health instanceof Response ? health : health?.response;
+    expect(healthResponse ? await healthResponse.text() : null).toBe("ok");
+
+    const user = await worker.fetch(new Request("http://localhost/personnel/users/42"), env, ctx);
+    const userResponse = user instanceof Response ? user : user?.response;
+    expect(userResponse ? await userResponse.json() : null).toEqual({
+      kind: "user",
+      id: "42",
+      path: "/users/42",
+      originalPath: "/personnel/users/42"
+    });
   });
 });

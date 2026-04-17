@@ -10,7 +10,8 @@ const connRefSchema = z.object({
 });
 
 const clusterLocateRequestSchema = z.object({
-  peerIds: z.array(z.string().min(1, "peerId is required")).min(1, "at least one peerId is required")
+  peerIds: z.array(z.string().min(1, "peerId is required")).min(1, "at least one peerId is required"),
+  groupId: z.string().min(1, "groupId must be non-empty").optional()
 });
 
 const ackModeSchema = z.enum(["none", "recv", "handle"]);
@@ -163,7 +164,7 @@ export type ClusterSocketMessage =
       error?: string;
     };
 
-export function parseClusterLocateRequest(value: unknown): { peerIds: string[] } {
+export function parseClusterLocateRequest(value: unknown): { peerIds: string[]; groupId?: string } {
   const result = clusterLocateRequestSchema.safeParse(value);
   if (!result.success) {
     throw new Error(`Invalid cluster locate request: ${formatZodError(result.error)}`);

@@ -6,4 +6,5 @@ export * from "./admin/planning.ts";
 export * from "./admin/transport.ts";
 export * from "./protocol/registry.ts";
 export * from "./runtime/client.ts";
+export * from "./serve/index.ts";
 export * from "./transport/ws.ts";

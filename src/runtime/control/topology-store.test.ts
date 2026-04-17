@@ -126,4 +126,67 @@ describe("RuntimeTopologyStore", () => {
       { nodeId: "node-c", baseUrl: "http://node-c.public" }
     ]);
   });
+
+  it("narrows cluster peers by placement groupId when provided", () => {
+    const store = new RuntimeTopologyStore();
+    store.setTopology({
+      membership: {
+        revision: "topology:3:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-a",
+            nodeId: "node-a",
+            internalBaseUrl: "http://node-a.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          },
+          {
+            hostId: "host-b",
+            nodeId: "node-b",
+            internalBaseUrl: "http://node-b.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          },
+          {
+            hostId: "host-c",
+            nodeId: "node-c",
+            internalBaseUrl: "http://node-c.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:3:placement",
+        generatedAt: 1,
+        deployments: [
+          {
+            deploymentId: "deploy-chat",
+            deploymentKind: "service_module",
+            groupId: "group-chat",
+            ownerHostIds: ["host-c"],
+            routes: []
+          }
+        ]
+      }
+    });
+
+    expect(store.listClusterPeerNodeIds("node-a", { groupId: "group-chat" })).toEqual(["node-c"]);
+    expect(store.listClusterPeerNodeIds("node-a", { groupId: undefined })).toEqual([]);
+    expect(store.listClusterPeerNodeIds("node-a", { groupId: "group-missing" })).toEqual([]);
+    expect(store.listClusterPeerNodeIds("node-a")).toEqual(["node-b", "node-c"]);
+  });
 });

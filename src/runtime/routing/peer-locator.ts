@@ -56,14 +56,19 @@ export class InMemoryPeerLocator implements PeerLocator {
     return this.connsByPeer.get(peerId)?.size ?? 0;
   }
 
-  async find(peerId: string): Promise<ConnRef[]> {
-    return Array.from(this.connsByPeer.get(peerId)?.values() ?? []);
+  async find(peerId: string, options?: { groupId?: string }): Promise<ConnRef[]> {
+    const conns = Array.from(this.connsByPeer.get(peerId)?.values() ?? []);
+    if (options === undefined) {
+      return conns;
+    }
+
+    return conns.filter((conn) => conn.groupId === options.groupId);
   }
 
-  async findMany(peerIds: string[]): Promise<Map<string, ConnRef[]>> {
+  async findMany(peerIds: string[], options?: { groupId?: string }): Promise<Map<string, ConnRef[]>> {
     const result = new Map<string, ConnRef[]>();
     for (const peerId of peerIds) {
-      result.set(peerId, await this.find(peerId));
+      result.set(peerId, await this.find(peerId, options));
     }
     return result;
   }

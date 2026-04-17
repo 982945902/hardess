@@ -6,12 +6,14 @@ export interface AuthContext {
   capabilities: string[];
   expiresAt: number;
   revokedAt?: number;
+  groupId?: string;
 }
 
 export interface ConnRef {
   nodeId: string;
   connId: string;
   peerId: string;
+  groupId?: string;
 }
 
 export interface Envelope<T = unknown> {
@@ -34,6 +36,7 @@ export interface Envelope<T = unknown> {
 export interface SysAuthPayload {
   provider: string;
   payload: unknown;
+  groupId?: string;
 }
 
 export interface SysAuthOkPayload {
@@ -278,8 +281,8 @@ export interface DeliveryPlan {
 }
 
 export interface PeerLocator {
-  find(peerId: string): Promise<ConnRef[]>;
-  findMany(peerIds: string[]): Promise<Map<string, ConnRef[]>>;
+  find(peerId: string, options?: { groupId?: string }): Promise<ConnRef[]>;
+  findMany(peerIds: string[], options?: { groupId?: string }): Promise<Map<string, ConnRef[]>>;
   invalidate?(peerId?: string): void;
 }
 
@@ -289,6 +292,7 @@ export interface HardessWorkerEnv {
     id: string;
     matchPrefix: string;
     downstreamOrigin: string;
+    groupId?: string;
   };
   traceId?: string;
 }
@@ -310,9 +314,64 @@ export interface HardessWorkerModule {
   ): Promise<Response | HardessWorkerResult | void> | Response | HardessWorkerResult | void;
 }
 
+export type HardessServeMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "HEAD"
+  | "OPTIONS"
+  | "ALL";
+
+export interface HardessServeContext extends HardessExecutionContext {
+  params: Record<string, string>;
+  path: string;
+  originalPath: string;
+}
+
+export type HardessServeHandlerResult = Response | HardessWorkerResult | void;
+
+export type HardessServeHandler = (
+  request: Request,
+  env: HardessWorkerEnv,
+  ctx: HardessServeContext
+) =>
+  | Promise<HardessServeHandlerResult>
+  | HardessServeHandlerResult;
+
+export type HardessServeNext = () => Promise<HardessServeHandlerResult>;
+
+export type HardessServeMiddleware = (
+  request: Request,
+  env: HardessWorkerEnv,
+  ctx: HardessServeContext,
+  next: HardessServeNext
+) =>
+  | Promise<HardessServeHandlerResult>
+  | HardessServeHandlerResult;
+
+export interface HardessServeRouteDefinition {
+  method: HardessServeMethod;
+  path: string;
+  handler: HardessServeHandler;
+}
+
+export interface HardessServeMiddlewareDefinition {
+  pathPrefix?: string;
+  handler: HardessServeMiddleware;
+}
+
+export interface HardessServeModule {
+  kind: "serve";
+  routes: HardessServeRouteDefinition[];
+  middleware?: HardessServeMiddlewareDefinition[];
+}
+
 export interface PipelineConfig {
   id: string;
   matchPrefix: string;
+  groupId?: string;
   auth?: {
     required: boolean;
   };

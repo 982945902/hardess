@@ -7,8 +7,10 @@ This demo wires the current `v1` control-plane slice end to end:
 - artifact manifest fetch
 - worker artifact staging
 - live HTTP pipeline apply
+- `serve` deployment staging and route projection
 - per-host desired-state projection
 - global topology snapshot projection (`membership` + `placement`)
+- placement `groupId` projection for scoped runtime traffic
 
 ## Start The Demo
 
@@ -60,6 +62,7 @@ Each runtime will:
 - stage the remote worker source plus `deno.json` / `deno.lock`
 - apply the shared HTTP pipeline only if this host is selected by the deployment replica placement
 - apply one host-specific HTTP pipeline derived from its own `hostId`
+- stage and activate one demo `serve` app projected with `groupId=group-personnel`
 - stage and activate one demo `service_module` artifact through the runtime
   WebSocket protocol registry
 - update its cluster peer scope from `topology.membership`
@@ -120,6 +123,25 @@ Expected:
 - runtime on `3001` should not have the shared deployment when `sharedDeploymentReplicas=1`
 - runtime on `3000` should not have the `host-demo-b` route
 - the request should fail with the normal "no pipeline" behavior
+
+Serve deployment with explicit `groupId`:
+
+```bash
+curl -i \
+  -H 'authorization: Bearer demo:alice' \
+  http://127.0.0.1:3000/demo/serve/health
+
+curl -i \
+  -H 'authorization: Bearer demo:bob' \
+  http://127.0.0.1:3001/demo/serve/health
+```
+
+Expected:
+
+- both runtimes serve `/demo/serve/health`
+- response JSON includes `"scope":"serve"` and `"groupId":"group-personnel"`
+- response headers include `x-hardess-admin-scope=serve` and `x-hardess-group-id=group-personnel`
+- in topology placement, this deployment is projected with `groupId=group-personnel`, so later cluster locate / probe can scope to that owner set
 
 ## Simulate A Rollout
 
@@ -203,6 +225,7 @@ The mock admin serves:
 - `POST /v1/admin/artifacts/manifest`
 - `GET /artifacts/demo-http-worker.ts`
 - `GET /artifacts/demo-host-worker.ts`
+- `GET /artifacts/demo-serve-app.ts`
 - `GET /artifacts/demo-chat-service-module.ts`
 - `GET /artifacts/deno.json`
 - `GET /artifacts/deno.lock`
@@ -213,14 +236,18 @@ Current fixed control-plane shape:
 
 - one shared `http_worker` deployment at `/demo/shared`, with replica count controlled by the mock admin
 - one host-scoped `http_worker` deployment projected as `/demo/hosts/<hostId>`
+- one all-host `serve` deployment projected as `/demo/serve/*`, with `groupId=group-personnel`
 - one all-host `service_module` deployment delivered through the same desired-state
   and artifact-manifest path
-- three artifact manifests with remote source digests
+- four artifact manifests with remote source digests
 - the same global deployment set, but different `DesiredHostState` per host
 - the same `topology.membership` and `topology.placement` snapshot is attached to every host projection for that revision
 - `topology.placement.routes` carries `pathPrefix -> ownerHostIds`, so a host can
   internally forward HTTP traffic to the correct owner when that route is not
   local
+- `topology.placement.deployments[*].groupId` carries the runtime scoping key;
+  in this demo only the `serve` deployment is explicitly grouped, while
+  deployments without `groupId` stay in the default group
 - the same route ownership can also be used to internally forward business
   WebSocket upgrade traffic to the correct owner host
 - the demo `service_module` shows the non-HTTP artifact path too: runtime stages

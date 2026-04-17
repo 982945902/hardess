@@ -147,6 +147,114 @@ describe("RuntimeHostAdapter", () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  it("builds pipelines for serve assignments and carries groupId into generated config", async () => {
+    const applyConfig = mock(async (config) => config);
+    const adapter = new RuntimeHostAdapter({
+      app: {
+        logger: {
+          info: mock(() => {}),
+          warn: mock(() => {}),
+          error: mock(() => {})
+        },
+        runtimeState: () => ({
+          startedAt: 100,
+          uptimeMs: 500,
+          shuttingDown: false,
+          disposed: false,
+          ready: true,
+          inFlightHttpRequests: 0
+        })
+      },
+      configStore: {
+        getConfig: () => ({ pipelines: [] }),
+        reload: async () => ({ pipelines: [] }),
+        applyConfig,
+        watch: () => {},
+        dispose: () => {},
+        subscribe: () => () => {}
+      },
+      artifactStore: {
+        stageHttpWorker: async () => ({ localEntry: "/tmp/staged/personnel-serve.ts" })
+      } as never,
+      hostId: "host-a",
+      runtimeVersion: "1.0.0"
+    });
+
+    await adapter.applyDesiredHostState({
+      hostId: "host-a",
+      revision: "rev-serve-1",
+      generatedAt: Date.now(),
+      topology: {
+        membership: {
+          revision: "topology:serve:membership",
+          generatedAt: Date.now(),
+          hosts: []
+        },
+        placement: {
+          revision: "topology:serve:placement",
+          generatedAt: Date.now(),
+          deployments: []
+        }
+      },
+      assignments: [
+        {
+          assignmentId: "assign-serve-1",
+          hostId: "host-a",
+          deploymentId: "deploy-serve",
+          deploymentKind: "serve",
+          groupId: "group-personnel",
+          declaredVersion: "serve-v1",
+          artifact: {
+            manifestId: "manifest-serve-1",
+            sourceUri: "https://admin.example/artifacts/personnel-serve.tgz"
+          },
+          serveApp: {
+            name: "personnel-serve",
+            entry: "apps/personnel-serve.ts",
+            routeRefs: ["route-serve-a"]
+          }
+        }
+      ],
+      sharedHttpForwardConfig: {
+        routes: [
+          {
+            routeId: "route-serve-a",
+            match: {
+              pathPrefix: "/personnel"
+            },
+            upstream: {
+              baseUrl: "http://upstream.internal"
+            }
+          }
+        ]
+      }
+    });
+
+    expect(applyConfig).toHaveBeenCalledWith(
+      {
+        pipelines: [
+          {
+            id: "assign-serve-1:route-serve-a",
+            matchPrefix: "/personnel",
+            groupId: "group-personnel",
+            auth: { required: true },
+            downstream: {
+              origin: "http://upstream.internal",
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000,
+              websocket: undefined
+            },
+            worker: {
+              entry: "/tmp/staged/personnel-serve.ts",
+              timeoutMs: 1000
+            }
+          }
+        ]
+      },
+      { source: "admin:rev-serve-1" }
+    );
+  });
+
   it("applies generated http config and activates service_module assignments through the manager", async () => {
     const logger = {
       info: mock(() => {}),

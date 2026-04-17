@@ -230,6 +230,83 @@ describe("admin planning helpers", () => {
     ]);
   });
 
+  it("builds serve manifests and carries groupId into placement", () => {
+    const manifest = buildHttpWorkerArtifactManifest({
+      deploymentId: "deployment:personnel",
+      deploymentKind: "serve",
+      groupId: "group-personnel",
+      declaredArtifactId: "artifact:personnel",
+      declaredVersion: "serve/v1",
+      manifestId: "manifest:personnel",
+      sourceUri: "https://admin.example/personnel-serve.ts",
+      workerName: "personnel-serve",
+      workerEntry: "apps/personnel-serve.ts",
+      routeId: "route:personnel",
+      routePathPrefix: "/personnel"
+    });
+    expect(manifest.artifactKind).toBe("serve");
+
+    const placement = buildPlacementSnapshot({
+      revision: "topology:serve:placement",
+      generatedAt: 11,
+      desiredHostStates: [
+        {
+          hostId: "host-a",
+          revision: "rev-a",
+          generatedAt: 1,
+          sharedHttpForwardConfig: {
+            routes: [
+              {
+                routeId: "route:personnel",
+                match: {
+                  pathPrefix: "/personnel"
+                },
+                upstream: {
+                  baseUrl: "http://127.0.0.1:9000"
+                }
+              }
+            ]
+          },
+          assignments: [
+            {
+              assignmentId: "assign:host-a:deployment:personnel",
+              hostId: "host-a",
+              deploymentId: "deployment:personnel",
+              deploymentKind: "serve",
+              groupId: "group-personnel",
+              declaredVersion: "serve/v1",
+              artifact: {
+                manifestId: "manifest:personnel",
+                sourceUri: "https://admin.example/personnel-serve.ts"
+              },
+              serveApp: {
+                name: "personnel-serve",
+                entry: "apps/personnel-serve.ts",
+                routeRefs: ["route:personnel"]
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(placement.deployments).toEqual([
+      {
+        deploymentId: "deployment:personnel",
+        deploymentKind: "serve",
+        groupId: "group-personnel",
+        ownerHostIds: ["host-a"],
+        routes: [
+          {
+            routeId: "route:personnel",
+            pathPrefix: "/personnel",
+            ownerHostIds: ["host-a"]
+          }
+        ]
+      }
+    ]);
+  });
+
   it("places replicas using labels, schedulable state, and capacity instead of plain hostId order", () => {
     const candidateHosts = buildPlacementCandidateHosts({
       registrations: [

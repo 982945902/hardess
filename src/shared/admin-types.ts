@@ -1,4 +1,4 @@
-export type DeploymentKind = "http_worker" | "service_module";
+export type DeploymentKind = "http_worker" | "service_module" | "serve";
 
 export interface HostStaticCapacity {
   maxHttpWorkerAssignments?: number;
@@ -31,6 +31,7 @@ export interface HostRegistration {
 export interface Deployment {
   deploymentId: string;
   deploymentKind: DeploymentKind;
+  groupId?: string;
   name: string;
   declaredVersion: string;
   declaredArtifactId?: string;
@@ -61,6 +62,7 @@ export interface Assignment {
   hostId: string;
   deploymentId: string;
   deploymentKind: DeploymentKind;
+  groupId?: string;
   declaredVersion: string;
   declaredArtifactId?: string;
   artifact: {
@@ -76,6 +78,11 @@ export interface Assignment {
   serviceModule?: {
     name: string;
     entry: string;
+  };
+  serveApp?: {
+    name: string;
+    entry: string;
+    routeRefs?: string[];
   };
   authPolicyRef?: string;
   secretRefs?: string[];
@@ -106,6 +113,7 @@ export interface MembershipSnapshot {
 export interface PlacementDeployment {
   deploymentId: string;
   deploymentKind: DeploymentKind;
+  groupId?: string;
   ownerHostIds: string[];
   routes: Array<{
     routeId: string;

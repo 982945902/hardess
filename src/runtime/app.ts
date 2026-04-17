@@ -139,6 +139,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   const nodeId = options.nodeId ?? "local";
   const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
   const localPeerLocator = new InMemoryPeerLocator();
+  const topologyStore = new RuntimeTopologyStore();
   const clusterNetwork = new StaticClusterNetwork(options.cluster?.peers ?? [], {
     nodeId,
     sharedSecret: options.cluster?.sharedSecret,
@@ -154,10 +155,11 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   const peerLocator = new DistributedPeerLocator(
     localPeerLocator,
     clusterNetwork.hasPeers() ? clusterNetwork : undefined,
-    options.cluster?.locatorCacheTtlMs
+    options.cluster?.locatorCacheTtlMs,
+    undefined,
+    (scope) => topologyStore.listClusterPeerNodeIds(nodeId, scope)
   );
   const dispatcher = new Dispatcher(peerLocator);
-  const topologyStore = new RuntimeTopologyStore();
   const registry = new ServerProtocolRegistry();
   const configStore = new ModuleConfigStore(
     options.configModulePath ?? "./config/hardess.config.ts",
@@ -472,7 +474,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           }
 
           const payload = parseClusterLocateRequest(await request.json());
-          const located = await localPeerLocator.findMany(payload.peerIds);
+          const located = await localPeerLocator.findMany(payload.peerIds, {
+            groupId: payload.groupId
+          });
 
           return json({
             ok: true,

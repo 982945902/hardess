@@ -40,7 +40,7 @@ describe("admin protocol schemas", () => {
     expect(value.staticLabels.zone).toBe("cn-sh-1");
   });
 
-  it("parses a desired host state with both assignment kinds", () => {
+  it("parses a desired host state with serve plus service-module assignments", () => {
     const value = parseDesiredHostState({
       hostId: "host-a",
       revision: "rev-42",
@@ -74,7 +74,8 @@ describe("admin protocol schemas", () => {
           deployments: [
             {
               deploymentId: "deploy-http",
-              deploymentKind: "http_worker",
+              deploymentKind: "serve",
+              groupId: "group-core",
               ownerHostIds: ["host-a"],
               routes: [
                 {
@@ -92,16 +93,17 @@ describe("admin protocol schemas", () => {
           assignmentId: "assign-http-1",
           hostId: "host-a",
           deploymentId: "deploy-http",
-          deploymentKind: "http_worker",
+          deploymentKind: "serve",
+          groupId: "group-core",
           declaredVersion: "worker-v3",
           artifact: {
             manifestId: "manifest-http-1",
             sourceUri: "https://admin.example/artifacts/http-worker.tgz",
             digest: "sha256:abc"
           },
-          httpWorker: {
+          serveApp: {
             name: "demo-http",
-            entry: "workers/demo-worker.ts",
+            entry: "apps/demo-serve.ts",
             routeRefs: ["route-a"]
           }
         },
@@ -140,7 +142,8 @@ describe("admin protocol schemas", () => {
     expect(value.assignments).toHaveLength(2);
     expect(value.topology?.membership.hosts[0]?.state).toBe("ready");
     expect(value.topology?.placement.deployments[0]?.ownerHostIds).toEqual(["host-a"]);
-    expect(value.assignments[0]?.httpWorker?.name).toBe("demo-http");
+    expect(value.assignments[0]?.groupId).toBe("group-core");
+    expect(value.assignments[0]?.serveApp?.name).toBe("demo-http");
     expect(value.assignments[1]?.serviceModule?.name).toBe("chat");
   });
 

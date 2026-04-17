@@ -133,6 +133,36 @@ describe("HardessClient", () => {
     expect(pingEnvelope?.action).toBe("ping");
   });
 
+  it("includes groupId in the auth envelope when provided", () => {
+    let socket: FakeSocket | undefined;
+
+    const client = new HardessClient("ws://localhost/ws", {
+      transport: {
+        reconnect: { enabled: false },
+        webSocketFactory() {
+          socket = new FakeSocket();
+          return socket;
+        }
+      },
+      timers: {
+        setInterval() {
+          return 1 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval() {}
+      }
+    });
+
+    client.connect("demo:alice", { groupId: "group-chat" });
+    socket?.emit("open");
+
+    const authEnvelope = parseEnvelope(socket?.sent[0] ?? "");
+    expect(authEnvelope?.payload).toEqual({
+      provider: "bearer",
+      payload: "demo:alice",
+      groupId: "group-chat"
+    });
+  });
+
   it("auto-sends handleAck after inbound biz message", async () => {
     let socket: FakeSocket | undefined;
 

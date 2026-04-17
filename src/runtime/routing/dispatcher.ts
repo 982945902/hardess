@@ -8,10 +8,13 @@ export class Dispatcher {
     options: {
       streamId?: string;
       ack?: AckMode;
+      groupId?: string;
     } = {}
   ): Promise<DeliveryPlan> {
     const uniquePeerIds = Array.from(new Set(peerIds));
-    const located = await this.peerLocator.findMany(uniquePeerIds);
+    const located = await this.peerLocator.findMany(uniquePeerIds, {
+      groupId: options.groupId
+    });
     const targets = uniquePeerIds.flatMap((peerId) => located.get(peerId) ?? []);
 
     return {

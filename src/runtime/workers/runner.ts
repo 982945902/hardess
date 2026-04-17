@@ -42,7 +42,8 @@ export async function runWorker(
         pipeline: {
           id: pipeline.id,
           matchPrefix: pipeline.matchPrefix,
-          downstreamOrigin: pipeline.downstream.origin
+          downstreamOrigin: pipeline.downstream.origin,
+          groupId: pipeline.groupId
         },
         traceId
       },

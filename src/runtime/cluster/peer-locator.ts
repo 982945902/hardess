@@ -13,15 +13,16 @@ export class DistributedPeerLocator implements PeerLocator {
     private readonly localPeerLocator: PeerLocator,
     private readonly clusterNetwork?: StaticClusterNetwork,
     private readonly cacheTtlMs = 250,
-    private readonly now = () => Date.now()
+    private readonly now = () => Date.now(),
+    private readonly resolveLocateNodeIds?: (scope?: { groupId?: string }) => string[] | undefined
   ) {}
 
-  async find(peerId: string): Promise<ConnRef[]> {
-    return (await this.findMany([peerId])).get(peerId) ?? [];
+  async find(peerId: string, options?: { groupId?: string }): Promise<ConnRef[]> {
+    return (await this.findMany([peerId], options)).get(peerId) ?? [];
   }
 
-  async findMany(peerIds: string[]): Promise<Map<string, ConnRef[]>> {
-    const result = await this.localPeerLocator.findMany(peerIds);
+  async findMany(peerIds: string[], options?: { groupId?: string }): Promise<Map<string, ConnRef[]>> {
+    const result = await this.localPeerLocator.findMany(peerIds, options);
     if (!this.clusterNetwork?.hasPeers()) {
       return result;
     }
@@ -30,7 +31,7 @@ export class DistributedPeerLocator implements PeerLocator {
     const currentTime = this.now();
 
     for (const peerId of peerIds) {
-      const cached = this.cache.get(peerId);
+      const cached = this.cache.get(this.cacheKey(peerId, options));
       if (cached && cached.expiresAt > currentTime) {
         result.set(peerId, this.mergeConnRefs(result.get(peerId) ?? [], cached.conns));
         continue;
@@ -43,16 +44,20 @@ export class DistributedPeerLocator implements PeerLocator {
       return result;
     }
 
-    const remote = await this.clusterNetwork.locate(cacheMisses);
+    const remote = await this.clusterNetwork.locate(cacheMisses, {
+      groupId: options?.groupId,
+      nodeIds: this.resolveLocateNodeIds?.(options)
+    });
     for (const peerId of cacheMisses) {
       const remoteConns = remote.get(peerId) ?? [];
+      const cacheKey = this.cacheKey(peerId, options);
       if (remoteConns.length > 0) {
-        this.cache.set(peerId, {
+        this.cache.set(cacheKey, {
           expiresAt: currentTime + this.cacheTtlMs,
           conns: remoteConns
         });
       } else {
-        this.cache.delete(peerId);
+        this.cache.delete(cacheKey);
       }
       result.set(peerId, this.mergeConnRefs(result.get(peerId) ?? [], remoteConns));
     }
@@ -62,7 +67,11 @@ export class DistributedPeerLocator implements PeerLocator {
 
   invalidate(peerId?: string): void {
     if (peerId) {
-      this.cache.delete(peerId);
+      for (const key of this.cache.keys()) {
+        if (key.endsWith(`:${peerId}`)) {
+          this.cache.delete(key);
+        }
+      }
       return;
     }
 
@@ -75,5 +84,13 @@ export class DistributedPeerLocator implements PeerLocator {
       merged.set(`${conn.nodeId}:${conn.connId}`, conn);
     }
     return Array.from(merged.values());
+  }
+
+  private cacheKey(peerId: string, options?: { groupId?: string }): string {
+    if (options === undefined) {
+      return `*:${peerId}`;
+    }
+
+    return `${options.groupId ?? "__default__"}:${peerId}`;
   }
 }

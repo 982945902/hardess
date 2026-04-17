@@ -207,7 +207,11 @@ describe("createRuntimeApp", () => {
 
   it("uses admin topology to narrow distributed websocket locate peers", async () => {
     const fetchUrls: string[] = [];
-    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+    const fetchBodies: unknown[] = [];
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.body) {
+        fetchBodies.push(JSON.parse(String(init.body)));
+      }
       fetchUrls.push(
         typeof input === "string"
           ? input
@@ -271,16 +275,30 @@ describe("createRuntimeApp", () => {
       placement: {
         revision: "topology:2:placement",
         generatedAt: 1,
-        deployments: []
+        deployments: [
+          {
+            deploymentId: "deploy-chat",
+            deploymentKind: "service_module",
+            groupId: "group-chat",
+            ownerHostIds: ["host-c"],
+            routes: []
+          }
+        ]
       }
     });
 
-    await app.peerLocator.find("alice");
+    await app.peerLocator.find("alice", { groupId: "group-chat" });
 
     expect(app.clusterNetwork.listPeers()).toEqual([
       { nodeId: "node-c", baseUrl: "http://node-c.internal" }
     ]);
     expect(fetchUrls).toEqual(["http://node-c.internal/__cluster/locate"]);
+    expect(fetchBodies).toEqual([
+      {
+        peerIds: ["alice"],
+        groupId: "group-chat"
+      }
+    ]);
   });
 
   it("returns 426 when websocket upgrade fails", async () => {

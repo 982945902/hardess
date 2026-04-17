@@ -19,7 +19,7 @@ import { formatZodError } from "./schema.ts";
 const stringRecordSchema = z.record(z.string(), z.string());
 const unknownRecordSchema = z.record(z.string(), z.unknown());
 const numberRecordSchema = z.record(z.string(), z.number().finite());
-const deploymentKindSchema = z.enum(["http_worker", "service_module"]);
+const deploymentKindSchema = z.enum(["http_worker", "service_module", "serve"]);
 const assignmentObservedStateSchema = z.enum([
   "pending",
   "preparing",
@@ -68,6 +68,7 @@ const membershipHostStateSchema = z.enum(["ready", "draining", "offline"]);
 export const deploymentSchema = z.object({
   deploymentId: z.string().min(1, "deploymentId is required"),
   deploymentKind: deploymentKindSchema,
+  groupId: z.string().min(1).optional(),
   name: z.string().min(1, "name is required"),
   declaredVersion: z.string().min(1, "declaredVersion is required"),
   declaredArtifactId: z.string().min(1).optional(),
@@ -102,16 +103,24 @@ const serviceModuleAssignmentSchema = z.object({
   entry: z.string().min(1, "serviceModule.entry is required")
 });
 
+const serveAppAssignmentSchema = z.object({
+  name: z.string().min(1, "serveApp.name is required"),
+  entry: z.string().min(1, "serveApp.entry is required"),
+  routeRefs: z.array(z.string().min(1)).optional()
+});
+
 export const assignmentSchema = z.object({
   assignmentId: z.string().min(1, "assignmentId is required"),
   hostId: z.string().min(1, "hostId is required"),
   deploymentId: z.string().min(1, "deploymentId is required"),
   deploymentKind: deploymentKindSchema,
+  groupId: z.string().min(1).optional(),
   declaredVersion: z.string().min(1, "declaredVersion is required"),
   declaredArtifactId: z.string().min(1).optional(),
   artifact: artifactRefSchema,
   httpWorker: httpWorkerAssignmentSchema.optional(),
   serviceModule: serviceModuleAssignmentSchema.optional(),
+  serveApp: serveAppAssignmentSchema.optional(),
   authPolicyRef: z.string().min(1).optional(),
   secretRefs: z.array(z.string().min(1)).optional()
 }).superRefine((value, ctx) => {
@@ -130,6 +139,13 @@ export const assignmentSchema = z.object({
         path: ["serviceModule"]
       });
     }
+    if (value.serveApp) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "serveApp must be absent when deploymentKind is http_worker",
+        path: ["serveApp"]
+      });
+    }
   }
 
   if (value.deploymentKind === "service_module") {
@@ -145,6 +161,37 @@ export const assignmentSchema = z.object({
         code: z.ZodIssueCode.custom,
         message: "httpWorker must be absent when deploymentKind is service_module",
         path: ["httpWorker"]
+      });
+    }
+    if (value.serveApp) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "serveApp must be absent when deploymentKind is service_module",
+        path: ["serveApp"]
+      });
+    }
+  }
+
+  if (value.deploymentKind === "serve") {
+    if (!value.serveApp) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "serveApp is required when deploymentKind is serve",
+        path: ["serveApp"]
+      });
+    }
+    if (value.httpWorker) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "httpWorker must be absent when deploymentKind is serve",
+        path: ["httpWorker"]
+      });
+    }
+    if (value.serviceModule) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "serviceModule must be absent when deploymentKind is serve",
+        path: ["serviceModule"]
       });
     }
   }
@@ -173,6 +220,7 @@ const membershipSnapshotSchema = z.object({
 const placementDeploymentSchema = z.object({
   deploymentId: z.string().min(1, "deploymentId is required"),
   deploymentKind: deploymentKindSchema,
+  groupId: z.string().min(1).optional(),
   ownerHostIds: z.array(z.string().min(1)),
   routes: z.array(
     z.object({

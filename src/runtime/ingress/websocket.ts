@@ -401,13 +401,15 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     const senderRef: ConnRef = {
       nodeId: deps.nodeId,
       connId: sender.socket.data.connId,
-      peerId: sender.auth?.peerId ?? envelope.src.peerId
+      peerId: sender.auth?.peerId ?? envelope.src.peerId,
+      groupId: sender.auth?.groupId
     };
 
     async function attemptDelivery(targetPeerIds: string[]): Promise<ConnRef[]> {
       const plan = await deps.dispatcher.buildPlan(targetPeerIds, {
         streamId: envelope.streamId,
-        ack
+        ack,
+        groupId: sender.auth?.groupId
       });
 
       if (plan.targets.length === 0) {
@@ -559,7 +561,8 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
           throw createDrainingError(envelope.msgId);
         }
 
-        const auth = await deps.authService.validateSystemAuth(parseSysAuthPayload(envelope.payload));
+        const authPayload = parseSysAuthPayload(envelope.payload);
+        const auth = await deps.authService.validateSystemAuth(authPayload);
 
         const currentConnRef = deps.peerLocator.getByConnId(connection.socket.data.connId);
         const existingPeerCount = deps.peerLocator.countConnectionsForPeer(auth.peerId);
@@ -575,11 +578,15 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
           );
         }
 
-        connection.auth = auth;
+        connection.auth = {
+          ...auth,
+          groupId: authPayload.groupId
+        };
         deps.peerLocator.register({
           nodeId: deps.nodeId,
           connId: connection.socket.data.connId,
-          peerId: auth.peerId
+          peerId: auth.peerId,
+          groupId: authPayload.groupId
         });
         enqueueOutbound(
           connection,
