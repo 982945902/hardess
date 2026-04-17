@@ -8,6 +8,7 @@ import {
 } from "./cluster/schema.ts";
 import { RuntimeAuthService } from "./auth/service.ts";
 import { ModuleConfigStore } from "./config/store.ts";
+import { RuntimeTopologyStore } from "./control/topology-store.ts";
 import { handleHttpRequest } from "./ingress/http.ts";
 import { createWebSocketHandlers } from "./ingress/websocket.ts";
 import { ConsoleLogger, type Logger } from "./observability/logger.ts";
@@ -59,6 +60,12 @@ export interface RuntimeAppOptions {
     shutdownGraceMs?: number;
   };
   listeners?: {
+    business?: {
+      allowedPathPrefixes?: string[];
+    };
+    control?: {
+      allowedPathPrefixes?: string[];
+    };
     public?: {
       allowedPathPrefixes?: string[];
     };
@@ -81,7 +88,12 @@ export interface UpgradeServerRef {
   ): boolean;
 }
 
-export type RuntimeListenerName = "default" | "public" | "internal";
+export type RuntimeListenerName =
+  | "default"
+  | "business"
+  | "control"
+  | "public"
+  | "internal";
 
 interface RuntimeRequestContext {
   listener?: RuntimeListenerName;
@@ -95,6 +107,30 @@ function sleep(ms: number): Promise<void> {
 
 function isMetricsSnapshotProvider(metrics: Metrics): metrics is MetricsSnapshotProvider {
   return typeof (metrics as { snapshot?: unknown }).snapshot === "function";
+}
+
+function normalizeListenerName(listener: RuntimeListenerName): RuntimeListenerName {
+  if (listener === "public") {
+    return "business";
+  }
+  if (listener === "internal") {
+    return "control";
+  }
+  return listener;
+}
+
+function resolveListenerAllowedPathPrefixes(
+  options: RuntimeAppOptions,
+  listener: RuntimeListenerName
+): string[] | undefined {
+  const normalized = normalizeListenerName(listener);
+  if (normalized === "business") {
+    return options.listeners?.business?.allowedPathPrefixes ?? options.listeners?.public?.allowedPathPrefixes;
+  }
+  if (normalized === "control") {
+    return options.listeners?.control?.allowedPathPrefixes ?? options.listeners?.internal?.allowedPathPrefixes;
+  }
+  return undefined;
 }
 
 export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
@@ -121,6 +157,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     options.cluster?.locatorCacheTtlMs
   );
   const dispatcher = new Dispatcher(peerLocator);
+  const topologyStore = new RuntimeTopologyStore();
   const registry = new ServerProtocolRegistry();
   const configStore = new ModuleConfigStore(
     options.configModulePath ?? "./config/hardess.config.ts",
@@ -144,6 +181,16 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     );
     invalidateWorkers(Array.from(new Set([...workerEntries, ...nextWorkerEntries])));
     workerEntries = nextWorkerEntries;
+  });
+  const unsubscribeTopology = topologyStore.subscribe((topology) => {
+    const dynamicPeers = topologyStore.listClusterPeers(nodeId);
+    clusterNetwork.setPeers(dynamicPeers);
+    logger.info("cluster topology peers updated", {
+      nodeId,
+      peers: dynamicPeers.map((peer) => peer.nodeId),
+      membershipRevision: topology?.membership.revision,
+      placementRevision: topology?.placement.revision
+    });
   });
   configStore.watch();
   const startedAt = Date.now();
@@ -252,19 +299,17 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   }
 
   function isPathAllowedOnListener(pathname: string, listener: RuntimeListenerName): boolean {
-    if (listener === "default") {
+    const normalizedListener = normalizeListenerName(listener);
+    if (normalizedListener === "default") {
       return true;
     }
 
     const isInternalOnlyPath = INTERNAL_ONLY_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
     if (isInternalOnlyPath) {
-      return listener === "internal";
+      return normalizedListener === "control";
     }
 
-    const allowedPathPrefixes =
-      listener === "public"
-        ? options.listeners?.public?.allowedPathPrefixes
-        : options.listeners?.internal?.allowedPathPrefixes;
+    const allowedPathPrefixes = resolveListenerAllowedPathPrefixes(options, normalizedListener);
 
     if (allowedPathPrefixes === undefined) {
       return true;
@@ -283,6 +328,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     dispatcher,
     registry,
     configStore,
+    topologyStore,
     websocket: runtimeWebsocket,
     runtimeState,
     beginShutdown() {
@@ -320,6 +366,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       shuttingDown = true;
       disposed = true;
       unsubscribeConfig();
+      unsubscribeTopology();
       configStore.dispose();
       websocket.dispose();
       upstreamWebSocketProxy.dispose();
@@ -457,6 +504,104 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
         return new Response("Cluster websocket upgrade failed", { status: 426 });
       }
 
+      if (url.pathname === "/__cluster/ws-forward") {
+        try {
+          if (
+            options.cluster?.sharedSecret &&
+            request.headers.get("x-hardess-cluster-secret") !== options.cluster.sharedSecret
+          ) {
+            return json({ ok: false, error: "Unauthorized cluster request" }, { status: 401 });
+          }
+
+          const forwardedPath = request.headers.get("x-hardess-forward-path");
+          if (!forwardedPath || !forwardedPath.startsWith("/")) {
+            return json({ ok: false, error: "Missing x-hardess-forward-path" }, { status: 400 });
+          }
+
+          const forwardedHeaders = new Headers(request.headers);
+          forwardedHeaders.delete("x-hardess-cluster-secret");
+          forwardedHeaders.delete("x-hardess-forward-path");
+          forwardedHeaders.set("connection", "Upgrade");
+          forwardedHeaders.set("upgrade", "websocket");
+          const forwardedRequest = new Request(`http://internal.forward${forwardedPath}`, {
+            method: request.method,
+            headers: forwardedHeaders,
+            redirect: "manual"
+          });
+
+          return await handleHttpRequest(forwardedRequest, {
+            configStore,
+            authService,
+            logger,
+            metrics,
+            nodeId,
+            clusterSharedSecret: options.cluster?.sharedSecret,
+            topologyStore,
+            serverRef,
+            upstreamWebSocketProxy
+          });
+        } catch (error) {
+          return json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error)
+            },
+            { status: 400 }
+          );
+        }
+      }
+
+      if (url.pathname === "/__cluster/http-forward") {
+        try {
+          if (
+            options.cluster?.sharedSecret &&
+            request.headers.get("x-hardess-cluster-secret") !== options.cluster.sharedSecret
+          ) {
+            return json({ ok: false, error: "Unauthorized cluster request" }, { status: 401 });
+          }
+
+          const forwardedPath = request.headers.get("x-hardess-forward-path");
+          if (!forwardedPath || !forwardedPath.startsWith("/")) {
+            return json({ ok: false, error: "Missing x-hardess-forward-path" }, { status: 400 });
+          }
+
+          const forwardedHeaders = new Headers(request.headers);
+          forwardedHeaders.delete("x-hardess-cluster-secret");
+          forwardedHeaders.delete("x-hardess-forward-path");
+          const forwardedRequest = new Request(`http://internal.forward${forwardedPath}`, {
+            method: request.method,
+            headers: forwardedHeaders,
+            body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+            redirect: "manual"
+          });
+
+          inFlightHttpRequests += 1;
+          try {
+            return await handleHttpRequest(forwardedRequest, {
+              configStore,
+              authService,
+              logger,
+              metrics,
+              nodeId,
+              clusterSharedSecret: options.cluster?.sharedSecret,
+              topologyStore,
+              serverRef,
+              upstreamWebSocketProxy
+            });
+          } finally {
+            inFlightHttpRequests -= 1;
+          }
+        } catch (error) {
+          return json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error)
+            },
+            { status: 400 }
+          );
+        }
+      }
+
       if (url.pathname === "/__cluster/deliver" && request.method === "POST") {
         try {
           if (options.cluster?.sharedSecret && request.headers.get("x-hardess-cluster-secret") !== options.cluster.sharedSecret) {
@@ -536,6 +681,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           authService,
           logger,
           metrics,
+          nodeId,
+          clusterSharedSecret: options.cluster?.sharedSecret,
+          topologyStore,
           serverRef,
           upstreamWebSocketProxy
         });

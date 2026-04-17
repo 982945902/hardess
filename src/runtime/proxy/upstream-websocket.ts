@@ -193,6 +193,40 @@ function sanitizeHeadersForUpstreamWebSocket(
   };
 }
 
+function sanitizeHeadersForForwardedWebSocket(
+  request: Request,
+  extraHeaders: Record<string, string> = {}
+): {
+  headers: Record<string, string>;
+  protocols?: string | string[];
+} {
+  const headers = new Headers(request.headers);
+  for (const header of HOP_BY_HOP_HEADERS) {
+    headers.delete(header);
+  }
+  for (const header of UPSTREAM_HANDSHAKE_HEADERS) {
+    headers.delete(header);
+  }
+
+  const offeredProtocols = headers.get("sec-websocket-protocol");
+  headers.delete("sec-websocket-protocol");
+
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    headers.set(key, value);
+  }
+
+  const sanitizedHeaders = Object.fromEntries(headers.entries());
+  const protocols = offeredProtocols
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+
+  return {
+    headers: sanitizedHeaders,
+    protocols: protocols && protocols.length > 0 ? protocols : undefined
+  };
+}
+
 function isValidCloseCode(code: number | undefined): code is number {
   return code !== undefined && code >= 1000 && code <= 4999 && code !== 1004 && code !== 1005 && code !== 1006 && code !== 1015;
 }
@@ -225,41 +259,40 @@ export class UpstreamWebSocketProxyRuntime {
     traceId: string | undefined,
     serverRef: UpgradeServerRef
   ): Promise<Response | undefined> {
-    const bridgeId = crypto.randomUUID();
     const upstreamUrl = toUpstreamWebSocketUrl(request, pipeline);
     const { headers, protocols } = sanitizeHeadersForUpstreamWebSocket(request, pipeline, auth, traceId);
-    const upstreamSocket = this.socketFactory(upstreamUrl, { headers, protocols });
-    upstreamSocket.binaryType = "uint8array";
+    return await this.upgradeToTarget(
+      request,
+      {
+        url: upstreamUrl,
+        headers,
+        protocols,
+        connectTimeoutMs: pipeline.downstream.connectTimeoutMs
+      },
+      serverRef
+    );
+  }
 
-    const bridge: UpstreamWebSocketBridge = {
-      id: bridgeId,
-      upstreamSocket,
-      pendingClientMessages: [],
-      pendingUpstreamMessages: [],
-      closed: false
-    };
-    this.bridges.set(bridgeId, bridge);
-    this.attachUpstreamListeners(bridge);
-
-    try {
-      await this.waitForUpstreamOpen(bridge, pipeline.downstream.connectTimeoutMs);
-    } catch (error) {
-      this.bridges.delete(bridgeId);
-      try {
-        upstreamSocket.close(1011, "upstream connect failed");
-      } catch {}
-      throw error;
-    }
-
+  async upgradeToTarget(
+    request: Request,
+    target: {
+      url: string;
+      headers?: Record<string, string>;
+      protocols?: string | string[];
+      connectTimeoutMs: number;
+    },
+    serverRef: UpgradeServerRef
+  ): Promise<Response | undefined> {
+    const bridge = await this.openBridge(target);
     const upgraded = serverRef.upgrade(request, {
-      headers: upstreamSocket.protocol
+      headers: bridge.upstreamSocket.protocol
         ? {
-            "sec-websocket-protocol": upstreamSocket.protocol
+            "sec-websocket-protocol": bridge.upstreamSocket.protocol
           }
         : undefined,
       data: {
         kind: "upstream_proxy",
-        bridgeId
+        bridgeId: bridge.id
       }
     });
 
@@ -270,6 +303,31 @@ export class UpstreamWebSocketProxyRuntime {
 
     this.closeBridge(bridge, 1011, "client websocket upgrade failed");
     return new Response("WebSocket upgrade failed", { status: 426 });
+  }
+
+  buildForwardTarget(
+    request: Request,
+    targetUrl: string,
+    options: {
+      connectTimeoutMs: number;
+      extraHeaders?: Record<string, string>;
+    }
+  ): {
+    url: string;
+    headers?: Record<string, string>;
+    protocols?: string | string[];
+    connectTimeoutMs: number;
+  } {
+    const { headers, protocols } = sanitizeHeadersForForwardedWebSocket(
+      request,
+      options.extraHeaders
+    );
+    return {
+      url: targetUrl,
+      headers,
+      protocols,
+      connectTimeoutMs: options.connectTimeoutMs
+    };
   }
 
   openClientSocket(socket: UpstreamProxyServerSocket): void {
@@ -429,6 +487,41 @@ export class UpstreamWebSocketProxyRuntime {
       } catch {}
     }
     this.bridges.delete(bridge.id);
+  }
+
+  private async openBridge(target: {
+    url: string;
+    headers?: Record<string, string>;
+    protocols?: string | string[];
+    connectTimeoutMs: number;
+  }): Promise<UpstreamWebSocketBridge> {
+    const bridgeId = crypto.randomUUID();
+    const upstreamSocket = this.socketFactory(target.url, {
+      headers: target.headers,
+      protocols: target.protocols
+    });
+    upstreamSocket.binaryType = "uint8array";
+
+    const bridge: UpstreamWebSocketBridge = {
+      id: bridgeId,
+      upstreamSocket,
+      pendingClientMessages: [],
+      pendingUpstreamMessages: [],
+      closed: false
+    };
+    this.bridges.set(bridgeId, bridge);
+    this.attachUpstreamListeners(bridge);
+
+    try {
+      await this.waitForUpstreamOpen(bridge, target.connectTimeoutMs);
+      return bridge;
+    } catch (error) {
+      this.bridges.delete(bridgeId);
+      try {
+        upstreamSocket.close(1011, "upstream connect failed");
+      } catch {}
+      throw error;
+    }
   }
 }
 

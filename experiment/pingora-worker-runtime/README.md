@@ -13,6 +13,8 @@ Current fixed direction:
 - one worker entry contract: `fetch(request, env, ctx)`
 - one TS request model: minimal Web `Request` / `Response`
 - no `v1` compatibility layer in this experiment
+- runtime nodes should be business-empty at bootstrap and converge from admin-declared desired state
+- control plane owns versions; runtime owns generations
 
 Related docs:
 
@@ -312,10 +314,16 @@ the worker project files. They are not yet control-plane-issued version ids, but
 they are stable enough to answer "which local artifact did this generation load?"
 
 The `declared_*` fields are different: they are optional control-plane-facing
-markers copied from the desired-worker payload, so status APIs can show both:
+markers copied from the desired input payload, so status APIs can show both:
 
 - what the node actually loaded locally
 - what artifact / version the control plane said it should be loading
+
+That boundary is intentional:
+
+- local artifact ids are runtime source metadata
+- declared versions are admin-owned rollout metadata
+- runtime generations are not global release versions
 
 Reload the configured worker entry as a new generation:
 
@@ -424,7 +432,7 @@ thread pool:
 - generation snapshots pin the project metadata that was actually loaded for that generation
 - the module-cache endpoint still inspects the current on-node worker project state
 
-The minimal desired-worker payload shape is now:
+The minimal debug desired-worker payload shape is now:
 
 - `worker_entry`: local worker entry path on the node
 - `declared_artifact_id`: optional control-plane artifact marker
@@ -432,6 +440,9 @@ The minimal desired-worker payload shape is now:
 
 In this experiment the runtime still prepares from a local `worker_entry`, but the
 apply path no longer depends on the old `reload current config` assumption.
+
+Longer term, this should expand into a full admin-declared `DesiredRuntimeState`
+rather than a worker-only payload.
 
 This is still an experiment-level execution model, but it is materially closer
 to the target architecture than creating a fresh runtime per request.

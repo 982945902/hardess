@@ -229,8 +229,8 @@ CLUSTER_RELEASE_GATE_SLO_PROFILE=local bun run release:gate:cluster
 
 This script assumes a two-node static cluster and measures the current cross-node path:
 
-- peer locate still goes over internal HTTP
-- remote `deliver` and `handleAck` go over the internal WebSocket cluster channel by default
+- peer locate still goes over control HTTP
+- remote `deliver` and `handleAck` go over the control WebSocket cluster channel by default
 
 ```bash
 CLUSTER_WS_LOAD_SENDER_WS_URL=ws://127.0.0.1:3000/ws \
@@ -245,7 +245,7 @@ The script prints JSON including:
 - `recvAck` latency summary
 - unique `recvAckCount` plus `duplicateRecvAckCount` for diagnostics when the sender sees repeated ack events
 - `handleAck` latency summary
-- `routeCacheRetryCount`, `clusterHttpFallbackCount`, `clusterEgressOverflowCount`, and `clusterEgressBackpressureCount` so you can tell whether the run stayed mostly on the internal WS channel or degraded onto internal HTTP fallback
+- `routeCacheRetryCount`, `clusterHttpFallbackCount`, `clusterEgressOverflowCount`, and `clusterEgressBackpressureCount` so you can tell whether the run stayed mostly on the control WS channel or degraded onto control HTTP fallback
 - sender and receiver metrics deltas
 - close-code distribution
 - `sys.err` distribution

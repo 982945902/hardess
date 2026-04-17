@@ -14,6 +14,7 @@ Run the local demo stack:
 
 ```bash
 bun run demo:upstream
+bun run demo:admin
 PORT=3000 bun run dev
 bun run demo:http
 PEER_ID=bob bun run demo:client
@@ -128,10 +129,14 @@ SDK behavior notes:
 ## Docs
 
 - [Local demo walkthrough](docs/local-demo.md)
+- [v1 Admin mock demo](docs/v1-admin-mock-demo.md)
 - [Load testing and weak-network simulation](docs/load-testing.md)
 - [Current local release baseline](docs/local-release-baseline.md)
 - [Operator guide](docs/operator-guide.md)
+- [v1 Admin / control-plane design](docs/hardess-v1-admin-control-plane.md)
+- [v1 Host protocol design](docs/hardess-v1-host-protocol.md)
 - [Dual-port cluster and Swarm design](docs/swarm-dual-port-cluster-design.md)
+- [Swarm v1 cluster deployment design](docs/swarm-v1-cluster-deployment.md)
 - [Grafana dashboard template](docs/grafana-hardess-overview.dashboard.json)
 - [Architecture design and current status](docs/hardess-architecture.md)
 - [Pingora / workerd as Hardess v2 research](docs/research-pingora-for-hardess-v2.md)

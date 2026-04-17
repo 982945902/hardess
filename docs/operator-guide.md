@@ -17,8 +17,10 @@ bun run clean
 HTTP / process:
 
 - `PORT`: legacy single-listener port, default `3000`
-- `PUBLIC_PORT`: public listener port; if unset, falls back to `PORT`
-- `INTERNAL_PORT`: optional internal listener port for `__admin/*` and `__cluster/*`; if unset, the runtime stays single-listener
+- `BUSINESS_PORT`: business listener port; if unset, falls back to `PUBLIC_PORT`, then `PORT`
+- `CONTROL_PORT`: optional control listener port for `__admin/*`, `__cluster/*`, and node-to-node forward entrypoints; if unset, the runtime stays single-listener
+- `PUBLIC_PORT`: legacy alias for `BUSINESS_PORT`
+- `INTERNAL_PORT`: legacy alias for `CONTROL_PORT`
 - `CONFIG_MODULE_PATH`: config module path, default `./config/hardess.config.ts`
 - `SHUTDOWN_DRAIN_MS`: time to stay not-ready before stopping the server, default `250`
 - `SHUTDOWN_TIMEOUT_MS`: hard stop timeout, default `10000`
@@ -26,17 +28,24 @@ HTTP / process:
 
 Optional listener path policy:
 
-- `PUBLIC_ALLOWED_PATH_PREFIXES`: comma-separated public-listener path prefixes
-- `INTERNAL_ALLOWED_PATH_PREFIXES`: comma-separated internal-listener path prefixes
+- `BUSINESS_ALLOWED_PATH_PREFIXES`: comma-separated business-listener path prefixes
+- `CONTROL_ALLOWED_PATH_PREFIXES`: comma-separated control-listener path prefixes
+- `PUBLIC_ALLOWED_PATH_PREFIXES`: legacy alias for `BUSINESS_ALLOWED_PATH_PREFIXES`
+- `INTERNAL_ALLOWED_PATH_PREFIXES`: legacy alias for `CONTROL_ALLOWED_PATH_PREFIXES`
 
 Listener policy semantics:
 
 - if a listener path policy env is unset, that listener stays unrestricted
 - if set, only matching path prefixes are exposed on that listener
-- `__admin/*` and `__cluster/*` are reserved internal-only routes and are never exposed on the public listener, regardless of listener path policy
+- `__admin/*` and `__cluster/*` are reserved control-only routes and are never exposed on the business listener, regardless of listener path policy
 - the recommended dual-port shape is:
-  - public listener: business HTTP paths plus `/ws`
-  - internal listener: `/__admin` plus `/__cluster`
+  - business listener: business HTTP paths plus `/ws`
+  - control listener: `/__admin` plus `/__cluster`
+
+Naming note:
+
+- `business/control` is the runtime semantic split
+- whether those listeners are actually public or private is a deployment concern handled by Swarm / LB / network policy
 
 HTTP proxy timeout semantics:
 - `connectTimeoutMs`: budget until Hardess gets the upstream response
@@ -80,11 +89,41 @@ Cluster / multi-node:
 - `NODE_ID`: current runtime node id, default `local`
 - `CLUSTER_PEERS_JSON`: static peer list JSON, for example `[{"nodeId":"node-b","baseUrl":"http://127.0.0.1:3101"}]`
 - `CLUSTER_TRANSPORT`: `ws` or `http`, default `ws` in the runtime server entrypoint
-- `CLUSTER_SHARED_SECRET`: optional shared secret for internal cluster locate requests and WS channel handshake
+- `CLUSTER_SHARED_SECRET`: optional shared secret for control-plane cluster locate requests and WS channel handshake
 - `CLUSTER_REQUEST_TIMEOUT_MS`: timeout for cluster locate and cross-node request/response operations, default `10000`
 - `CLUSTER_OUTBOUND_MAX_QUEUE_MESSAGES`: per-node internal WS channel outbound queue cap, default `16384`
-- `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS`: retry delay after internal cluster WS backpressure, default `10`
+- `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS`: retry delay after control-plane cluster WS backpressure, default `10`
 - `CLUSTER_LOCATOR_CACHE_TTL_MS`: remote peer-location cache TTL on each node
+
+Admin / host-agent control plane:
+
+- `ADMIN_BASE_URL`: when set, enable the optional host-agent reconcile loop against the admin service
+- `ADMIN_BEARER_TOKEN`: optional bearer token for admin HTTP requests
+- `ADMIN_HOST_ID`: admin-facing host id; defaults to `NODE_ID`, then `local`
+- `HARDESS_RUNTIME_VERSION`: runtime version string reported during host registration, default `v1`
+- `ADMIN_BUSINESS_BASE_URL`: optional business base URL advertised in host registration; falls back to `ADMIN_PUBLIC_BASE_URL`
+- `ADMIN_CONTROL_BASE_URL`: optional control base URL advertised in host registration; falls back to `ADMIN_INTERNAL_BASE_URL`
+- `ADMIN_PUBLIC_BASE_URL`: legacy alias for `ADMIN_BUSINESS_BASE_URL`
+- `ADMIN_INTERNAL_BASE_URL`: legacy alias for `ADMIN_CONTROL_BASE_URL`
+- `ADMIN_STATIC_LABELS_JSON`: optional JSON object of static host labels
+- `ADMIN_STATIC_CAPABILITIES`: optional comma-separated static host capabilities; defaults to `http_worker,service_module`
+- `ADMIN_STATIC_CAPACITY_JSON`: optional JSON object of static host capacity such as `maxHttpWorkerAssignments`
+- `ADMIN_REGISTRATION_DYNAMIC_FIELDS_JSON`: optional JSON object attached to host registration dynamic fields
+- `ADMIN_OBSERVED_DYNAMIC_FIELDS_JSON`: optional JSON object attached to observed host-state dynamic fields
+- `ADMIN_POLL_AFTER_MS`: optional default host-agent poll interval override
+- `ADMIN_RETRY_POLL_AFTER_MS`: optional retry poll interval after reconcile failure
+- `ADMIN_ARTIFACT_ROOT_DIR`: optional local cache root for admin-delivered artifacts; default `.hardess-admin-artifacts`
+- `SERVICE_MODULE_DRAIN_GRACE_MS`: optional local grace drain window for removed `service_module` assignments; default `3000`
+
+Current implementation note:
+
+- the optional host-agent loop is now wired into runtime startup when `ADMIN_BASE_URL` is set
+- the admin SDK, HTTP transport, mock transport, shared protocol types, and runtime-side reconcile loop all exist
+- `http_worker` assignments now compile into live `HardessConfig` pipelines and are applied through the runtime config store
+- for `http_worker`, the current artifact path treats `ArtifactManifest.source.uri` as the worker source file and stages it under `ADMIN_ARTIFACT_ROOT_DIR`
+- `service_module` assignments now stage their module source under `ADMIN_ARTIFACT_ROOT_DIR`, load the staged entry, validate the explicit `{ protocol, version, actions }` export shape, and register or replace those actions in the runtime WebSocket protocol registry
+- when `packageManager.denoJson` / `packageManager.denoLock` are present, runtime also stages those project files into the same local artifact directory using the worker source location as the resolution base
+- remote artifact cache reuse is only considered stable when the main worker source carries a `digest`; without that, runtime will restage remote sources instead of trusting cached metadata
 
 ## Verification Env Vars
 
@@ -110,12 +149,13 @@ Single-node release gate:
 Cluster release gate:
 
 - `CLUSTER_RELEASE_GATE_*`: cluster gate profile, ports, shared-secret wiring, sizing, readiness timing, metrics mode, an optional layered `CLUSTER_RELEASE_GATE_SLO_PROFILE`, and optional cluster SLO thresholds
-- `CLUSTER_RELEASE_GATE_LISTENER_MODE`: `single` or `dual`; `dual` runs client WS on public ports and admin/cluster traffic on internal ports
-- `CLUSTER_RELEASE_GATE_INTERNAL_PORT_A` / `CLUSTER_RELEASE_GATE_INTERNAL_PORT_B`: optional explicit internal ports when the cluster release gate runs in `dual` mode
+- `CLUSTER_RELEASE_GATE_LISTENER_MODE`: `single` or `dual`; `dual` runs client WS on business ports and admin/cluster traffic on control ports
+- `CLUSTER_RELEASE_GATE_CONTROL_PORT_A` / `CLUSTER_RELEASE_GATE_CONTROL_PORT_B`: optional explicit control ports when the cluster release gate runs in `dual` mode
+- `CLUSTER_RELEASE_GATE_INTERNAL_PORT_A` / `CLUSTER_RELEASE_GATE_INTERNAL_PORT_B`: legacy aliases for the control-port envs above
 
 Cluster benchmark:
 
-- `BENCH_CLUSTER_LISTENER_MODE`: `single` or `dual`; `dual` benchmarks the split-path shape where client WS uses public ingress and node-to-node/admin traffic uses internal listeners
+- `BENCH_CLUSTER_LISTENER_MODE`: `single` or `dual`; `dual` benchmarks the split-path shape where client WS uses business ingress and node-to-node/admin traffic uses control listeners
 
 Detailed per-variable examples and the full verification env reference live in [load-testing.md](load-testing.md).
 
@@ -162,11 +202,11 @@ The current multi-node baseline is static-peer based:
 
 - each node keeps local websocket connections in-memory
 - `PeerLocator` expands recipients from local memory plus cached remote lookups
-- peer locate uses internal HTTP `POST /__cluster/locate`
-- remote `deliver` and `handleAck` use a long-lived internal websocket channel at `GET /__cluster/ws`
+- peer locate uses control HTTP `POST /__cluster/locate`
+- remote `deliver` and `handleAck` use a long-lived control websocket channel at `GET /__cluster/ws`
 - `CLUSTER_TRANSPORT=http` keeps the older pure-HTTP transport available as a fallback path
-- when `CLUSTER_TRANSPORT=ws`, per-request fallback to the internal HTTP endpoints is now used if the cluster WS channel is temporarily unavailable or its outbound queue overflows
-- in dual-port deployments, cluster peer `baseUrl` entries should point to the internal listener, not the public listener
+- when `CLUSTER_TRANSPORT=ws`, per-request fallback to the control HTTP endpoints is now used if the cluster WS channel is temporarily unavailable or its outbound queue overflows
+- in dual-port deployments, cluster peer `baseUrl` entries should point to the control listener, not the business listener
 
 Current boundary:
 

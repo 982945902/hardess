@@ -107,6 +107,23 @@ const fanoutServerModule: ServerProtocolModule<{
   }
 };
 
+const terminalServerModule: ServerProtocolModule<{
+  content: string;
+}> = {
+  protocol: "terminal",
+  version: "1.0",
+  actions: {
+    send: {
+      validate() {},
+      handleLocally() {
+        return {
+          ack: "handle"
+        };
+      }
+    }
+  }
+};
+
 describe("createWebSocketHandlers", () => {
   it("authenticates sockets and dispatches business messages", async () => {
     const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
@@ -222,6 +239,64 @@ describe("createWebSocketHandlers", () => {
     expect(aliceHandleAck?.action).toBe("handleAck");
     expect((aliceHandleAck?.payload as { ackFor?: string } | undefined)?.ackFor).toBe("m-biz-1");
     handlers.dispose();
+  });
+
+  it("supports service-module actions that terminate locally without forwarding", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(terminalServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-terminal-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "terminal",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          content: "only-local"
+        }
+      })
+    );
+
+    const actions = alice.sent
+      .map((raw) => parseEnvelope(raw)?.action)
+      .filter((value): value is string => value !== undefined);
+    expect(actions.slice(-2)).toEqual(["recvAck", "handleAck"]);
   });
 
   it("sends heartbeat ping and closes stale connections", async () => {

@@ -1,8 +1,15 @@
 import { createRuntimeApp, type RuntimeListenerName } from "./app.ts";
 import { parseClusterPeersEnv, parseClusterTransportEnv } from "./cluster/schema.ts";
+import { HostAgent } from "./control/host-agent.ts";
+import { ArtifactStore } from "./control/artifact-store.ts";
+import { RuntimeHostAdapter } from "./control/runtime-host-adapter.ts";
+import { ServiceModuleManager } from "./control/service-module-manager.ts";
 import { MetricsAlertMonitor, type MetricsAlertThresholds } from "./observability/alerts.ts";
 import { ConsoleLogger } from "./observability/logger.ts";
 import { InMemoryMetrics, WindowedMetrics, type MetricsSnapshotProvider } from "./observability/metrics.ts";
+import { HardessAdminClient } from "../sdk/admin/client.ts";
+import { HttpAdminTransport } from "../sdk/admin/http.ts";
+import type { HostStaticCapacity } from "../shared/index.ts";
 
 declare const Bun: {
   serve(options: {
@@ -50,6 +57,19 @@ function envString(name: string): string | undefined {
   return processEnv[name];
 }
 
+function envStringList(name: string): string[] | undefined {
+  const value = envString(name);
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const items = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return items.length > 0 ? items : [];
+}
+
 function envPathPrefixes(name: string): string[] | undefined {
   const value = envString(name);
   if (value === undefined) {
@@ -68,6 +88,71 @@ function parseClusterPeers() {
 
 function parseClusterTransport() {
   return parseClusterTransportEnv(envString("CLUSTER_TRANSPORT"));
+}
+
+function envJsonObject(name: string): Record<string, unknown> | undefined {
+  const value = envString(name);
+  if (!value) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(
+      `Invalid ${name}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid ${name}: expected a JSON object`);
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+function envStringRecord(name: string): Record<string, string> | undefined {
+  const parsed = envJsonObject(name);
+  if (!parsed) {
+    return undefined;
+  }
+
+  const entries = Object.entries(parsed);
+  for (const [key, value] of entries) {
+    if (typeof value !== "string") {
+      throw new Error(`Invalid ${name}: expected string value for key ${key}`);
+    }
+  }
+
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function envStaticCapacity(name: string): HostStaticCapacity | undefined {
+  const parsed = envJsonObject(name);
+  if (!parsed) {
+    return undefined;
+  }
+
+  const capacity: HostStaticCapacity = {};
+  const knownKeys = [
+    "maxHttpWorkerAssignments",
+    "maxServiceModuleAssignments",
+    "maxConnections",
+    "maxInflightRequests"
+  ] as const;
+  for (const key of knownKeys) {
+    const value = parsed[key];
+    if (value === undefined) {
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error(`Invalid ${name}: expected non-negative number for key ${key}`);
+    }
+    capacity[key] = Math.trunc(value);
+  }
+
+  return capacity;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -110,28 +195,33 @@ function hasAlertThresholds(thresholds: MetricsAlertThresholds): boolean {
 }
 
 function createListenConfig(): {
-  publicPort: number;
-  internalPort?: number;
-  publicAllowedPathPrefixes?: string[];
-  internalAllowedPathPrefixes?: string[];
+  businessPort: number;
+  controlPort?: number;
+  businessAllowedPathPrefixes?: string[];
+  controlAllowedPathPrefixes?: string[];
   singleListenerName: RuntimeListenerName;
 } {
-  const publicPort = envNumber("PUBLIC_PORT") ?? envNumber("PORT") ?? 3000;
-  const internalPort = envNumber("INTERNAL_PORT");
-  const publicAllowedPathPrefixes = envPathPrefixes("PUBLIC_ALLOWED_PATH_PREFIXES");
-  const internalAllowedPathPrefixes = envPathPrefixes("INTERNAL_ALLOWED_PATH_PREFIXES");
+  const businessPort =
+    envNumber("BUSINESS_PORT") ?? envNumber("PUBLIC_PORT") ?? envNumber("PORT") ?? 3000;
+  const controlPort = envNumber("CONTROL_PORT") ?? envNumber("INTERNAL_PORT");
+  const businessAllowedPathPrefixes =
+    envPathPrefixes("BUSINESS_ALLOWED_PATH_PREFIXES") ?? envPathPrefixes("PUBLIC_ALLOWED_PATH_PREFIXES");
+  const controlAllowedPathPrefixes =
+    envPathPrefixes("CONTROL_ALLOWED_PATH_PREFIXES") ?? envPathPrefixes("INTERNAL_ALLOWED_PATH_PREFIXES");
   const hasNamedListenerConfig =
+    processEnv.BUSINESS_PORT !== undefined ||
+    processEnv.CONTROL_PORT !== undefined ||
     processEnv.PUBLIC_PORT !== undefined ||
     processEnv.INTERNAL_PORT !== undefined ||
-    publicAllowedPathPrefixes !== undefined ||
-    internalAllowedPathPrefixes !== undefined;
+    businessAllowedPathPrefixes !== undefined ||
+    controlAllowedPathPrefixes !== undefined;
 
   return {
-    publicPort,
-    internalPort: internalPort !== undefined && internalPort !== publicPort ? internalPort : undefined,
-    publicAllowedPathPrefixes,
-    internalAllowedPathPrefixes,
-    singleListenerName: hasNamedListenerConfig ? "public" : "default"
+    businessPort,
+    controlPort: controlPort !== undefined && controlPort !== businessPort ? controlPort : undefined,
+    businessAllowedPathPrefixes,
+    controlAllowedPathPrefixes,
+    singleListenerName: hasNamedListenerConfig ? "business" : "default"
   };
 }
 
@@ -178,17 +268,17 @@ try {
       shutdownGraceMs: websocketShutdownGraceMs
     },
     listeners: {
-      public: {
-        allowedPathPrefixes: listenConfig.publicAllowedPathPrefixes
+      business: {
+        allowedPathPrefixes: listenConfig.businessAllowedPathPrefixes
       },
-      internal: {
-        allowedPathPrefixes: listenConfig.internalAllowedPathPrefixes
+      control: {
+        allowedPathPrefixes: listenConfig.controlAllowedPathPrefixes
       }
     }
   });
 
-  const publicServer = Bun.serve({
-    port: listenConfig.publicPort,
+  const businessServer = Bun.serve({
+    port: listenConfig.businessPort,
     async fetch(request, serverRef) {
       return app.fetch(request, serverRef, {
         listener: listenConfig.singleListenerName
@@ -196,18 +286,18 @@ try {
     },
     websocket: app.websocket
   });
-  const internalServer = listenConfig.internalPort === undefined
+  const controlServer = listenConfig.controlPort === undefined
     ? undefined
     : Bun.serve({
-        port: listenConfig.internalPort,
+        port: listenConfig.controlPort,
         async fetch(request, serverRef) {
           return app.fetch(request, serverRef, {
-            listener: "internal"
+            listener: "control"
           });
         },
         websocket: app.websocket
       });
-  const servers = [publicServer, internalServer].filter((server): server is typeof publicServer => server !== undefined);
+  const servers = [businessServer, controlServer].filter((server): server is typeof businessServer => server !== undefined);
 
   const alertWindowMs = envNumber("ALERT_WINDOW_MS") ?? 30_000;
   const alertThresholds = createAlertThresholds();
@@ -226,12 +316,16 @@ try {
     : undefined;
 
   app.logger.info("hardess runtime listening", {
-    publicPort: publicServer.port,
-    internalPort: internalServer?.port,
-    listenerMode: internalServer ? "dual" : "single",
-    singleListenerName: internalServer ? undefined : listenConfig.singleListenerName,
-    publicAllowedPathPrefixes: listenConfig.publicAllowedPathPrefixes,
-    internalAllowedPathPrefixes: listenConfig.internalAllowedPathPrefixes,
+    businessPort: businessServer.port,
+    controlPort: controlServer?.port,
+    publicPort: businessServer.port,
+    internalPort: controlServer?.port,
+    listenerMode: controlServer ? "dual" : "single",
+    singleListenerName: controlServer ? undefined : listenConfig.singleListenerName,
+    businessAllowedPathPrefixes: listenConfig.businessAllowedPathPrefixes,
+    controlAllowedPathPrefixes: listenConfig.controlAllowedPathPrefixes,
+    publicAllowedPathPrefixes: listenConfig.businessAllowedPathPrefixes,
+    internalAllowedPathPrefixes: listenConfig.controlAllowedPathPrefixes,
     metricsMode,
     configModulePath: processEnv.CONFIG_MODULE_PATH ?? "./config/hardess.config.ts",
     nodeId: envString("NODE_ID") ?? "local",
@@ -239,6 +333,68 @@ try {
     clusterPeers: parseClusterPeers().map((peer) => peer.nodeId),
     alertWindowMs: alertMonitor ? alertWindowMs : undefined
   });
+  const adminBaseUrl = envString("ADMIN_BASE_URL");
+  const hostAgent = adminBaseUrl
+    ? new HostAgent(
+        new HardessAdminClient(
+          new HttpAdminTransport({
+            baseUrl: adminBaseUrl,
+            headers: envString("ADMIN_BEARER_TOKEN")
+              ? {
+                  authorization: `Bearer ${envString("ADMIN_BEARER_TOKEN")}`
+                }
+              : undefined
+          })
+        ),
+        (() => {
+          const artifactStore = new ArtifactStore({
+            rootDir: envString("ADMIN_ARTIFACT_ROOT_DIR") ?? ".hardess-admin-artifacts",
+            logger: app.logger
+          });
+          const serviceModuleManager = new ServiceModuleManager({
+            registry: app.registry,
+            artifactStore,
+            logger: app.logger,
+            drainGraceMs: envNumber("SERVICE_MODULE_DRAIN_GRACE_MS") ?? 3_000
+          });
+          return new RuntimeHostAdapter({
+            app,
+            configStore: app.configStore,
+            artifactStore,
+            serviceModuleManager,
+            topologyStore: app.topologyStore,
+            hostId: envString("ADMIN_HOST_ID") ?? envString("NODE_ID") ?? "local",
+            nodeId: envString("NODE_ID") ?? "local",
+            runtimeVersion: envString("HARDESS_RUNTIME_VERSION") ?? "v1",
+            publicBaseUrl: envString("ADMIN_BUSINESS_BASE_URL") ?? envString("ADMIN_PUBLIC_BASE_URL"),
+            internalBaseUrl: envString("ADMIN_CONTROL_BASE_URL") ?? envString("ADMIN_INTERNAL_BASE_URL"),
+            publicListenerEnabled: true,
+            internalListenerEnabled: Boolean(listenConfig.controlPort),
+            staticLabels: envStringRecord("ADMIN_STATIC_LABELS_JSON"),
+            staticCapabilities:
+              envStringList("ADMIN_STATIC_CAPABILITIES") ?? ["http_worker", "service_module"],
+            staticCapacity: envStaticCapacity("ADMIN_STATIC_CAPACITY_JSON"),
+            defaultConnectTimeoutMs: envNumber("ADMIN_DEFAULT_CONNECT_TIMEOUT_MS"),
+            defaultResponseTimeoutMs: envNumber("ADMIN_DEFAULT_RESPONSE_TIMEOUT_MS"),
+            defaultWorkerTimeoutMs: envNumber("ADMIN_DEFAULT_WORKER_TIMEOUT_MS"),
+            registrationDynamicFields: envJsonObject("ADMIN_REGISTRATION_DYNAMIC_FIELDS_JSON"),
+            observedDynamicFields: envJsonObject("ADMIN_OBSERVED_DYNAMIC_FIELDS_JSON")
+          });
+        })(),
+        {
+          logger: app.logger,
+          defaultPollAfterMs: envNumber("ADMIN_POLL_AFTER_MS"),
+          retryPollAfterMs: envNumber("ADMIN_RETRY_POLL_AFTER_MS")
+        }
+      )
+    : undefined;
+  if (hostAgent) {
+    hostAgent.start();
+    app.logger.info("hardess host agent enabled", {
+      adminBaseUrl,
+      hostId: envString("ADMIN_HOST_ID") ?? envString("NODE_ID") ?? "local"
+    });
+  }
   void app.clusterNetwork.warmConnections().catch((error) => {
     app.logger.error("cluster channel warmup failed", {
       error: error instanceof Error ? error.message : String(error)
@@ -255,6 +411,7 @@ try {
     }
 
     shutdownInFlight = true;
+    hostAgent?.stop();
     app.beginShutdown();
     app.logger.info("hardess runtime shutting down", {
       signal,
@@ -294,6 +451,7 @@ try {
       if (alertTimer) {
         clearInterval(alertTimer);
       }
+      hostAgent?.stop();
       app.dispose();
       env.process?.exit?.(0);
     }

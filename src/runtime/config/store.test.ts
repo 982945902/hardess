@@ -258,4 +258,44 @@ describe("ModuleConfigStore", () => {
     await expect(store.reload()).rejects.toThrow("module must export hardessConfig or default");
     store.dispose();
   });
+
+  it("applies runtime-provided config snapshots directly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-apply-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: []
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    await store.reload();
+
+    const applied = await store.applyConfig({
+      pipelines: [
+        {
+          id: "demo-http",
+          matchPrefix: "/demo",
+          downstream: {
+            origin: "http://127.0.0.1:9000",
+            connectTimeoutMs: 1000,
+            responseTimeoutMs: 5000
+          },
+          worker: {
+            entry: "workers/demo-worker.ts",
+            timeoutMs: 1000
+          }
+        }
+      ]
+    }, {
+      source: "admin:rev-1"
+    });
+
+    expect(applied.pipelines).toHaveLength(1);
+    expect(store.getConfig().pipelines[0]?.id).toBe("demo-http");
+    store.dispose();
+  });
 });

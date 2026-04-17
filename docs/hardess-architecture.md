@@ -59,10 +59,10 @@ Implemented in repository:
 7. Baseline WebSocket runtime controls now exist: per-peer connection quota enforcement, inbound message rate-limit, bounded outbound queue handling, explicit close-code mapping for auth/protocol/quota/backpressure failures, stricter protocol-violation close behavior, and cleaner connection rebinding behavior.
 8. Runtime metrics now include bounded snapshot support for server mode, HTTP/worker/proxy/WebSocket-side counters and timings, cluster-transport counters for internal WS channels, threshold-based structured alert logging over configurable windows, and Prometheus text export for external scraping.
 9. Runtime admin endpoints now exist for `__admin/health`, `__admin/ready`, `__admin/metrics`, `__admin/metrics/prometheus`, and `__admin/cluster/peers`, and the Bun server path supports graceful shutdown signaling with an explicit drain window before stop/dispose.
-10. The runtime server now supports an optional dual-listener deployment shape: one shared `RuntimeApp` can serve a public listener and an internal listener simultaneously, with optional per-listener path-prefix policies and permissive defaults when those policies are unset.
+10. The runtime server now supports an optional dual-listener deployment shape: one shared `RuntimeApp` can serve a business listener and a control listener simultaneously, with optional per-listener path-prefix policies, compatibility aliases for older `public/internal` naming, and permissive defaults when those policies are unset.
 11. Local operator tooling now includes HTTP/WS load scripts, an automated local release-gate runner with optional or profile-driven SLO thresholds, optional Toxiproxy weak-network simulation, repo-level workflow entrypoints, tuned single-node plus cluster high-load benchmark profiles with optional or profile-driven SLO thresholds, a small operator guide, a sample Prometheus scrape config, and a sample Grafana dashboard template.
-12. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived internal WebSocket channel between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
-13. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/internal HTTP/admin response validation, business protocol payloads, and worker result validation.
+12. Static multi-node routing baseline is now implemented with per-node local connection indexes, cached remote peer lookup, HTTP-based peer locate, a long-lived control-channel WebSocket between configured cluster peers for cross-node delivery and `handleAck` forwarding, and an explicit HTTP fallback transport mode.
+13. A shared runtime-schema baseline is now implemented with `zod` for config validation, config/worker module export boundaries, shared envelope validation, key system payloads, cluster env/control HTTP/admin response validation, business protocol payloads, and worker result validation.
 14. SDK transport now exposes structured close/error events and avoids reconnecting on terminal server close codes such as auth/policy/quota/backpressure failures.
 15. SDK sender-side delivery surfaces are now implemented with split transport/protocol errors, a global delivery event stream, per-message tracked sends, immediate tracked-send failure on transport close, sender-visible delivery timeouts, and higher-level `waitForResult()` / `client.send(...)` helpers for common business code.
 16. Tests cover HTTP ingress, WebSocket runtime, local and distributed routing, worker reload, config reload, SDK transport/client behavior, protocol registries, runtime admin endpoints, timeout mapping, listener-policy behavior, and schema validation boundaries.
@@ -87,8 +87,8 @@ Partially completed:
 2. Auth integration is partially implemented: the shared `AuthService` abstraction, provider dispatch, expiry checks, and revocation path exist, but only the local demo provider is wired today.
 3. WebSocket backpressure and egress governance are partially implemented: Bun send-status handling, bounded queueing, socket buffered-amount limits, retry-on-backpressure, and overflow close behavior now exist, but deeper transport-specific flow-control tuning may still be needed under heavier production traffic.
 4. Runtime operational polish is partially implemented: config/worker reload, health/readiness, graceful shutdown with drain window, startup-failure handling, repo-level workflow docs, an operator guide, automated local release-gate execution, SLO-aware release-gate checks, and SLO-aware cluster benchmarking are in place, but broader deployment integration is still environment-specific.
-5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, internal WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
-6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, including cluster env and internal HTTP/admin response parsing plus the worker-module export boundary, but a small tail still remains in the hot-path envelope fast parser and a few runtime helper guards.
+5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, control-WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
+6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, including cluster env and control HTTP/admin response parsing plus the worker-module export boundary, but a small tail still remains in the hot-path envelope fast parser and a few runtime helper guards.
 7. ACL / capability enforcement is partially implemented: the `authorize` hook exists and the built-in `demo.send` / `chat.send` path now requires `notify.conn`, but a broader default capability policy for future injected protocols is still open.
 8. Some SDK ergonomics remain intentionally thin above the current sender-side delivery baseline: `emit`, `emitTracked`, `waitForResult`, and `send` now cover the common cases, but request/reply-style business abstractions are still protocol-level decisions rather than a fixed core contract.
 
@@ -298,10 +298,10 @@ Rules:
 The current multi-node transport is intentionally hybrid rather than fully distributed.
 
 Current behavior:
-1. Peer discovery still uses internal HTTP `POST /__cluster/locate` against the statically configured peer list.
-2. Cross-node message delivery and cross-node `sys.handleAck` forwarding use a long-lived internal WebSocket channel at `GET /__cluster/ws`.
-3. The runtime server defaults `CLUSTER_TRANSPORT` to `ws`; `http` remains supported as a compatibility and fallback mode, and the `ws` mode can degrade individual requests back to the internal HTTP endpoints when the WS channel is temporarily unavailable or backpressured.
-4. The optional shared secret is enforced on HTTP locate requests and during the internal WebSocket `hello` handshake.
+1. Peer discovery still uses control HTTP `POST /__cluster/locate` against the statically configured peer list.
+2. Cross-node message delivery and cross-node `sys.handleAck` forwarding use a long-lived control WebSocket channel at `GET /__cluster/ws`.
+3. The runtime server defaults `CLUSTER_TRANSPORT` to `ws`; `http` remains supported as a compatibility and fallback mode, and the `ws` mode can degrade individual requests back to the control HTTP endpoints when the WS channel is temporarily unavailable or backpressured.
+4. The optional shared secret is enforced on HTTP locate requests and during the control WebSocket `hello` handshake.
 
 Why this shape exists:
 1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.
@@ -309,7 +309,7 @@ Why this shape exists:
 3. This is still a static-cluster baseline, not a distributed membership or durable routing system.
 
 Deployment note:
-1. The current implementation is still single-listener, but the intended deployment evolution is a dual-port single-process model where public ingress and internal cluster/admin traffic are separated while sharing one runtime state. See [swarm-dual-port-cluster-design.md](swarm-dual-port-cluster-design.md).
+1. The current implementation now supports both single-listener and dual-listener deployment; the intended dual-port shape is still single-process with business ingress and control traffic separated while sharing one runtime state. See [swarm-dual-port-cluster-design.md](swarm-dual-port-cluster-design.md).
 
 ## 7. Protocol Model
 Hardess protocol is split into two layers:
@@ -685,6 +685,9 @@ export interface ServerProtocolModule<Payload = unknown> {
 export interface ServerActionHooks<Payload = unknown> {
   validate?: (ctx: ServerHookContext<Payload>) => Promise<void> | void;
   authorize?: (ctx: ServerHookContext<Payload>) => Promise<void> | void;
+  handleLocally?: (
+    ctx: ServerHookContext<Payload>
+  ) => Promise<{ ack?: "none" | "recv" | "handle" } | void> | { ack?: "none" | "recv" | "handle" } | void;
   resolveRecipients?: (
     ctx: ServerHookContext<Payload>
   ) => Promise<string[]> | string[];
@@ -716,9 +719,10 @@ export interface ServerDispatch {
 Rules:
 1. `resolveRecipients(ctx)` returns `peerId[]`, not `connId[]`.
 2. Business code decides recipients from payload and business context.
-3. `buildDispatch(ctx)` may rewrite the outbound business action/payload before fanout.
-4. `ServerHookContext` includes the shared `AuthContext`.
-5. Hardess runtime owns the `peerId -> ConnRef[]` index and final transport fanout.
+3. `handleLocally(ctx)` is optional and allows a server module to act as a terminal or origin-side local handler without mandatory fanout.
+4. `buildDispatch(ctx)` may rewrite the outbound business action/payload before fanout.
+5. `ServerHookContext` includes the shared `AuthContext`.
+6. Hardess runtime owns the `peerId -> ConnRef[]` index and final transport fanout.
 
 ### 8.4 Runtime Dispatch Pipeline
 Internal runtime types:
@@ -735,13 +739,14 @@ Execution flow:
 1. Sender SDK emits a business message.
 2. Hardess verifies sender auth state from the shared auth module.
 3. Hardess matches `protocol + version + action`.
-4. Hardess runs `validate`, `authorize`, `resolveRecipients`, and optional `buildDispatch`.
-5. `resolveRecipients` returns `peerId[]`.
-6. `buildDispatch` may rewrite `action`, `payload`, `streamId`, and `ack` mode for receiver-side delivery.
-7. Hardess filters out recipients whose auth state is invalid or revoked.
-8. Hardess expands valid `peerId[]` into online `ConnRef[]`.
-9. Hardess builds `DeliveryPlan` and dispatches over WebSocket.
-10. Receiver SDK decodes and handles the inbound business message.
+4. Hardess runs `validate`, `authorize`, optional `handleLocally`, `resolveRecipients`, and optional `buildDispatch`.
+5. If `handleLocally` exists, the action may complete locally without fanout.
+6. `resolveRecipients` returns `peerId[]` when fanout is needed.
+7. `buildDispatch` may rewrite `action`, `payload`, `streamId`, and `ack` mode for receiver-side delivery.
+8. Hardess filters out recipients whose auth state is invalid or revoked.
+9. Hardess expands valid `peerId[]` into online `ConnRef[]`.
+10. Hardess builds `DeliveryPlan` and dispatches over WebSocket when recipients exist.
+11. Receiver SDK decodes and handles the inbound business message.
 
 Fanout behavior notes:
 1. Delivery is best-effort per resolved target connection.

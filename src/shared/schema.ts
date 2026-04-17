@@ -5,6 +5,7 @@ import type {
   ConnRef,
   Envelope,
   HardessConfig,
+  HardessServiceModule,
   HardessWorkerModule,
   HardessWorkerResult,
   SysAuthOkPayload,
@@ -46,7 +47,7 @@ export const pipelineConfigSchema = z.object({
 });
 
 export const hardessConfigSchema = z.object({
-  pipelines: z.array(pipelineConfigSchema).min(1, "at least one pipeline is required")
+  pipelines: z.array(pipelineConfigSchema)
 });
 
 export const envelopeSchema = z.object({
@@ -136,6 +137,34 @@ export const workerModuleExportSchema = z.custom<HardessWorkerModule>(
     "fetch" in value &&
     typeof (value as { fetch?: unknown }).fetch === "function",
   "worker module must export fetch(request, env, ctx)"
+);
+
+export const serviceModuleExportSchema = z.custom<HardessServiceModule>(
+  (value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    const moduleValue = value as {
+      protocol?: unknown;
+      version?: unknown;
+      actions?: unknown;
+    };
+    if (typeof moduleValue.protocol !== "string" || moduleValue.protocol.length === 0) {
+      return false;
+    }
+    if (typeof moduleValue.version !== "string" || moduleValue.version.length === 0) {
+      return false;
+    }
+    if (!moduleValue.actions || typeof moduleValue.actions !== "object" || Array.isArray(moduleValue.actions)) {
+      return false;
+    }
+
+    return Object.values(moduleValue.actions).every(
+      (hooks) => hooks !== null && typeof hooks === "object" && !Array.isArray(hooks)
+    );
+  },
+  "service module must export { protocol, version, actions }"
 );
 
 export function formatZodError(error: ZodError): string {
@@ -272,6 +301,18 @@ export function parseWorkerModuleExport(value: unknown, entry = "worker"): Harde
   const result = workerModuleExportSchema.safeParse(value);
   if (!result.success) {
     throw new Error(`Invalid worker module ${entry}: ${formatZodError(result.error)}`);
+  }
+
+  return result.data;
+}
+
+export function parseServiceModuleExport(
+  value: unknown,
+  entry = "service module"
+): HardessServiceModule {
+  const result = serviceModuleExportSchema.safeParse(value);
+  if (!result.success) {
+    throw new Error(`Invalid service module ${entry}: ${formatZodError(result.error)}`);
   }
 
   return result.data;

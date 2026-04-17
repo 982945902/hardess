@@ -1,5 +1,5 @@
 import { readClusterWsGateSloThresholds } from "./gate-slo.ts";
-import { envNumber, envString, parseErrorPayload, summarizeSeries } from "./shared.ts";
+import { envNumber, envOptionalStringFirst, envString, parseErrorPayload, summarizeSeries } from "./shared.ts";
 import { runClusterReleaseGate } from "./release-gate-cluster.ts";
 import { applyClusterBenchmarkProfile } from "./profiles.ts";
 
@@ -115,7 +115,7 @@ const portBase = envNumber("BENCH_CLUSTER_PORT_BASE", 3400);
 const upstreamPortBase = envNumber("BENCH_CLUSTER_UPSTREAM_PORT_BASE", 9400);
 const sendIntervalMs = envNumber("BENCH_CLUSTER_SEND_INTERVAL_MS", 0);
 const listenerMode = (() => {
-  const raw = envString("BENCH_CLUSTER_LISTENER_MODE", "single");
+  const raw = envOptionalStringFirst(["BENCH_CLUSTER_LISTENER_MODE"]) ?? "single";
   if (raw === "single" || raw === "dual") {
     return raw as ListenerMode;
   }
@@ -154,8 +154,8 @@ for (const [scenarioIndex, messagesPerSender] of scenarioValues.entries()) {
         listenerMode,
         nodeAPort: portBase + portOffset,
         nodeBPort: portBase + portOffset + 1,
-        nodeAInternalPort: listenerMode === "dual" ? portBase + portOffset + 2 : undefined,
-        nodeBInternalPort: listenerMode === "dual" ? portBase + portOffset + 3 : undefined,
+        nodeAControlPort: listenerMode === "dual" ? portBase + portOffset + 2 : undefined,
+        nodeBControlPort: listenerMode === "dual" ? portBase + portOffset + 3 : undefined,
         upstreamPort: upstreamPortBase + portOffset,
         senderCount,
         receiverCount,

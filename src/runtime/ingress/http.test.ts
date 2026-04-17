@@ -7,6 +7,7 @@ import { RuntimeAuthService } from "../auth/service.ts";
 import { ConsoleLogger } from "../observability/logger.ts";
 import { InMemoryMetrics } from "../observability/metrics.ts";
 import { UpstreamWebSocketProxyRuntime } from "../proxy/upstream-websocket.ts";
+import { RuntimeTopologyStore } from "../control/topology-store.ts";
 
 const config: HardessConfig = {
   pipelines: [
@@ -48,6 +49,7 @@ function createConfigStoreMock(nextConfig: HardessConfig): ConfigStore {
   return {
     getConfig: () => nextConfig,
     reload: async () => nextConfig,
+    applyConfig: async (config) => config,
     watch: () => {},
     dispose: () => {},
     subscribe: () => () => {}
@@ -245,5 +247,91 @@ describe("handleHttpRequest", () => {
     expect(metrics.counter("http.upstream_connect_timeout")).toBe(0);
     expect(metrics.counter("http.upstream_timeout")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
+  });
+
+  it("internally forwards http requests based on admin topology when the route is not local", async () => {
+    globalThis.fetch = mock(async (request: Request) => {
+      expect(request.url).toBe("http://host-b.internal/__cluster/http-forward");
+      expect(request.headers.get("x-hardess-forward-path")).toBe("/demo/orders?source=public");
+      expect(request.headers.get("x-hardess-forward-hop")).toBe("1");
+      expect(request.headers.get("x-trace-id")).toBe("trace-internal-1");
+      return Response.json({
+        ok: true,
+        forwardedTo: request.url
+      });
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const topologyStore = new RuntimeTopologyStore();
+    topologyStore.setTopology({
+      membership: {
+        revision: "topology:1:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-a",
+            nodeId: "node-a",
+            internalBaseUrl: "http://host-a.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          },
+          {
+            hostId: "host-b",
+            nodeId: "node-b",
+            internalBaseUrl: "http://host-b.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:1:placement",
+        generatedAt: 1,
+        deployments: [
+          {
+            deploymentId: "deployment:demo-http",
+            deploymentKind: "http_worker",
+            ownerHostIds: ["host-b"],
+            routes: [
+              {
+                routeId: "route:demo-http",
+                pathPrefix: "/demo",
+                ownerHostIds: ["host-b"]
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders?source=public", {
+        headers: {
+          authorization: "Bearer demo:alice",
+          "x-trace-id": "trace-internal-1"
+        }
+      }),
+      {
+        ...createHttpDeps({ pipelines: [] }, metrics),
+        nodeId: "node-a",
+        topologyStore
+      }
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      ok: true,
+      forwardedTo: "http://host-b.internal/__cluster/http-forward"
+    });
+    expect(metrics.counter("http.internal_forward_ok")).toBe(1);
+    expect(metrics.counter("http.route_missing")).toBe(0);
   });
 });

@@ -130,9 +130,7 @@ export class StaticClusterNetwork {
     peers: ClusterPeerNode[],
     private readonly options: ClusterNetworkOptions
   ) {
-    for (const peer of peers) {
-      this.peersByNodeId.set(peer.nodeId, peer);
-    }
+    this.setPeers(peers);
     this.fetchFn = options.fetchFn ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.outboundMaxQueueMessages =
@@ -146,6 +144,26 @@ export class StaticClusterNetwork {
 
   listPeers(): ClusterPeerNode[] {
     return Array.from(this.peersByNodeId.values());
+  }
+
+  setPeers(peers: ClusterPeerNode[]): void {
+    const nextPeersByNodeId = new Map<string, ClusterPeerNode>();
+    for (const peer of peers) {
+      nextPeersByNodeId.set(peer.nodeId, peer);
+    }
+
+    for (const [nodeId, channel] of this.channelsByNodeId) {
+      if (nextPeersByNodeId.has(nodeId)) {
+        continue;
+      }
+      channel.socket.close(1012, "cluster peer removed");
+      this.channelsByNodeId.delete(nodeId);
+    }
+
+    this.peersByNodeId.clear();
+    for (const peer of nextPeersByNodeId.values()) {
+      this.peersByNodeId.set(peer.nodeId, peer);
+    }
   }
 
   hasPeers(): boolean {

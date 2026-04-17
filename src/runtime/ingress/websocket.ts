@@ -684,22 +684,42 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     await hooks.validate?.(ctx);
     await hooks.authorize?.(ctx);
 
+    const localHandleResult = await hooks.handleLocally?.(ctx);
     const peerIds = await hooks.resolveRecipients?.(ctx);
-    if (!peerIds || peerIds.length === 0) {
+    const hasRecipients = Boolean(peerIds && peerIds.length > 0);
+    const handledLocally = hooks.handleLocally !== undefined;
+    if (!handledLocally && !hasRecipients) {
       throw new HardessError(ERROR_CODES.ROUTE_NO_RECIPIENT, "No recipients resolved");
     }
 
-    const dispatch = (await hooks.buildDispatch?.(ctx)) ?? {};
-    const outboundEnvelope: Envelope<unknown> = {
-      ...envelope,
-      protocol: dispatch.protocol ?? envelope.protocol,
-      version: dispatch.version ?? envelope.version,
-      action: dispatch.action ?? envelope.action,
-      streamId: dispatch.streamId ?? envelope.streamId,
-      payload: dispatch.payload ?? envelope.payload
-    };
+    if (hasRecipients) {
+      const dispatch = (await hooks.buildDispatch?.(ctx)) ?? {};
+      const outboundEnvelope: Envelope<unknown> = {
+        ...envelope,
+        protocol: dispatch.protocol ?? envelope.protocol,
+        version: dispatch.version ?? envelope.version,
+        action: dispatch.action ?? envelope.action,
+        streamId: dispatch.streamId ?? envelope.streamId,
+        payload: dispatch.payload ?? envelope.payload
+      };
 
-    await sendToPeerIds(connection, outboundEnvelope, peerIds, dispatch.ack ?? "recv");
+      await sendToPeerIds(connection, outboundEnvelope, peerIds ?? [], dispatch.ack ?? "recv");
+      return;
+    }
+
+    const localAck = localHandleResult?.ack ?? "handle";
+    if (localAck === "recv" || localAck === "handle") {
+      enqueueOutbound(
+        connection,
+        serializeEnvelope(createRecvAckEnvelope(connection.socket.data.connId, envelope.msgId, envelope.traceId))
+      );
+    }
+    if (localAck === "handle") {
+      enqueueOutbound(
+        connection,
+        serializeEnvelope(createHandleAckEnvelope("system", envelope.msgId, envelope.traceId))
+      );
+    }
   }
 
   return {

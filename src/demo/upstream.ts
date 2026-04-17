@@ -23,6 +23,8 @@ const server = Bun.serve({
         "x-hardess-pipeline": request.headers.get("x-hardess-pipeline"),
         "x-hardess-worker": request.headers.get("x-hardess-worker"),
         "x-hardess-auth-peer": request.headers.get("x-hardess-auth-peer"),
+        "x-hardess-admin-demo": request.headers.get("x-hardess-admin-demo"),
+        "x-hardess-admin-scope": request.headers.get("x-hardess-admin-scope"),
         "x-hardess-peer-id": request.headers.get("x-hardess-peer-id"),
         "x-hardess-trace-id": request.headers.get("x-hardess-trace-id")
       },

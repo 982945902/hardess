@@ -1,7 +1,7 @@
 import { watch, type FSWatcher } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { parseConfigModuleExport, type HardessConfig } from "../../shared/index.ts";
+import { parseConfigModuleExport, parseHardessConfig, type HardessConfig } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
 
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
@@ -9,6 +9,7 @@ type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
 export interface ConfigStore {
   getConfig(): HardessConfig;
   reload(): Promise<HardessConfig>;
+  applyConfig(config: HardessConfig, options?: { source?: string }): Promise<HardessConfig>;
   watch(): void;
   dispose(): void;
   subscribe(listener: (config: HardessConfig) => void | Promise<void>): () => void;
@@ -73,6 +74,12 @@ export class ModuleConfigStore implements ConfigStore {
     }
   }
 
+  async applyConfig(config: HardessConfig, options: { source?: string } = {}): Promise<HardessConfig> {
+    const parsed = parseHardessConfig(config);
+    await this.publishConfig(parsed, options.source ?? "runtime");
+    return parsed;
+  }
+
   private async performReload(): Promise<HardessConfig> {
     const absolutePath = resolve(this.modulePath);
     const source = await readFile(absolutePath, "utf8");
@@ -93,17 +100,21 @@ export class ModuleConfigStore implements ConfigStore {
       exportName: this.exportName,
       modulePath: this.modulePath
     });
+    await this.publishConfig(config, this.modulePath);
+    return config;
+  }
+
+  private async publishConfig(config: HardessConfig, source: string): Promise<void> {
     this.currentConfig = config;
     this.logger?.info("config reloaded", {
       modulePath: this.modulePath,
+      source,
       pipelines: config.pipelines.length
     });
 
     for (const listener of this.listeners) {
       await listener(config);
     }
-
-    return config;
   }
 
   private scheduleReload(): void {

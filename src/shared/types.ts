@@ -236,9 +236,16 @@ export interface ServerHookContext<Payload = unknown> {
   ts: number;
 }
 
+export interface ServerLocalHandleResult {
+  ack?: AckMode;
+}
+
 export interface ServerActionHooks<Payload = unknown> {
   validate?: (ctx: ServerHookContext<Payload>) => Promise<void> | void;
   authorize?: (ctx: ServerHookContext<Payload>) => Promise<void> | void;
+  handleLocally?: (
+    ctx: ServerHookContext<Payload>
+  ) => Promise<ServerLocalHandleResult | void> | ServerLocalHandleResult | void;
   resolveRecipients?: (ctx: ServerHookContext<Payload>) => Promise<string[]> | string[];
   buildDispatch?: (
     ctx: ServerHookContext<Payload>
@@ -250,6 +257,8 @@ export interface ServerProtocolModule<Payload = unknown> {
   version: string;
   actions: Record<string, ServerActionHooks<Payload>>;
 }
+
+export type HardessServiceModule<Payload = unknown> = ServerProtocolModule<Payload>;
 
 export type AckMode = "none" | "recv" | "handle";
 

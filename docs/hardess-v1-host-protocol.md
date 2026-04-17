@@ -1,0 +1,529 @@
+# Hardess v1 Host Protocol Design
+
+## 1. Scope
+
+This document defines the baseline admin-to-runtime protocol for the current
+`hardess v1` line.
+
+It is designed for:
+
+- the current Bun-based runtime
+- the current `v1` control-plane direction
+- an `admin + mock service` integration phase
+
+It does not assume:
+
+- the `v2` experiment
+- a Rust runtime rewrite
+- a final transport beyond a simple HTTP control contract
+
+## 2. Design Goal
+
+Define one host-oriented protocol between:
+
+- `Hardess Admin`
+- `Hardess Runtime`
+
+This protocol should support:
+
+- host registration
+- host heartbeat and observed state reporting
+- deployment publication and placement
+- per-host desired state reconciliation
+- runtime artifact retrieval
+
+The protocol should fit the fixed `v1` design:
+
+- `worker` and `serviceModule` publish like `Kubernetes` / `Ray Serve`
+- publish creates a deployment
+- deployment declares replica count
+- admin produces assignments
+- each host reconciles only its own desired state
+
+## 3. Core Objects
+
+The baseline protocol uses six core objects:
+
+1. `HostRegistration`
+2. `Deployment`
+3. `Assignment`
+4. `DesiredHostState`
+5. `ObservedHostState`
+6. `ArtifactManifest`
+
+## 4. HostRegistration
+
+This is the first object a runtime host sends to admin.
+
+Purpose:
+
+- identify the host
+- advertise static capabilities
+- advertise initial dynamic state
+- give admin enough information to schedule assignments later
+
+Recommended shape:
+
+```ts
+type HostRegistration = {
+  host_id: string;
+  node_id?: string;
+  started_at: number;
+  runtime: {
+    kind: "hardess-v1";
+    version: string;
+    pid?: number;
+  };
+  network: {
+    public_base_url?: string;
+    internal_base_url?: string;
+    public_listener_enabled: boolean;
+    internal_listener_enabled: boolean;
+  };
+  static_labels: Record<string, string>;
+  static_capabilities: string[];
+  static_capacity: {
+    max_http_worker_assignments?: number;
+    max_service_module_assignments?: number;
+    max_connections?: number;
+    max_inflight_requests?: number;
+  };
+  dynamic_fields?: Record<string, unknown>;
+}
+```
+
+Notes:
+
+- `host_id` is the admin-facing stable identity
+- `node_id` may mirror runtime/node naming already present in cluster mode
+- `dynamic_fields` exists on purpose so the contract can grow without churn
+
+## 5. Deployment
+
+This is the global control-plane object.
+
+It is the thing users publish and scale.
+
+Recommended shape:
+
+```ts
+type Deployment = {
+  deployment_id: string;
+  deployment_kind: "http_worker" | "service_module";
+  name: string;
+  declared_version: string;
+  declared_artifact_id?: string;
+  replicas: number;
+  artifact: {
+    manifest_id: string;
+    source_uri: string;
+    digest?: string;
+  };
+  route_bindings?: Array<{
+    route_id: string;
+  }>;
+  auth_policy_ref?: string;
+  secret_refs?: string[];
+  scheduling?: {
+    required_labels?: Record<string, string>;
+    preferred_labels?: Record<string, string>;
+  };
+  rollout?: {
+    strategy?: "gradual";
+    max_unavailable?: number;
+    batch_size?: number;
+  };
+}
+```
+
+Notes:
+
+- `replicas` is global desired count
+- `scheduling` leaves room for future affinity / anti-affinity policy
+- `rollout` stays intentionally simple in `v1`
+
+## 6. Assignment
+
+This is the placement result from admin onto one host.
+
+One assignment means:
+
+- one deployment replica
+- placed onto one host
+
+Recommended shape:
+
+```ts
+type Assignment = {
+  assignment_id: string;
+  host_id: string;
+  deployment_id: string;
+  deployment_kind: "http_worker" | "service_module";
+  declared_version: string;
+  declared_artifact_id?: string;
+  artifact: {
+    manifest_id: string;
+    source_uri: string;
+    digest?: string;
+  };
+  http_worker?: {
+    name: string;
+    entry: string;
+    route_refs?: string[];
+  };
+  service_module?: {
+    name: string;
+    entry: string;
+  };
+  auth_policy_ref?: string;
+  secret_refs?: string[];
+}
+```
+
+Notes:
+
+- this is the scheduling unit for `v1`
+- more advanced sub-assignment behavior is out of scope for now
+
+## 7. DesiredHostState
+
+This is what admin returns to one specific host.
+
+It is not a global config snapshot.
+
+It is the host-local projection of:
+
+- deployments
+- placement decisions
+- current rollout state
+
+Recommended shape:
+
+```ts
+type DesiredHostState = {
+  host_id: string;
+  revision: string;
+  generated_at: number;
+  assignments: Assignment[];
+  topology?: {
+    membership: {
+      revision: string;
+      generated_at: number;
+      hosts: Array<{
+        host_id: string;
+        node_id?: string;
+        public_base_url?: string;
+        internal_base_url?: string;
+        public_listener_enabled: boolean;
+        internal_listener_enabled: boolean;
+        state: "ready" | "draining" | "offline";
+      }>;
+    };
+    placement: {
+      revision: string;
+      generated_at: number;
+      deployments: Array<{
+        deployment_id: string;
+        deployment_kind: "http_worker" | "service_module";
+        owner_host_ids: string[];
+        routes: Array<{
+          route_id: string;
+          path_prefix: string;
+          owner_host_ids: string[];
+        }>;
+      }>;
+    };
+  };
+  shared_http_forward_config?: {
+    routes: Array<{
+      route_id: string;
+      match: {
+        path_prefix: string;
+      };
+      upstream: {
+        base_url: string;
+        websocket_enabled?: boolean;
+      };
+    }>;
+  };
+}
+```
+
+Notes:
+
+- `revision` is the admin-side monotonic desired-state token
+- hosts should treat `revision` as an opaque value
+- `topology.membership` is the global slow-changing host view
+- `topology.placement` is the global slow-changing deployment-owner view
+- `topology.placement.routes` is the minimal routing table needed for host-to-host
+  HTTP forwarding and business WebSocket upgrade forwarding
+- hot `connId` location is still runtime-owned and should not be pushed through
+  admin
+
+## 8. ObservedHostState
+
+This is what runtime reports back to admin.
+
+Purpose:
+
+- let admin know whether assignments are healthy
+- support scheduling decisions
+- support rollout progress and rollback decisions
+
+Recommended shape:
+
+```ts
+type ObservedHostState = {
+  host_id: string;
+  observed_at: number;
+  ready: boolean;
+  draining: boolean;
+  static_labels: Record<string, string>;
+  static_capabilities: string[];
+  static_capacity: {
+    max_http_worker_assignments?: number;
+    max_service_module_assignments?: number;
+    max_connections?: number;
+    max_inflight_requests?: number;
+  };
+  dynamic_state: {
+    current_assignment_count: number;
+    current_connection_count?: number;
+    current_inflight_requests?: number;
+    schedulable?: boolean;
+    applied_topology?: {
+      membership_revision?: string;
+      placement_revision?: string;
+    };
+    resource_hints?: Record<string, number>;
+    dynamic_fields?: Record<string, unknown>;
+  };
+  assignment_statuses: Array<{
+    assignment_id: string;
+    deployment_id: string;
+    declared_version: string;
+    generation_id?: string;
+    state:
+      | "pending"
+      | "preparing"
+      | "ready"
+      | "active"
+      | "draining"
+      | "failed";
+    prepared_at?: number;
+    activated_at?: number;
+    failed_at?: number;
+    last_error?: {
+      code: string;
+      message: string;
+      retryable?: boolean;
+    };
+  }>;
+}
+```
+
+Notes:
+
+- runtime owns `generation_id`
+- admin owns `declared_version`
+- this keeps version and generation semantics separated
+- `applied_topology` lets admin observe whether one host has converged to the
+  latest topology snapshot
+
+## 9. ArtifactManifest
+
+This object tells runtime how to fetch and validate one artifact.
+
+Recommended shape:
+
+```ts
+type ArtifactManifest = {
+  manifest_id: string;
+  artifact_kind: "http_worker" | "service_module";
+  declared_artifact_id?: string;
+  declared_version: string;
+  source: {
+    uri: string;
+    digest?: string;
+  };
+  entry: string;
+  package_manager: {
+    kind: "deno";
+    deno_json?: string;
+    deno_lock?: string;
+    frozen_lock?: boolean;
+  };
+  metadata?: {
+    annotations?: Record<string, string>;
+  };
+}
+```
+
+This matches the current direction:
+
+- admin governs version and artifact identity
+- runtime prepares dependencies locally
+- runtime can use package-manager metadata during prepare
+
+Current `v1` implementation boundary:
+
+- for `http_worker`, runtime currently treats `source.uri` as the worker source file
+- runtime stages that file into a local artifact cache and points the live pipeline `worker.entry` at the staged path
+- for `service_module`, runtime stages the module source into the same local artifact cache, loads the staged entry, validates that it exports `{ protocol, version, actions }`, and registers it into the runtime WebSocket protocol registry
+- when `package_manager.deno_json` or `package_manager.deno_lock` are present, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
+- for remote `source.uri`, a `digest` is the boundary for reliable cache reuse; without it, runtime should prefer restaging over assuming the cached remote source is still current
+- `package_manager.deno_json` and `package_manager.deno_lock` are already part of the protocol, but runtime-side dependency materialization is still incremental
+
+## 10. Baseline Operations
+
+The protocol can start with five runtime-facing operations.
+
+### 10.1 Register host
+
+```ts
+registerHost(input: HostRegistration): {
+  host_id: string;
+  accepted: boolean;
+  poll_after_ms?: number;
+}
+```
+
+### 10.2 Heartbeat host
+
+```ts
+heartbeatHost(input: {
+  host_id: string;
+  observed: ObservedHostState;
+}): {
+  accepted: boolean;
+  next_poll_after_ms?: number;
+}
+```
+
+### 10.3 Get desired host state
+
+```ts
+getDesiredHostState(input: {
+  host_id: string;
+  if_revision?: string;
+}): {
+  changed: boolean;
+  desired?: DesiredHostState;
+}
+```
+
+### 10.4 Report observed host state
+
+```ts
+reportObservedHostState(input: ObservedHostState): {
+  accepted: boolean;
+}
+```
+
+### 10.5 Fetch artifact manifest
+
+```ts
+fetchArtifactManifest(input: {
+  manifest_id: string;
+}): ArtifactManifest
+```
+
+## 11. Baseline HTTP Binding
+
+The first concrete transport can be a simple JSON-over-HTTP binding.
+
+Recommended `v1` paths:
+
+- `POST /v1/admin/hosts/register`
+- `POST /v1/admin/hosts/heartbeat`
+- `POST /v1/admin/hosts/desired`
+- `POST /v1/admin/hosts/observed`
+- `POST /v1/admin/artifacts/manifest`
+
+Recommended baseline behavior:
+
+- request body is JSON
+- response body is JSON
+- non-2xx responses are transport errors at the SDK layer
+- schema validation still runs on successful responses
+
+This binding is intentionally simple so it works for:
+
+- a real admin service
+- a mock admin service
+- local integration tests
+
+## 12. Reconciliation Loop
+
+The intended runtime loop is:
+
+1. runtime bootstraps with host identity and admin credentials
+2. runtime calls `registerHost(...)`
+3. runtime calls `getDesiredHostState(...)`
+4. runtime compares desired revision with its current local revision
+5. runtime prepares or updates local assignments
+6. runtime activates new local generations and drains old ones
+7. runtime reports `ObservedHostState`
+8. runtime repeats via heartbeat / polling
+
+This is a reconcile loop, not a push-command model.
+
+## 13. Mock-Friendly Constraint
+
+This protocol must work well with:
+
+- real admin implementation
+- mock admin implementation
+- unit tests
+- integration tests
+
+So:
+
+- payload shapes should stay explicit
+- responses should be deterministic
+- error shapes should be typed
+- transports should remain replaceable
+
+## 14. What Is Still Deferred
+
+This baseline protocol intentionally leaves these for later:
+
+- watch / stream-based desired-state push
+- advanced scheduler policy
+- affinity / anti-affinity semantics
+- canary / gray release semantics
+- multi-cluster federation
+- final admin auth model
+
+## 15. Recommended Next Step
+
+That first implementation slice is already done in the current repo:
+
+- shared TypeScript types
+- shared schema validation
+- mock admin adapter
+- runtime host-agent reconcile loop
+
+So the next protocol-facing TODO is no longer "define the protocol".
+
+It is:
+
+1. document the multi-node deployment rule for `service_module` so protocol
+   actions do not land on a WebSocket ingress node that does not carry the
+   required module
+2. finish the real admin publish / rollback shape beyond the current mock
+   admin flow
+
+Current implemented `service_module` replacement rule:
+
+- runtime keeps removed or replaced `service_module` assignments in local
+  `draining` state for a bounded grace window instead of unregistering
+  immediately
+- that drain window is node-local and grace-based, not per-socket version
+  pinning
+- during the grace window, `ObservedHostState.assignmentStatuses` still reports
+  the removed assignment as `draining`
+- once the grace window expires, runtime unregisters the old protocol module
+  and the draining assignment disappears from observed state
+- if the same assignment is re-added before the grace window expires, runtime
+  cancels the drain and keeps the module active
