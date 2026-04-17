@@ -127,6 +127,7 @@ Current implementation note:
 - when `packageManager.kind=\"bun\"` and `packageJson` is present, runtime also runs `bun install` in the staged artifact directory before activation
 - when `packageManager` declares Bun or Deno project files, runtime stages those files into the same local artifact directory using the worker source location as the resolution base
 - Deno project files are currently staged only; the Bun host runtime does not yet run a Deno-native prepare step
+- Bun artifact prepare now emits `artifact.prepare_ok`, `artifact.prepare_error`, `artifact.prepare_cache_hit`, `artifact.prepare_cache_miss`, and `artifact.prepare_ms`
 - remote artifact cache reuse is only considered stable when the main worker source carries a `digest`; without that, runtime will restage remote sources instead of trusting cached metadata
 
 ## Verification Env Vars

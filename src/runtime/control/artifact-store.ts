@@ -4,6 +4,7 @@ import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ArtifactManifest, ArtifactPackageManager, Assignment } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
+import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type PrepareRunner = (command: string, args: string[], options: { cwd: string }) => Promise<void>;
@@ -29,6 +30,7 @@ export interface ArtifactStoreOptions {
   fetchFn?: FetchLike;
   prepareRunner?: PrepareRunner;
   logger?: Logger;
+  metrics?: Metrics;
 }
 
 export class ArtifactStore {
@@ -36,12 +38,14 @@ export class ArtifactStore {
   private readonly fetchFn: FetchLike;
   private readonly prepareRunner: PrepareRunner;
   private readonly logger?: Logger;
+  private readonly metrics: Metrics;
 
   constructor(options: ArtifactStoreOptions) {
     this.rootDir = resolve(options.rootDir);
     this.fetchFn = options.fetchFn ?? fetch;
     this.prepareRunner = options.prepareRunner ?? defaultPrepareRunner;
     this.logger = options.logger;
+    this.metrics = options.metrics ?? new NoopMetrics();
   }
 
   async stageHttpWorker(
@@ -313,8 +317,10 @@ export class ArtifactStore {
     const prepareMetadataPath = join(stagePlan.artifactDir, ".artifact-prepare-meta.json");
     const currentPrepared = await readPreparedProjectState(prepareMetadataPath);
     if (currentPrepared?.key === prepareKey) {
+      this.metrics.increment("artifact.prepare_cache_hit");
       return;
     }
+    this.metrics.increment("artifact.prepare_cache_miss");
 
     const args = [
       "install",
@@ -329,29 +335,45 @@ export class ArtifactStore {
       args.push("--frozen-lockfile");
     }
 
-    await this.prepareRunner("bun", args, {
-      cwd: stagePlan.artifactDir
-    });
+    const startedAt = Date.now();
+    try {
+      await this.prepareRunner("bun", args, {
+        cwd: stagePlan.artifactDir
+      });
 
-    await writeFile(
-      prepareMetadataPath,
-      JSON.stringify(
-        {
-          key: prepareKey,
-          packageManagerKind: "bun",
-          preparedAt: Date.now()
-        },
-        null,
-        2
-      ),
-      "utf8"
-    );
+      await writeFile(
+        prepareMetadataPath,
+        JSON.stringify(
+          {
+            key: prepareKey,
+            packageManagerKind: "bun",
+            preparedAt: Date.now()
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
 
-    this.logger?.info("artifact project prepared", {
-      packageManager: "bun",
-      artifactDir: stagePlan.artifactDir,
-      entry: stagePlan.localEntry
-    });
+      this.metrics.increment("artifact.prepare_ok");
+      this.metrics.timing("artifact.prepare_ms", Date.now() - startedAt);
+
+      this.logger?.info("artifact project prepared", {
+        packageManager: "bun",
+        artifactDir: stagePlan.artifactDir,
+        entry: stagePlan.localEntry
+      });
+    } catch (error) {
+      this.metrics.increment("artifact.prepare_error");
+      this.metrics.timing("artifact.prepare_ms", Date.now() - startedAt);
+      this.logger?.warn("artifact project prepare failed", {
+        packageManager: "bun",
+        artifactDir: stagePlan.artifactDir,
+        entry: stagePlan.localEntry,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
   }
 
   private async readSource(sourceUri: string): Promise<string> {

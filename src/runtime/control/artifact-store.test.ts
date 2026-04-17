@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ArtifactManifest, Assignment } from "../../shared/index.ts";
+import { InMemoryMetrics } from "../observability/metrics.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 
 const cleanupPaths: string[] = [];
@@ -146,9 +147,11 @@ describe("ArtifactStore", () => {
     await writeFile(join(dir, "bun.lock"), JSON.stringify({ lockfileVersion: 1 }), "utf8");
 
     const prepareRunner = mock(async () => {});
+    const metrics = new InMemoryMetrics();
     const store = new ArtifactStore({
       rootDir: join(dir, "cache"),
-      prepareRunner
+      prepareRunner,
+      metrics
     });
 
     const result = await store.stageHttpWorker(createAssignment(sourcePath), {
@@ -185,6 +188,10 @@ describe("ArtifactStore", () => {
         cwd: join(dir, "cache", "manifest-http-1")
       }
     );
+    expect(metrics.counter("artifact.prepare_ok")).toBe(1);
+    expect(metrics.counter("artifact.prepare_cache_miss")).toBe(1);
+    expect(metrics.counter("artifact.prepare_cache_hit")).toBe(1);
+    expect(metrics.timings("artifact.prepare_ms")).toHaveLength(1);
   });
 
   it("stages deno project files when declared by the manifest", async () => {
@@ -197,9 +204,11 @@ describe("ArtifactStore", () => {
     await writeFile(join(dir, "deno.lock"), JSON.stringify({ version: "4" }), "utf8");
 
     const prepareRunner = mock(async () => {});
+    const metrics = new InMemoryMetrics();
     const store = new ArtifactStore({
       rootDir: join(dir, "cache"),
-      prepareRunner
+      prepareRunner,
+      metrics
     });
 
     await store.stageHttpWorker(createAssignment(sourcePath), {
@@ -219,6 +228,51 @@ describe("ArtifactStore", () => {
       '"version":"4"'
     );
     expect(prepareRunner).not.toHaveBeenCalled();
+    expect(metrics.counter("artifact.prepare_ok")).toBe(0);
+    expect(metrics.counter("artifact.prepare_cache_miss")).toBe(0);
+    expect(metrics.counter("artifact.prepare_cache_hit")).toBe(0);
+    expect(metrics.timings("artifact.prepare_ms")).toHaveLength(0);
+  });
+
+  it("records prepare errors when bun install fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-project-error-"));
+    cleanupPaths.push(dir);
+
+    const sourcePath = join(dir, "remote-worker.ts");
+    await writeFile(sourcePath, `export default { fetch() { return new Response("ok"); } };`, "utf8");
+    await writeFile(
+      join(dir, "package.json"),
+      JSON.stringify({
+        name: "demo-worker",
+        type: "module"
+      }),
+      "utf8"
+    );
+
+    const prepareRunner = mock(async () => {
+      throw new Error("install failed");
+    });
+    const metrics = new InMemoryMetrics();
+    const store = new ArtifactStore({
+      rootDir: join(dir, "cache"),
+      prepareRunner,
+      metrics
+    });
+
+    await expect(
+      store.stageHttpWorker(createAssignment(sourcePath), {
+        ...createManifest(`file://${sourcePath}`),
+        packageManager: {
+          kind: "bun",
+          packageJson: "package.json",
+          frozenLock: true
+        }
+      })
+    ).rejects.toThrow("install failed");
+
+    expect(metrics.counter("artifact.prepare_error")).toBe(1);
+    expect(metrics.counter("artifact.prepare_cache_miss")).toBe(1);
+    expect(metrics.timings("artifact.prepare_ms")).toHaveLength(1);
   });
 
   it("reuses staged artifact metadata for remote worker sources when a digest is present", async () => {

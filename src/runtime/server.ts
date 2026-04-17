@@ -351,7 +351,8 @@ try {
         (() => {
           const artifactStore = new ArtifactStore({
             rootDir: envString("ADMIN_ARTIFACT_ROOT_DIR") ?? ".hardess-admin-artifacts",
-            logger: app.logger
+            logger: app.logger,
+            metrics: app.metrics
           });
           const serviceModuleManager = new ServiceModuleManager({
             registry: app.registry,
