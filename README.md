@@ -2,30 +2,32 @@
 
 Hardess is a Bun-based gateway and realtime message hub for HTTP and WebSocket workloads.
 
-The repository already ships a working single-node path for `auth -> worker -> proxy`, a single-node WebSocket path with `sys.auth`, routing, ack flow, heartbeat, and quota or rate-limit baseline support, plus a static multi-node baseline with HTTP peer locate and an internal node-to-node WebSocket channel for cross-node delivery.
+It is not a slide-deck architecture repo. You can boot it, push traffic through it, and watch the current shape of the system: single-node HTTP, single-node WebSocket delivery, and a static multi-node baseline with cross-node relay.
 
-## Highlights
+## Why It Exists
 
-- Bun-native runtime for gateway and realtime messaging workloads
-- Single-node HTTP pipeline and WebSocket delivery path already running
-- Static multi-node baseline with cross-node relay support
-- Admin-projected local demo that exercises registration, reconcile, artifact staging, projection, and placement flow
-- SDK with structured client and remote error handling
-- Built-in verification, load tests, benchmark scripts, and release gates
+Hardess is aimed at the awkward middle ground between a tiny local prototype and a full control-plane-heavy edge platform.
 
-## Current Baseline
+Today the repo already covers:
 
-Today the repo covers:
-
-- HTTP path: `auth -> worker -> proxy`
-- WebSocket path: `sys.auth`, routing, ack flow, heartbeat, quota or rate-limit baseline
-- Multi-node baseline: HTTP peer locate plus an internal WS node channel for cross-node delivery
+- An HTTP path built around `auth -> worker -> proxy`
+- A WebSocket path with `sys.auth`, routing, ack flow, heartbeat, and quota or rate-limit baseline support
+- A static multi-node baseline with HTTP peer locate and node-to-node WebSocket delivery
 - Higher-level HTTP authoring through `serve(...)`
-- Group-local topology and routing projection driven by the admin mock stack
+- Group-local topology projection driven by the admin mock stack
 
-This is a strong local and design baseline, not a finished production cluster.
+The important qualifier is still the same: this is a serious local and design baseline, not a finished production cluster.
 
-## Quick Start
+## What Feels Real Already
+
+- The runtime is Bun-native end to end.
+- The single-node HTTP and WebSocket paths are already runnable.
+- Cross-node delivery is not hand-waved away; there is a concrete static baseline for it.
+- The admin-projected demo exercises registration, reconcile, artifact staging, projection, and placement.
+- The SDK already surfaces structured client-side and remote-side errors instead of forcing string parsing.
+- The repo includes verification, load tests, benchmarks, and release-gate scripts.
+
+## Start Here
 
 Install dependencies:
 
@@ -33,7 +35,7 @@ Install dependencies:
 bun install
 ```
 
-Run verification:
+Run the baseline verification pass:
 
 ```bash
 bun run verify
@@ -45,9 +47,11 @@ Clean runtime-generated shadow files:
 bun run clean
 ```
 
-## Local Demo
+If you only want one takeaway from this README, make it this: the fastest path to understanding Hardess is to run the demo flows, not to read the design docs first.
 
-### Quick Single-Node Flow
+## Run It Locally
+
+### Fast Single-Node Path
 
 Start the upstream demo:
 
@@ -61,22 +65,24 @@ Start Hardess:
 PORT=3000 bun run dev
 ```
 
-Exercise HTTP:
+Exercise the HTTP path:
 
 ```bash
 bun run demo:http
 ```
 
-Exercise WebSocket peers:
+Exercise the WebSocket path:
 
 ```bash
 PEER_ID=bob bun run demo:client
 PEER_ID=alice TARGET_PEER_ID=bob AUTO_SEND=true bun run demo:client
 ```
 
-### Admin-Projected Demo
+This flow is the quickest way to see the system move without involving the admin projection layer.
 
-The admin-projected flow is the better end-to-end demo right now. It exercises:
+### Better Demo: Admin-Projected Stack
+
+The admin-projected flow is the more representative local demo right now. It exercises:
 
 - host registration
 - desired-state reconcile
@@ -91,7 +97,7 @@ Run the full stack:
 bun run demo:stack
 ```
 
-Or start the four processes manually:
+Or run the four processes manually:
 
 ```bash
 bun run demo:upstream
@@ -105,11 +111,11 @@ Useful overrides for `demo:stack`:
 - `DEMO_STACK_RESET_ARTIFACTS=1` clears the two local artifact cache directories before boot
 - `DEMO_STACK_SHARED_DEPLOYMENT_REPLICAS=2` starts the mock admin with two shared owners
 
-For a walkthrough, see [docs/v1-admin-mock-demo.md](docs/v1-admin-mock-demo.md).
+For a full walkthrough, see [docs/v1-admin-mock-demo.md](docs/v1-admin-mock-demo.md).
 
 ## SDK Quick Start
 
-Recommended client flow:
+The recommended client flow is short and strict:
 
 1. `connect(...)`
 2. `waitUntilReady()`
@@ -182,7 +188,7 @@ SDK behavior notes:
 
 ## HTTP Authoring
 
-`worker` is still the lowest-level HTTP primitive:
+At the low end, `worker` is still the raw HTTP primitive:
 
 ```ts
 export default {
@@ -192,7 +198,7 @@ export default {
 };
 ```
 
-`serve` is the higher-level HTTP app form now supported by the runtime:
+At the higher level, the runtime now supports `serve(...)`:
 
 ```ts
 import { createApp, createRouter, defineServe } from "./src/sdk/index.ts";
@@ -221,12 +227,12 @@ Current `serve` behavior:
 
 ## Group Model
 
-The current `v1` group model is runtime-side, not client-side:
+The current `v1` group model lives on the runtime side, not on the client side:
 
 - `admin` is global and can manage multiple groups.
 - One `hardess` host belongs to exactly one group, decided at startup by `HOST_GROUP_ID`.
 - If `HOST_GROUP_ID` is omitted, that host joins the default group.
-- HTTP forwarding, WS peer locate, and cross-node relay stay inside the host's group-local topology.
+- HTTP forwarding, WebSocket peer locate, and cross-node relay stay inside the host's group-local topology.
 - Clients do not need to pass a `groupId`; upstream control-plane routing should send them to the correct host set.
 
 ## Verification, Load, And Release Gates
@@ -262,9 +268,9 @@ bun run release:gate:cluster
 bun run release:gate:cluster:local
 ```
 
-## Documentation
+## Read Next
 
-Getting started and operations:
+If you want to operate or understand the current system:
 
 - [Local demo walkthrough](docs/local-demo.md)
 - [v1 Admin mock demo](docs/v1-admin-mock-demo.md)
@@ -272,7 +278,7 @@ Getting started and operations:
 - [Load testing and weak-network simulation](docs/load-testing.md)
 - [Current local release baseline](docs/local-release-baseline.md)
 
-Architecture and protocol design:
+If you want the design and protocol detail:
 
 - [Architecture design and current status](docs/hardess-architecture.md)
 - [v1 Admin / control-plane design](docs/hardess-v1-admin-control-plane.md)
@@ -280,13 +286,13 @@ Architecture and protocol design:
 - [Dual-port cluster and Swarm design](docs/swarm-dual-port-cluster-design.md)
 - [Swarm v1 cluster deployment design](docs/swarm-v1-cluster-deployment.md)
 
-Research and assets:
+If you want research artifacts and experiments:
 
 - [Grafana dashboard template](docs/grafana-hardess-overview.dashboard.json)
 - [Pingora / workerd as Hardess v2 research](docs/research-pingora-for-hardess-v2.md)
 - [Experimental Pingora + Rust + TS runtime workspace](experiment/README.md)
 
-## Still Not Done
+## What Is Still Open
 
 - Production auth provider integration still replaces only the demo auth path.
 - The shared runtime-schema layer still has a small tail of ad hoc validation, mostly around the hot-path envelope fast parser and a few runtime helper guards.
