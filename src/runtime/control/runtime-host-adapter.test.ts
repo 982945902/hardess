@@ -1,5 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { DesiredHostState } from "../../shared/index.ts";
+import { InMemoryMetrics } from "../observability/metrics.ts";
 import { RuntimeHostAdapter } from "./runtime-host-adapter.ts";
 import { RuntimeTopologyStore } from "./topology-store.ts";
 
@@ -62,10 +63,15 @@ describe("RuntimeHostAdapter", () => {
       warn: mock(() => {}),
       error: mock(() => {})
     };
+    const metrics = new InMemoryMetrics();
+    metrics.increment("artifact.prepare_ok");
+    metrics.increment("artifact.prepare_cache_hit");
+    metrics.timing("artifact.prepare_ms", 12);
     const topologyStore = new RuntimeTopologyStore();
     const adapter = new RuntimeHostAdapter({
       app: {
         logger,
+        metrics,
         runtimeState: () => ({
           startedAt: 100,
           uptimeMs: 500,
@@ -135,6 +141,15 @@ describe("RuntimeHostAdapter", () => {
     expect(observed.dynamicState.appliedTopology).toEqual({
       membershipRevision: "topology:1:membership",
       placementRevision: "topology:1:placement"
+    });
+    expect(observed.dynamicState.dynamicFields?.metrics).toEqual({
+      counters: {
+        "artifact.prepare_ok": 1,
+        "artifact.prepare_cache_hit": 1
+      },
+      timingCounts: {
+        "artifact.prepare_ms": 1
+      }
     });
     expect(topologyStore.getTopology()?.membership.revision).toBe("topology:1:membership");
     expect(observed.assignmentStatuses[0]).toMatchObject({

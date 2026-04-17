@@ -170,6 +170,7 @@ Detailed per-variable examples and the full verification env reference live in [
 - `GET /__admin/ready`: readiness view; returns `503` after shutdown starts
 - `GET /__admin/metrics`: counter/timing snapshot from the configured metrics sink
 - `GET /__admin/metrics/prometheus`: Prometheus scrape endpoint
+- when admin host-agent mode is enabled, runtime also reports a compact metrics summary in `ObservedHostState.dynamicState.dynamicFields.metrics` so control-plane heartbeat/report traffic can carry counters and timing counts without shipping raw timing arrays
 - `GET /__admin/cluster/peers`: static cluster peer view for the current node
 
 Recommended minimum checks:

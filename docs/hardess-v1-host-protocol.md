@@ -95,6 +95,12 @@ type HostRegistration = {
 
 Notes:
 
+- `dynamic_state.dynamic_fields` is the extensibility surface for runtime-side
+  reporting that should not churn the protocol
+- runtime metrics may be reported here as a compact summary, for example
+  `metrics.counters` and `metrics.timing_counts`, instead of shipping full raw
+  timing sample arrays in every heartbeat
+
 - `host_id` is the admin-facing stable identity
 - `group_id` is the host's group boundary; one runtime host belongs to exactly
   one group, chosen at startup by `HOST_GROUP_ID`

@@ -9,6 +9,7 @@ import type {
 } from "../../shared/index.ts";
 import type { ConfigStore } from "../config/store.ts";
 import type { Logger } from "../observability/logger.ts";
+import type { Metrics, MetricsSnapshot, MetricsSnapshotProvider } from "../observability/metrics.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import type { HostRuntimeAdapter } from "./host-agent.ts";
 import type { ServiceModuleManager } from "./service-module-manager.ts";
@@ -25,6 +26,7 @@ interface RuntimeStateSnapshot {
 
 export interface RuntimeHostAdapterApp {
   logger: Logger;
+  metrics?: Metrics;
   runtimeState(): RuntimeStateSnapshot;
 }
 
@@ -190,6 +192,7 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
 
   collectObservedHostState(): ObservedHostState {
     const state = this.options.app.runtimeState();
+    const metricsSummary = summarizeMetrics(this.options.app.metrics);
     const assignments = this.lastDesired?.assignments ?? [];
     const drainingAssignments = this.options.serviceModuleManager?.listDrainingAssignments?.() ?? [];
     const assignmentStatuses = assignments.map((assignment) => {
@@ -243,7 +246,12 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
         dynamicFields: {
           uptimeMs: state.uptimeMs,
           disposed: state.disposed,
-          ...(this.options.observedDynamicFields ?? {})
+          ...(this.options.observedDynamicFields ?? {}),
+          ...(metricsSummary
+            ? {
+                metrics: metricsSummary
+              }
+            : {})
         }
       },
       assignmentStatuses
@@ -385,4 +393,34 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
       pipelines
     };
   }
+}
+
+function isMetricsSnapshotProvider(metrics: Metrics | undefined): metrics is MetricsSnapshotProvider {
+  return typeof (metrics as { snapshot?: unknown } | undefined)?.snapshot === "function";
+}
+
+function summarizeMetrics(
+  metrics: Metrics | undefined
+):
+  | {
+      counters: Record<string, number>;
+      timingCounts: Record<string, number>;
+    }
+  | undefined {
+  if (!isMetricsSnapshotProvider(metrics)) {
+    return undefined;
+  }
+
+  const snapshot = metrics.snapshot();
+  return summarizeMetricsSnapshot(snapshot);
+}
+
+function summarizeMetricsSnapshot(snapshot: MetricsSnapshot): {
+  counters: Record<string, number>;
+  timingCounts: Record<string, number>;
+} {
+  return {
+    counters: { ...snapshot.counters },
+    timingCounts: { ...snapshot.timingCounts }
+  };
 }
