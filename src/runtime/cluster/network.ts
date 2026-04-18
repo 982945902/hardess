@@ -26,6 +26,7 @@ interface ClusterPendingRequest {
 
 interface ClusterOutboundMessage {
   data: string;
+  bytes: number;
   resolve(): void;
   reject(error: Error): void;
 }
@@ -74,6 +75,7 @@ export interface ClusterNetworkOptions {
   sharedSecret?: string;
   requestTimeoutMs?: number;
   outboundMaxQueueMessages?: number;
+  outboundMaxQueueBytes?: number;
   outboundBackpressureRetryMs?: number;
   metrics?: Metrics;
   fetchFn?: typeof fetch;
@@ -108,10 +110,12 @@ function shouldFallbackToHttp(error: unknown): boolean {
 export class StaticClusterNetwork {
   private static readonly DEFAULT_OUTBOUND_BACKPRESSURE_RETRY_MS = 10;
   private static readonly DEFAULT_MAX_OUTBOUND_QUEUE_MESSAGES = 16_384;
+  private static readonly DEFAULT_MAX_OUTBOUND_QUEUE_BYTES = 8 * 1024 * 1024;
   private readonly peersByNodeId = new Map<string, ClusterPeerNode>();
   private readonly fetchFn: typeof fetch;
   private readonly requestTimeoutMs: number;
   private readonly outboundMaxQueueMessages: number;
+  private readonly outboundMaxQueueBytes: number;
   private readonly outboundBackpressureRetryMs: number;
   private readonly transport: ClusterTransport;
   private readonly socketFactory: (url: string) => ClusterSocket;
@@ -122,6 +126,7 @@ export class StaticClusterNetwork {
   private readonly nodeIdBySocket = new WeakMap<ClusterSocket, string>();
   private readonly serverSockets = new Set<ClusterSocket>();
   private readonly outboundQueueBySocket = new WeakMap<ClusterSocket, ClusterOutboundMessage[]>();
+  private readonly outboundQueuedBytesBySocket = new WeakMap<ClusterSocket, number>();
   private readonly outboundDrainTimerBySocket = new WeakMap<ClusterSocket, ReturnType<typeof setTimeout>>();
   private readonly outboundDrainScheduled = new WeakSet<ClusterSocket>();
   private serverHandlers?: ClusterServerHandlers;
@@ -135,6 +140,8 @@ export class StaticClusterNetwork {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.outboundMaxQueueMessages =
       options.outboundMaxQueueMessages ?? StaticClusterNetwork.DEFAULT_MAX_OUTBOUND_QUEUE_MESSAGES;
+    this.outboundMaxQueueBytes =
+      options.outboundMaxQueueBytes ?? StaticClusterNetwork.DEFAULT_MAX_OUTBOUND_QUEUE_BYTES;
     this.outboundBackpressureRetryMs =
       options.outboundBackpressureRetryMs ?? StaticClusterNetwork.DEFAULT_OUTBOUND_BACKPRESSURE_RETRY_MS;
     this.transport = options.transport ?? "http";
@@ -660,6 +667,7 @@ export class StaticClusterNetwork {
       entry.reject(new Error("Cluster socket closed"));
     }
     this.outboundQueueBySocket.delete(socket);
+    this.outboundQueuedBytesBySocket.delete(socket);
     const drainTimer = this.outboundDrainTimerBySocket.get(socket);
     if (drainTimer !== undefined) {
       clearTimeout(drainTimer);
@@ -730,6 +738,14 @@ export class StaticClusterNetwork {
     return created;
   }
 
+  private getOutboundQueuedBytes(socket: ClusterSocket): number {
+    return this.outboundQueuedBytesBySocket.get(socket) ?? 0;
+  }
+
+  private setOutboundQueuedBytes(socket: ClusterSocket, bytes: number): void {
+    this.outboundQueuedBytesBySocket.set(socket, bytes);
+  }
+
   private trySendNow(socket: ClusterSocket, data: string): boolean {
     if (socket.readyState === 3) {
       throw new Error("Cluster socket is closed");
@@ -790,9 +806,11 @@ export class StaticClusterNetwork {
         }
 
         queue.shift();
+        this.setOutboundQueuedBytes(socket, this.getOutboundQueuedBytes(socket) - next.bytes);
         next.resolve();
       } catch (error) {
         queue.shift();
+        this.setOutboundQueuedBytes(socket, this.getOutboundQueuedBytes(socket) - next.bytes);
         next.reject(error instanceof Error ? error : new Error(String(error)));
         try {
           socket.close(1011, "cluster outbound send failed");
@@ -826,13 +844,25 @@ export class StaticClusterNetwork {
     }
   }
 
+  private ensureQueueBytesWithinLimit(socket: ClusterSocket, nextBytes: number): void {
+    if (this.getOutboundQueuedBytes(socket) + nextBytes <= this.outboundMaxQueueBytes) {
+      return;
+    }
+
+    this.metrics.increment("cluster.egress_overflow");
+    throw new Error("Cluster outbound queue overflow");
+  }
+
   private async sendMessage(socket: ClusterSocket, data: string): Promise<void> {
     let queue = this.getOutboundQueue(socket);
+    const bytes = new TextEncoder().encode(data).byteLength;
 
     while (queue.length + 1 > this.outboundMaxQueueMessages) {
       await this.waitForQueueCapacity(socket);
       queue = this.getOutboundQueue(socket);
     }
+
+    this.ensureQueueBytesWithinLimit(socket, bytes);
 
     return await new Promise<void>((resolve, reject) => {
       if (
@@ -854,9 +884,11 @@ export class StaticClusterNetwork {
 
       queue.push({
         data,
+        bytes,
         resolve,
         reject
       });
+      this.setOutboundQueuedBytes(socket, this.getOutboundQueuedBytes(socket) + bytes);
       if (!this.outboundDrainTimerBySocket.has(socket)) {
         this.scheduleDrain(socket);
       }

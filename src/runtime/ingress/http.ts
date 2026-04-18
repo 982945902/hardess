@@ -25,6 +25,10 @@ export interface HttpRuntimeDeps {
   nodeId?: string;
   clusterSharedSecret?: string;
   topologyStore?: RuntimeTopologyStore;
+  internalForward?: {
+    httpTimeoutMs?: number;
+    wsConnectTimeoutMs?: number;
+  };
   serverRef: {
     upgrade(
       request: Request,
@@ -40,7 +44,8 @@ export interface HttpRuntimeDeps {
 const INTERNAL_FORWARD_HOP_HEADER = "x-hardess-forward-hop";
 const INTERNAL_FORWARD_PATH_HEADER = "x-hardess-forward-path";
 const MAX_INTERNAL_FORWARD_HOPS = 1;
-const INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_INTERNAL_FORWARD_HTTP_TIMEOUT_MS = 5_000;
+const DEFAULT_INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS = 5_000;
 
 function findPipeline(pathname: string, pipelines: PipelineConfig[]): PipelineConfig | undefined {
   return [...pipelines]
@@ -162,7 +167,8 @@ async function tryForwardInternally(
       response: await deps.upstreamWebSocketProxy.upgradeToTarget(
         request,
         deps.upstreamWebSocketProxy.buildForwardTarget(request, targetWsUrl.toString(), {
-          connectTimeoutMs: INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS,
+          connectTimeoutMs:
+            deps.internalForward?.wsConnectTimeoutMs ?? DEFAULT_INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS,
           extraHeaders: {
             [INTERNAL_FORWARD_HOP_HEADER]: String(input.forwardHop + 1),
             [INTERNAL_FORWARD_PATH_HEADER]: `${input.pathname}${input.search}`,
@@ -188,6 +194,12 @@ async function tryForwardInternally(
     headers.set("x-hardess-cluster-secret", deps.clusterSharedSecret);
   }
 
+  const controller = new AbortController();
+  const timeoutMs = deps.internalForward?.httpTimeoutMs ?? DEFAULT_INTERNAL_FORWARD_HTTP_TIMEOUT_MS;
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
   try {
     return {
       handled: true,
@@ -196,6 +208,7 @@ async function tryForwardInternally(
           method: request.method,
           headers,
           body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+          signal: controller.signal,
           redirect: "manual"
         })
       )
@@ -209,6 +222,34 @@ async function tryForwardInternally(
       targetBaseUrl: target.baseUrl,
       error: error instanceof Error ? error.message : String(error)
     });
-    return { handled: false };
+    if (controller.signal.aborted) {
+      throw new HardessError(
+        ERROR_CODES.GATEWAY_UPSTREAM_TIMEOUT,
+        `Internal forward timed out after ${timeoutMs}ms`,
+        {
+          retryable: true,
+          detail: {
+            targetNodeId: target.nodeId,
+            targetBaseUrl: target.baseUrl,
+            timeoutMs
+          }
+        }
+      );
+    }
+    throw new HardessError(
+      ERROR_CODES.GATEWAY_UPSTREAM_UNAVAILABLE,
+      "Internal forward target is unavailable",
+      {
+        retryable: true,
+        detail: {
+          targetNodeId: target.nodeId,
+          targetBaseUrl: target.baseUrl,
+          error: error instanceof Error ? error.message : String(error)
+        },
+        cause: error
+      }
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 }

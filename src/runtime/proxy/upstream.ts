@@ -35,58 +35,82 @@ function createUnavailableError(error: unknown): HardessError {
   );
 }
 
-async function readResponseBody(
+async function readResponseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number
+): Promise<Awaited<ReturnType<typeof reader.read>>> {
+  return await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      void reader.cancel().catch(() => {});
+      reject(createTimeoutError("response"));
+    }, timeoutMs);
+
+    void reader.read().then(
+      (result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
+}
+
+function createStreamingResponseBody(
   response: Response,
-  signal: AbortSignal
-): Promise<ArrayBuffer | undefined> {
+  timeoutMs: number
+): Promise<ReadableStream<Uint8Array> | undefined> {
   if (!response.body) {
-    return undefined;
+    return Promise.resolve(undefined);
   }
 
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
+  return (async () => {
+    const firstChunk = await readResponseChunk(reader, timeoutMs);
+    if (firstChunk.done) {
+      reader.releaseLock();
+      return undefined;
+    }
 
-  const abortPromise = new Promise<never>((_, reject) => {
-    signal.addEventListener(
-      "abort",
-      () => {
-        void reader.cancel().catch(() => {});
-        reject(createTimeoutError("response"));
+    let seeded = false;
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (firstChunk.value && !seeded) {
+          seeded = true;
+          controller.enqueue(firstChunk.value);
+        }
       },
-      { once: true }
-    );
-  });
+      async pull(controller) {
+        try {
+          const next = await readResponseChunk(reader, timeoutMs);
+          if (next.done) {
+            reader.releaseLock();
+            controller.close();
+            return;
+          }
 
-  const readPromise = (async () => {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+          if (next.value) {
+            controller.enqueue(next.value);
+          }
+        } catch (error) {
+          try {
+            reader.releaseLock();
+          } catch {}
+          controller.error(error);
+        }
+      },
+      async cancel() {
+        try {
+          await reader.cancel();
+        } catch {}
+        try {
+          reader.releaseLock();
+        } catch {}
       }
-
-      if (!value) {
-        continue;
-      }
-
-      chunks.push(value);
-      totalBytes += value.byteLength;
-    }
-
-    const body = new Uint8Array(totalBytes);
-    let offset = 0;
-    for (const chunk of chunks) {
-      body.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return body.buffer;
+    });
   })();
-
-  try {
-    return await Promise.race([readPromise, abortPromise]);
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 export async function proxyUpstream(
@@ -153,15 +177,10 @@ export async function proxyUpstream(
     clearTimeout(connectTimeout);
   }
 
-  const responseController = new AbortController();
-  const responseTimeout = setTimeout(() => {
-    responseController.abort();
-  }, pipeline.downstream.responseTimeoutMs);
-
   try {
-    // Bun fetch resolves once the upstream response is available; buffer the body so
-    // responseTimeout applies after the connect/header stage instead of racing it.
-    const body = await readResponseBody(upstreamResponse, responseController.signal);
+    // Wait for the first response chunk within responseTimeoutMs, then stream the rest
+    // with the same per-chunk timeout instead of buffering the whole upstream body.
+    const body = await createStreamingResponseBody(upstreamResponse, pipeline.downstream.responseTimeoutMs);
     const responseHeaders = new Headers(upstreamResponse.headers);
     for (const header of HOP_BY_HOP_HEADERS) {
       responseHeaders.delete(header);
@@ -184,7 +203,5 @@ export async function proxyUpstream(
     metrics.increment("http.upstream_unavailable");
     metrics.timing("http.upstream_ms", Date.now() - startedAt);
     throw createUnavailableError(error);
-  } finally {
-    clearTimeout(responseTimeout);
   }
 }

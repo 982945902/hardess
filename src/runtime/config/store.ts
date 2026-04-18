@@ -88,20 +88,25 @@ export class ModuleConfigStore implements ConfigStore {
       `.${basename(absolutePath, extname(absolutePath))}.hardess-config-${Date.now()}-${this.reloadCounter += 1}${extname(absolutePath)}`
     );
     await writeFile(shadowCopyPath, source, "utf8");
-    const moduleUrl = new URL(`file://${shadowCopyPath}`);
-    const loaded = await import(moduleUrl.href);
 
-    if (this.shadowCopyPath) {
-      await rm(this.shadowCopyPath, { force: true });
+    try {
+      const moduleUrl = new URL(`file://${shadowCopyPath}`);
+      const loaded = await import(moduleUrl.href);
+      const config = parseConfigModuleExport(loaded, {
+        exportName: this.exportName,
+        modulePath: this.modulePath
+      });
+
+      if (this.shadowCopyPath) {
+        await rm(this.shadowCopyPath, { force: true });
+      }
+      this.shadowCopyPath = shadowCopyPath;
+      await this.publishConfig(config, this.modulePath);
+      return config;
+    } catch (error) {
+      await rm(shadowCopyPath, { force: true });
+      throw error;
     }
-    this.shadowCopyPath = shadowCopyPath;
-
-    const config = parseConfigModuleExport(loaded, {
-      exportName: this.exportName,
-      modulePath: this.modulePath
-    });
-    await this.publishConfig(config, this.modulePath);
-    return config;
   }
 
   private async publishConfig(config: HardessConfig, source: string): Promise<void> {

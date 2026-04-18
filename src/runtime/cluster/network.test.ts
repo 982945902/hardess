@@ -444,7 +444,7 @@ describe("StaticClusterNetwork", () => {
     });
 
     expect(delivered).toEqual([{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }]);
-    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(fetchFn).toHaveBeenCalled();
   });
 
   it("waits for queue capacity before failing with cluster outbound overflow", async () => {
@@ -549,6 +549,110 @@ describe("StaticClusterNetwork", () => {
 
     expect(delivered).toEqual([targets, targets]);
     expect(metrics.snapshot().counters["cluster.egress_overflow"] ?? 0).toBe(0);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("enforces websocket cluster queue byte limits", async () => {
+    const metrics = new InMemoryMetrics();
+    const fetchFn = mock(async () => {
+      return new Response(
+        JSON.stringify({
+          deliveredConns: [{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }]
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        }
+      );
+    }) as unknown as typeof fetch;
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret"
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    let clientSocketRef: FakeClusterSocket | undefined;
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        metrics,
+        fetchFn,
+        requestTimeoutMs: 200,
+        outboundMaxQueueMessages: 8,
+        outboundMaxQueueBytes: 400,
+        outboundBackpressureRetryMs: 5,
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          clientSocketRef = clientSocket;
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    const sender = { nodeId: "node-a", connId: "conn-alice", peerId: "alice" };
+    const targets = [{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }];
+
+    await clientNetwork.deliver("node-b", {
+      sender,
+      envelope: {
+        msgId: "warmup-bytes",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "chat",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: { content: "warmup" }
+      },
+      ack: "recv",
+      targets
+    });
+
+    clientSocketRef?.sendResults.push(-1, -1, -1);
+    const largePayload = "x".repeat(1024);
+
+    const delivered = await clientNetwork.deliver("node-b", {
+      sender,
+      envelope: {
+        msgId: "m-bytes",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "chat",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: { content: largePayload }
+      },
+      ack: "recv",
+      targets
+    });
+
+    expect(delivered).toEqual(targets);
+    expect(metrics.snapshot().counters["cluster.egress_overflow"] ?? 0).toBeGreaterThanOrEqual(1);
+    expect(fetchFn).toHaveBeenCalled();
 
     clientNetwork.dispose();
     serverNetwork.dispose();

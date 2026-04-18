@@ -37,6 +37,7 @@ export interface RuntimeAppOptions {
     sharedSecret?: string;
     requestTimeoutMs?: number;
     outboundMaxQueueMessages?: number;
+    outboundMaxQueueBytes?: number;
     outboundBackpressureRetryMs?: number;
     locatorCacheTtlMs?: number;
     fetchFn?: typeof fetch;
@@ -76,6 +77,10 @@ export interface RuntimeAppOptions {
   };
   upstreamWebSocket?: {
     socketFactory?: UpstreamWebSocketFactory;
+  };
+  internalForward?: {
+    httpTimeoutMs?: number;
+    wsConnectTimeoutMs?: number;
   };
 }
 
@@ -146,6 +151,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     sharedSecret: options.cluster?.sharedSecret,
     requestTimeoutMs: options.cluster?.requestTimeoutMs,
     outboundMaxQueueMessages: options.cluster?.outboundMaxQueueMessages,
+    outboundMaxQueueBytes: options.cluster?.outboundMaxQueueBytes,
     outboundBackpressureRetryMs: options.cluster?.outboundBackpressureRetryMs,
     metrics,
     fetchFn: options.cluster?.fetchFn,
@@ -217,7 +223,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     maxConnectionsPerPeer: options.websocket?.maxConnectionsPerPeer,
     rateLimit: options.websocket?.rateLimit,
     outbound: options.websocket?.outbound,
-      shutdownGraceMs: options.websocket?.shutdownGraceMs
+    shutdownGraceMs: options.websocket?.shutdownGraceMs
   });
   const upstreamWebSocketProxy = new UpstreamWebSocketProxyRuntime({
     logger,
@@ -543,6 +549,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
             nodeId,
             clusterSharedSecret: options.cluster?.sharedSecret,
             topologyStore,
+            internalForward: options.internalForward,
             serverRef,
             upstreamWebSocketProxy
           });
@@ -591,6 +598,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
               nodeId,
               clusterSharedSecret: options.cluster?.sharedSecret,
               topologyStore,
+              internalForward: options.internalForward,
               serverRef,
               upstreamWebSocketProxy
             });
@@ -690,6 +698,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           nodeId,
           clusterSharedSecret: options.cluster?.sharedSecret,
           topologyStore,
+          internalForward: options.internalForward,
           serverRef,
           upstreamWebSocketProxy
         });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { FSWatcher } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { ModuleConfigStore } from "./store.ts";
@@ -239,6 +239,44 @@ describe("ModuleConfigStore", () => {
 
     const store = new ModuleConfigStore(configPath);
     await expect(store.reload()).rejects.toThrow("connectTimeoutMs must be > 0");
+    store.dispose();
+  });
+
+  it("cleans up failed shadow copies after a reload error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-shadow-cleanup-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: []
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    await store.reload();
+
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: [
+          {
+            id: "demo-http",
+            matchPrefix: "/demo",
+            downstream: {
+              origin: "http://127.0.0.1:9000",
+              connectTimeoutMs: 0,
+              responseTimeoutMs: 5000
+            }
+          }
+        ]
+      };`
+    );
+
+    await expect(store.reload()).rejects.toThrow("connectTimeoutMs must be > 0");
+    const hardessShadowCopies = (await readdir(dir)).filter((entry) => entry.startsWith(".hardess.config"));
+    expect(hardessShadowCopies).toHaveLength(1);
     store.dispose();
   });
 
