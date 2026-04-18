@@ -309,7 +309,7 @@ Why this shape exists:
 1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.
 2. `deliver` and `handleAck` are the hotter cross-node path, so moving them onto a reused internal channel removes repeated HTTP setup overhead.
 3. This is still an admin-projected cluster baseline, not a fully distributed membership or durable routing system; the current health overlay is only the first SWIM-ish step.
-4. The current direction is rumor-style liveness dissemination plus a periodic anti-entropy repair path, while keeping admin as the sole owner of desired topology.
+4. The current direction is rumor-style liveness dissemination plus a periodic digest-based anti-entropy repair path, while keeping admin as the sole owner of desired topology.
 
 Deployment note:
 1. The current implementation now supports both single-listener and dual-listener deployment; the intended dual-port shape is still single-process with business ingress and control traffic separated while sharing one runtime state. See [swarm-dual-port-cluster-design.md](swarm-dual-port-cluster-design.md).

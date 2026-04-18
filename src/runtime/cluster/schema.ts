@@ -73,6 +73,23 @@ const clusterPeerHealthRumorMessageSchema = z.object({
   lastAliveAt: z.number().optional()
 });
 
+const clusterPeerHealthDigestMessageSchema = z.object({
+  type: z.literal("peerHealthDigest"),
+  digests: z.array(
+    z.object({
+      peerNodeId: z.string().min(1, "peerNodeId is required"),
+      status: clusterPeerHealthStatusSchema,
+      incarnation: z.number().int().min(1, "incarnation must be >= 1"),
+      lastAliveAt: z.number().optional()
+    })
+  )
+});
+
+const clusterPeerHealthRepairRequestMessageSchema = z.object({
+  type: z.literal("peerHealthRepairRequest"),
+  peerNodeIds: z.array(z.string().min(1, "peerNodeId is required")).min(1)
+});
+
 const clusterPeerHealthSyncMessageSchema = z.object({
   type: z.literal("peerHealthSync"),
   rumors: z.array(
@@ -136,6 +153,8 @@ const clusterSocketMessageSchema = z.discriminatedUnion("type", [
   clusterPingMessageSchema,
   clusterPongMessageSchema,
   clusterPeerHealthRumorMessageSchema,
+  clusterPeerHealthDigestMessageSchema,
+  clusterPeerHealthRepairRequestMessageSchema,
   clusterPeerHealthSyncMessageSchema,
   clusterDeliverMessageSchema,
   clusterDeliverResultMessageSchema,
@@ -167,6 +186,19 @@ export type ClusterSocketMessage =
       status: Exclude<ClusterPeerHealthStatus, "unknown">;
       incarnation: number;
       lastAliveAt?: number;
+    }
+  | {
+      type: "peerHealthDigest";
+      digests: Array<{
+        peerNodeId: string;
+        status: Exclude<ClusterPeerHealthStatus, "unknown">;
+        incarnation: number;
+        lastAliveAt?: number;
+      }>;
+    }
+  | {
+      type: "peerHealthRepairRequest";
+      peerNodeIds: string[];
     }
   | {
       type: "peerHealthSync";
