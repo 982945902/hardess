@@ -10,7 +10,7 @@ import type { ConfigStore } from "../config/store.ts";
 import type { RuntimeTopologyStore } from "../control/topology-store.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
-import { proxyUpstream } from "../proxy/upstream.ts";
+import { proxyUpstream, withResponseReadTimeout } from "../proxy/upstream.ts";
 import {
   isWebSocketUpgradeRequest,
   UpstreamWebSocketProxyRuntime
@@ -201,16 +201,21 @@ async function tryForwardInternally(
   }, timeoutMs);
 
   try {
+    const forwardedResponse = await fetch(
+      new Request(targetUrl, {
+        method: request.method,
+        headers,
+        body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+        signal: controller.signal,
+        redirect: "manual"
+      })
+    );
+
     return {
       handled: true,
-      response: await fetch(
-        new Request(targetUrl, {
-          method: request.method,
-          headers,
-          body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
-          signal: controller.signal,
-          redirect: "manual"
-        })
+      response: await withResponseReadTimeout(
+        forwardedResponse,
+        timeoutMs
       )
     };
   } catch (error) {

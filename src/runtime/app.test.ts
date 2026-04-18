@@ -1210,13 +1210,22 @@ describe("createRuntimeApp", () => {
   it("waits for in-flight http requests to drain during shutdown", async () => {
     let releaseUpstream!: () => void;
     globalThis.fetch = mock(async () => {
-      await new Promise<void>((resolve) => {
-        releaseUpstream = resolve;
-      });
-
-      return Response.json({
-        ok: true
-      });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"ok":'));
+            releaseUpstream = () => {
+              controller.enqueue(new TextEncoder().encode("true}"));
+              controller.close();
+            };
+          }
+        }),
+        {
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
     }) as unknown as typeof fetch;
 
     const app = await createRuntimeApp({
@@ -1225,7 +1234,7 @@ describe("createRuntimeApp", () => {
     });
     appDisposers.push(() => app.dispose());
 
-    const requestPromise = app.fetch(
+    const response = await app.fetch(
       new Request("http://localhost/demo/slow", {
         headers: {
           authorization: "Bearer demo:alice"
@@ -1248,10 +1257,12 @@ describe("createRuntimeApp", () => {
     expect(drainedBeforeRelease).toBe(false);
 
     releaseUpstream();
-    const response = await requestPromise;
+    expect(response?.status).toBe(200);
+    await expect(response!.json()).resolves.toEqual({
+      ok: true
+    });
     const drained = await app.waitForHttpDrain({ timeoutMs: 50, pollIntervalMs: 1 });
 
-    expect(response?.status).toBe(200);
     expect(drained).toBe(true);
     expect(app.runtimeState().inFlightHttpRequests).toBe(0);
   });
