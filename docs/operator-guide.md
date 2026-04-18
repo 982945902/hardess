@@ -53,6 +53,49 @@ HTTP proxy timeout semantics:
 - when a pipeline sets `downstream.websocket=true`, websocket upgrade requests on that matched path are proxied to the downstream origin instead of using the normal HTTP fetch path
 - for upstream websocket proxying, `connectTimeoutMs` still applies to the upstream websocket connect handshake; `responseTimeoutMs` remains HTTP-response specific
 
+## Timeout Matrix
+
+The runtime now resolves and validates its timeout-related env at startup instead of silently falling back on malformed values. On boot, the effective timeout profile is also logged under `timeoutProfile`.
+
+Runtime env timeouts:
+
+| Scope | Setting | Env | Default | Notes |
+| --- | --- | --- | --- | --- |
+| process | server idle timeout | `SERVER_IDLE_TIMEOUT_SECS` | unset | Bun listener idle timeout in seconds; optional, validated when set |
+| process | shutdown pre-stop drain | `SHUTDOWN_DRAIN_MS` | `250` | non-ready wait before stopping listeners; may be `0` |
+| process | shutdown hard deadline | `SHUTDOWN_TIMEOUT_MS` | `10000` | hard stop budget; must stay `>= SHUTDOWN_DRAIN_MS` |
+| websocket ingress | heartbeat interval | `WS_HEARTBEAT_INTERVAL_MS` | `25000` | ping cadence for connected peers |
+| websocket ingress | stale timeout | `WS_STALE_AFTER_MS` | `60000` | stale cutoff; must be greater than heartbeat interval |
+| websocket ingress | shutdown grace | `WS_SHUTDOWN_GRACE_MS` | `3000` | grace window for existing WS sessions after shutdown starts |
+| websocket ingress | outbound retry backoff | `WS_OUTBOUND_BACKPRESSURE_RETRY_MS` | `10` | retry delay after Bun reports WS backpressure |
+| cluster transport | request timeout | `CLUSTER_REQUEST_TIMEOUT_MS` | `10000` | locate and request-response timeout for cluster traffic |
+| cluster transport | locate cache TTL | `CLUSTER_LOCATOR_CACHE_TTL_MS` | `250` | not a timeout budget, but part of cluster timing behavior; may be `0` |
+| cluster transport | outbound retry backoff | `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS` | `10` | retry delay after control-channel backpressure |
+| internal forward | internal HTTP forward timeout | `INTERNAL_FORWARD_HTTP_TIMEOUT_MS` | `5000` | applies to body reads too, not just headers |
+| internal forward | internal WS connect timeout | `INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS` | `5000` | connect budget for forwarded WS upgrades |
+| admin host-agent | reconcile poll interval | `ADMIN_POLL_AFTER_MS` | `5000` | default next-poll delay after a healthy cycle |
+| admin host-agent | retry poll interval | `ADMIN_RETRY_POLL_AFTER_MS` | `1000` | retry delay after reconcile/report failure |
+| admin host-agent | generated pipeline connect timeout | `ADMIN_DEFAULT_CONNECT_TIMEOUT_MS` | `1000` | default `downstream.connectTimeoutMs` for admin-projected `http_worker` assignments |
+| admin host-agent | generated pipeline response timeout | `ADMIN_DEFAULT_RESPONSE_TIMEOUT_MS` | `5000` | default `downstream.responseTimeoutMs` for admin-projected `http_worker` assignments |
+| admin host-agent | generated worker timeout | `ADMIN_DEFAULT_WORKER_TIMEOUT_MS` | `1000` | default `worker.timeoutMs` for admin-projected `http_worker` assignments |
+| admin host-agent | service-module drain grace | `SERVICE_MODULE_DRAIN_GRACE_MS` | `3000` | local grace window before removed service modules are unregistered |
+
+Config-file timeouts:
+
+| Scope | Setting | Where | Default | Notes |
+| --- | --- | --- | --- | --- |
+| downstream HTTP | upstream connect timeout | `pipeline.downstream.connectTimeoutMs` | required | required per pipeline; validated by config schema |
+| downstream HTTP | upstream response-body timeout | `pipeline.downstream.responseTimeoutMs` | required | required per pipeline; enforced while streaming body chunks |
+| worker | worker execution timeout | `pipeline.worker.timeoutMs` | optional | only applies when a worker is configured on the pipeline |
+
+SDK timeouts:
+
+| Scope | Setting | Where | Default | Notes |
+| --- | --- | --- | --- | --- |
+| runtime client | recvAck timeout | `deliveryTimeoutMs.recvAckMs` | `5000` | client-side tracked delivery timeout |
+| runtime client | handleAck timeout | `deliveryTimeoutMs.handleAckMs` | `15000` | client-side tracked delivery timeout |
+| runtime client | readiness wait timeout | `waitUntilReady({ timeoutMs })` | unset | optional per-call timeout while waiting for auth readiness |
+
 WebSocket ingress / egress:
 
 - `WS_HEARTBEAT_INTERVAL_MS`: heartbeat interval
