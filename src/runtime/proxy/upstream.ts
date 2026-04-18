@@ -113,6 +113,18 @@ function createStreamingResponseBody(
   })();
 }
 
+export async function withResponseReadTimeout(
+  response: Response,
+  timeoutMs: number
+): Promise<Response> {
+  const body = await createStreamingResponseBody(response, timeoutMs);
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers)
+  });
+}
+
 export async function proxyUpstream(
   request: Request,
   pipeline: PipelineConfig,
@@ -180,17 +192,20 @@ export async function proxyUpstream(
   try {
     // Wait for the first response chunk within responseTimeoutMs, then stream the rest
     // with the same per-chunk timeout instead of buffering the whole upstream body.
-    const body = await createStreamingResponseBody(upstreamResponse, pipeline.downstream.responseTimeoutMs);
-    const responseHeaders = new Headers(upstreamResponse.headers);
+    const response = await withResponseReadTimeout(
+      upstreamResponse,
+      pipeline.downstream.responseTimeoutMs
+    );
+    const responseHeaders = new Headers(response.headers);
     for (const header of HOP_BY_HOP_HEADERS) {
       responseHeaders.delete(header);
     }
 
     metrics.increment("http.upstream_ok");
     metrics.timing("http.upstream_ms", Date.now() - startedAt);
-    return new Response(body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
       headers: responseHeaders
     });
   } catch (error) {

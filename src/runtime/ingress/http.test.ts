@@ -461,4 +461,85 @@ describe("handleHttpRequest", () => {
     expect(metrics.counter("http.internal_forward_error")).toBe(1);
     expect(metrics.counter("http.error")).toBe(1);
   });
+
+  it("applies internal forward body read timeouts after headers are received", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"ok":'));
+            await Bun.sleep(20);
+            controller.enqueue(new TextEncoder().encode("true}"));
+            controller.close();
+          }
+        }),
+        {
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const topologyStore = new RuntimeTopologyStore();
+    topologyStore.setTopology({
+      membership: {
+        revision: "topology:3:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-b",
+            nodeId: "node-b",
+            internalBaseUrl: "http://host-b.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:3:placement",
+        generatedAt: 1,
+        deployments: [
+          {
+            deploymentId: "deployment:demo-http",
+            deploymentKind: "http_worker",
+            ownerHostIds: ["host-b"],
+            routes: [
+              {
+                routeId: "route:demo-http",
+                pathPrefix: "/demo",
+                ownerHostIds: ["host-b"]
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice",
+          "x-trace-id": "trace-internal-stream-timeout"
+        }
+      }),
+      {
+        ...createHttpDeps({ pipelines: [] }, metrics),
+        nodeId: "node-a",
+        topologyStore,
+        internalForward: {
+          httpTimeoutMs: 5
+        }
+      }
+    );
+
+    expect(response?.status).toBe(200);
+    await expect(response!.text()).rejects.toThrow("Upstream request timed out");
+    expect(metrics.counter("http.error")).toBe(0);
+  });
 });

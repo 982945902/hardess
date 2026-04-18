@@ -111,6 +111,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function cloneResponseWithBody(response: Response, body: ReadableStream<Uint8Array> | null): Response {
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers)
+  });
+}
+
 function isMetricsSnapshotProvider(metrics: Metrics): metrics is MetricsSnapshotProvider {
   return typeof (metrics as { snapshot?: unknown }).snapshot === "function";
 }
@@ -206,6 +214,71 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   let shuttingDown = false;
   let disposed = false;
   let inFlightHttpRequests = 0;
+
+  function beginTrackedHttpRequest(): () => void {
+    inFlightHttpRequests += 1;
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      inFlightHttpRequests -= 1;
+    };
+  }
+
+  function trackHttpResponseLifecycle(
+    response: Response | undefined,
+    release: () => void
+  ): Response | undefined {
+    if (!response) {
+      release();
+      return response;
+    }
+
+    if (!response.body) {
+      release();
+      return response;
+    }
+
+    const reader = response.body.getReader();
+    const trackedBody = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const next = await reader.read();
+          if (next.done) {
+            try {
+              reader.releaseLock();
+            } catch {}
+            release();
+            controller.close();
+            return;
+          }
+
+          if (next.value) {
+            controller.enqueue(next.value);
+          }
+        } catch (error) {
+          try {
+            reader.releaseLock();
+          } catch {}
+          release();
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason);
+        } catch {}
+        try {
+          reader.releaseLock();
+        } catch {}
+        release();
+      }
+    });
+
+    return cloneResponseWithBody(response, trackedBody);
+  }
 
   const websocket = createWebSocketHandlers({
     nodeId,
@@ -588,9 +661,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
             redirect: "manual"
           });
 
-          inFlightHttpRequests += 1;
+          const releaseHttpRequest = beginTrackedHttpRequest();
           try {
-            return await handleHttpRequest(forwardedRequest, {
+            const response = await handleHttpRequest(forwardedRequest, {
               configStore,
               authService,
               logger,
@@ -602,8 +675,10 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
               serverRef,
               upstreamWebSocketProxy
             });
-          } finally {
-            inFlightHttpRequests -= 1;
+            return trackHttpResponseLifecycle(response, releaseHttpRequest);
+          } catch (error) {
+            releaseHttpRequest();
+            throw error;
           }
         } catch (error) {
           return json(
@@ -688,9 +763,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 426 });
       }
 
-      inFlightHttpRequests += 1;
+      const releaseHttpRequest = beginTrackedHttpRequest();
       try {
-        return await handleHttpRequest(request, {
+        const response = await handleHttpRequest(request, {
           configStore,
           authService,
           logger,
@@ -702,8 +777,10 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           serverRef,
           upstreamWebSocketProxy
         });
-      } finally {
-        inFlightHttpRequests -= 1;
+        return trackHttpResponseLifecycle(response, releaseHttpRequest);
+      } catch (error) {
+        releaseHttpRequest();
+        throw error;
       }
     }
   };
