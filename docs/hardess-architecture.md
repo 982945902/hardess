@@ -87,7 +87,7 @@ Partially completed:
 2. Auth integration is partially implemented: the shared `AuthService` abstraction, provider dispatch, expiry checks, and revocation path exist, but only the local demo provider is wired today.
 3. WebSocket backpressure and egress governance are partially implemented: Bun send-status handling, bounded queueing, socket buffered-amount limits, retry-on-backpressure, and overflow close behavior now exist, but deeper transport-specific flow-control tuning may still be needed under heavier production traffic.
 4. Runtime operational polish is partially implemented: config/worker reload, health/readiness, graceful shutdown with drain window, startup-failure handling, repo-level workflow docs, an operator guide, automated local release-gate execution, SLO-aware release-gate checks, and SLO-aware cluster benchmarking are in place, but broader deployment integration is still environment-specific.
-5. Multi-node scalability boundaries are partially implemented: a static-peer distributed `PeerLocator`, cached remote lookup, HTTP locate, control-WebSocket-based cross-node delivery / handle-ack forwarding, and an HTTP fallback transport mode now exist, but membership and stronger coordination are still intentionally simple.
+5. Multi-node scalability boundaries are partially implemented: a distributed `PeerLocator`, cached remote lookup, HTTP locate, control-WebSocket-based cross-node delivery / handle-ack forwarding, an HTTP fallback transport mode, and admin-projected topology narrowing now exist, but stronger runtime health coordination is still intentionally simple.
 6. Runtime-schema standardization is partially implemented: the highest-value boundaries now use a shared schema layer, including cluster env and control HTTP/admin response parsing plus the worker-module export boundary, but a small tail still remains in the hot-path envelope fast parser and a few runtime helper guards.
 7. ACL / capability enforcement is partially implemented: the `authorize` hook exists and the built-in `demo.send` / `chat.send` path now requires `notify.conn`, but a broader default capability policy for future injected protocols is still open.
 8. Some SDK ergonomics remain intentionally thin above the current sender-side delivery baseline: `emit`, `emitTracked`, `waitForResult`, and `send` now cover the common cases, but request/reply-style business abstractions are still protocol-level decisions rather than a fixed core contract.
@@ -96,7 +96,7 @@ Not started or intentionally deferred:
 1. External `AuthProvider` integration is intentionally deferred until the external auth-service contract is stable.
 2. Stronger worker isolation beyond same-process Bun execution is deferred to Phase 2.
 3. Persistent offline storage, replay, and exactly-once semantics are out of MVP scope and not started.
-4. Dynamic cluster membership, shared distributed routing state, and non-static topology management are deferred beyond the current static multi-node baseline.
+4. Gossip-style health convergence, shared distributed routing state, and other stronger scale-out coordination are deferred beyond the current admin-projected multi-node baseline.
 5. Control plane route/worker version management UI is out of MVP scope and not started.
 
 TODO / still open:
@@ -105,7 +105,7 @@ TODO / still open:
 3. Medium priority: define and calibrate cluster latency / degradation SLOs per deployment tier. The benchmark runner and release gates now support layered built-in `local` / `high` envelopes plus explicit overrides, but the acceptable envelope is still workload-specific.
 4. Medium priority: finish observability environment integration beyond the current bounded metrics, threshold-log, and Prometheus-export baseline.
 5. Medium priority: improve deployment automation and runtime operational polish beyond the current local release-gate and graceful-shutdown baseline.
-6. Lower priority: decide whether the static cluster transport baseline should evolve toward a shared registry, gossip, or service-discovery-backed `PeerLocator` once scale-out requirements are clearer.
+6. Lower priority: decide whether the admin-projected cluster baseline should gain a gossip health overlay, shared registry support, or broader service-discovery-backed peer inputs once scale-out requirements are clearer.
 7. Deferred by dependency: external `AuthProvider` integration should follow the external auth-service contract rather than lead MVP scope.
 8. Deferred pending upstream standard: finish the default ACL / capability policy for injected protocol actions. The hook exists and built-in direct-notify-style actions now enforce `notify.conn`, but the broader policy should wait for the upstream integration contract rather than churn locally.
 
@@ -131,7 +131,7 @@ Current implementation priority after deferring external auth integration:
 4. Keep the default ACL / capability policy for injected protocols deferred until the upstream integration contract is stable.
 
 Can defer for single-node release:
-1. Dynamic cluster membership, stronger distributed routing state, and other scale-out architecture work beyond the current static cluster baseline.
+1. Gossip health overlay, stronger distributed routing state, and other scale-out architecture work beyond the current admin-projected cluster baseline.
 2. Stronger worker isolation via process or isolate boundaries.
 3. Persistent offline storage, replay, and exactly-once delivery semantics.
 4. Control-plane route/worker version management UI.
@@ -292,22 +292,24 @@ Rules:
 1. All `peerId -> ConnRef[]` expansion must go through `PeerLocator`.
 2. The current repo ships two implementations: local in-memory lookup for single-node mode and a static-peer distributed lookup that merges local indexes with cached remote lookups.
 3. `ConnRef` always includes `nodeId`, even in single-node mode.
-4. Cluster peer membership is currently static and configured per node; stronger distributed coordination or service-discovery-backed membership can replace this without changing protocol hooks or SDK contracts.
+4. Cluster peer input can come from static config or admin-projected topology; stronger distributed coordination such as a gossip health overlay can be added later without changing protocol hooks or SDK contracts.
 
-### 6.5 Static Cluster Transport Baseline
+### 6.5 Admin-Projected Cluster Transport Baseline
 The current multi-node transport is intentionally hybrid rather than fully distributed.
 
 Current behavior:
-1. Peer discovery still uses control HTTP `POST /__cluster/locate` against the statically configured peer list.
+1. Peer discovery still uses control HTTP `POST /__cluster/locate` against the current runtime peer set, which may come from static config or an admin-projected topology snapshot.
 2. Cross-node message delivery and cross-node `sys.handleAck` forwarding use a long-lived control WebSocket channel at `GET /__cluster/ws`.
 3. The runtime server defaults `CLUSTER_TRANSPORT` to `ws`; `http` remains supported as a compatibility and fallback mode, and the `ws` mode can degrade individual requests back to the control HTTP endpoints when the WS channel is temporarily unavailable or backpressured.
 4. The optional shared secret is enforced on HTTP locate requests and during the control WebSocket `hello` handshake.
 5. Distributed peer discovery is narrowed by the host's group-local topology on both the local connection table and the remote locate probe set derived from topology; clients do not select that group directly.
+6. The runtime health overlay now keeps admin-projected peers annotated with local liveness, using passive channel observations, active WS `ping/pong` probes, and rumor-style WS health dissemination; `suspect` and `dead` only affect local forwarding preference and retry behavior, not control-plane membership.
 
 Why this shape exists:
 1. `locate` is small request/response metadata, so plain HTTP stays simple and sufficient.
 2. `deliver` and `handleAck` are the hotter cross-node path, so moving them onto a reused internal channel removes repeated HTTP setup overhead.
-3. This is still a static-cluster baseline, not a distributed membership or durable routing system.
+3. This is still an admin-projected cluster baseline, not a fully distributed membership or durable routing system; the current health overlay is only the first SWIM-ish step.
+4. The current direction is rumor-style liveness dissemination plus a periodic anti-entropy repair path, while keeping admin as the sole owner of desired topology.
 
 Deployment note:
 1. The current implementation now supports both single-listener and dual-listener deployment; the intended dual-port shape is still single-process with business ingress and control traffic separated while sharing one runtime state. See [swarm-dual-port-cluster-design.md](swarm-dual-port-cluster-design.md).

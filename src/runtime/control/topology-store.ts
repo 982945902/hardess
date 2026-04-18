@@ -1,4 +1,5 @@
 import type { ClusterPeerNode } from "../cluster/network.ts";
+import type { ClusterPeerHealthStatus } from "../cluster/health.ts";
 import type { DesiredTopology, MembershipHost } from "../../shared/index.ts";
 
 type TopologyListener = (topology: DesiredTopology | undefined) => void;
@@ -14,6 +15,7 @@ export interface ResolvedHttpRouteTarget {
 export class RuntimeTopologyStore {
   private topology?: DesiredTopology;
   private readonly listeners = new Set<TopologyListener>();
+  private readonly runtimePeerHealthByNodeId = new Map<string, ClusterPeerHealthStatus>();
 
   setTopology(topology: DesiredTopology | undefined): void {
     this.topology = topology;
@@ -33,6 +35,20 @@ export class RuntimeTopologyStore {
     };
   }
 
+  setRuntimePeerHealth(nodeId: string, status: ClusterPeerHealthStatus): void {
+    this.runtimePeerHealthByNodeId.set(nodeId, status);
+  }
+
+  clearRuntimePeerHealth(nodeIds: string[]): void {
+    const allowedNodeIds = new Set(nodeIds);
+    for (const nodeId of this.runtimePeerHealthByNodeId.keys()) {
+      if (allowedNodeIds.has(nodeId)) {
+        continue;
+      }
+      this.runtimePeerHealthByNodeId.delete(nodeId);
+    }
+  }
+
   listClusterPeers(selfNodeId?: string): ClusterPeerNode[] {
     return this.buildClusterPeers(selfNodeId);
   }
@@ -45,8 +61,9 @@ export class RuntimeTopologyStore {
   ): string[] | undefined {
     const allowedHostIds = scope ? this.resolveAllowedHostIdsForGroup(scope.groupId) : undefined;
     const peers = this.buildClusterPeers(selfNodeId, allowedHostIds);
+    const effectivePeers = peers.filter((peer) => this.peerStatus(peer.nodeId) !== "dead");
     if (peers.length > 0) {
-      return peers.map((peer) => peer.nodeId);
+      return effectivePeers.map((peer) => peer.nodeId);
     }
 
     return allowedHostIds === undefined ? undefined : [];
@@ -115,21 +132,46 @@ export class RuntimeTopologyStore {
     const hostsById = new Map(
       (this.topology?.membership.hosts ?? []).map((host) => [host.hostId, host] as const)
     );
-    const readyTargets = this.buildRouteTargets(match.route.ownerHostIds, match.route.pathPrefix, match.route.routeId, hostsById)
+    const routeTargets = this.buildRouteTargets(match.route.ownerHostIds, match.route.pathPrefix, match.route.routeId, hostsById)
       .filter((target) => target.nodeId !== input.selfNodeId)
-      .filter((target) => target.host.state === "ready");
+      .filter((target) => this.peerStatus(target.nodeId) !== "dead");
+    const readyTargets = routeTargets
+      .filter((target) => target.host.state === "ready")
+      .filter((target) => this.peerStatus(target.nodeId) !== "suspect");
     if (readyTargets.length > 0) {
       return this.pickTarget(readyTargets, input.traceKey);
     }
 
-    const drainingTargets = this.buildRouteTargets(match.route.ownerHostIds, match.route.pathPrefix, match.route.routeId, hostsById)
+    const suspectReadyTargets = routeTargets
+      .filter((target) => target.host.state === "ready")
+      .filter((target) => this.peerStatus(target.nodeId) === "suspect");
+    if (suspectReadyTargets.length > 0) {
+      return this.pickTarget(suspectReadyTargets, input.traceKey);
+    }
+
+    const drainingTargets = routeTargets
       .filter((target) => target.nodeId !== input.selfNodeId)
-      .filter((target) => target.host.state === "draining");
+      .filter((target) => target.host.state === "draining")
+      .filter((target) => this.peerStatus(target.nodeId) !== "suspect");
     if (drainingTargets.length > 0) {
       return this.pickTarget(drainingTargets, input.traceKey);
     }
 
+    const suspectDrainingTargets = routeTargets
+      .filter((target) => target.host.state === "draining")
+      .filter((target) => this.peerStatus(target.nodeId) === "suspect");
+    if (suspectDrainingTargets.length > 0) {
+      return this.pickTarget(suspectDrainingTargets, input.traceKey);
+    }
+
     return undefined;
+  }
+
+  private peerStatus(nodeId?: string): ClusterPeerHealthStatus {
+    if (!nodeId) {
+      return "unknown";
+    }
+    return this.runtimePeerHealthByNodeId.get(nodeId) ?? "unknown";
   }
 
   private findBestRoute(pathname: string):

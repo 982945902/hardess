@@ -1,4 +1,5 @@
 import { DemoBearerAuthProvider } from "./auth/provider.ts";
+import { ClusterPeerHealthStore } from "./cluster/health.ts";
 import { StaticClusterNetwork, type ClusterPeerNode, type ClusterSocket, type ClusterTransport } from "./cluster/network.ts";
 import { DistributedPeerLocator } from "./cluster/peer-locator.ts";
 import {
@@ -40,6 +41,10 @@ export interface RuntimeAppOptions {
     outboundMaxQueueBytes?: number;
     outboundBackpressureRetryMs?: number;
     locatorCacheTtlMs?: number;
+    peerProbeIntervalMs?: number;
+    peerPingTimeoutMs?: number;
+    peerSuspectTimeoutMs?: number;
+    peerAntiEntropyIntervalMs?: number;
     fetchFn?: typeof fetch;
     socketFactory?: (url: string) => ClusterSocket;
     transport?: ClusterTransport;
@@ -154,6 +159,9 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
   const localPeerLocator = new InMemoryPeerLocator();
   const topologyStore = new RuntimeTopologyStore();
+  const clusterPeerHealth = new ClusterPeerHealthStore({
+    suspectTimeoutMs: options.cluster?.peerSuspectTimeoutMs
+  });
   const clusterNetwork = new StaticClusterNetwork(options.cluster?.peers ?? [], {
     nodeId,
     sharedSecret: options.cluster?.sharedSecret,
@@ -161,12 +169,18 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     outboundMaxQueueMessages: options.cluster?.outboundMaxQueueMessages,
     outboundMaxQueueBytes: options.cluster?.outboundMaxQueueBytes,
     outboundBackpressureRetryMs: options.cluster?.outboundBackpressureRetryMs,
+    peerProbeIntervalMs: options.cluster?.peerProbeIntervalMs,
+    peerPingTimeoutMs: options.cluster?.peerPingTimeoutMs,
+    peerAntiEntropyIntervalMs: options.cluster?.peerAntiEntropyIntervalMs,
     metrics,
     fetchFn: options.cluster?.fetchFn,
     socketFactory: options.cluster?.socketFactory,
     logger,
-    transport: options.cluster?.transport
+    transport: options.cluster?.transport,
+    peerHealthObserver: clusterPeerHealth,
+    peerHealthSnapshotProvider: () => clusterPeerHealth.list()
   });
+  clusterPeerHealth.noteKnownPeers((options.cluster?.peers ?? []).map((peer) => peer.nodeId));
   const peerLocator = new DistributedPeerLocator(
     localPeerLocator,
     clusterNetwork.hasPeers() ? clusterNetwork : undefined,
@@ -201,6 +215,8 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
   });
   const unsubscribeTopology = topologyStore.subscribe((topology) => {
     const dynamicPeers = topologyStore.listClusterPeers(nodeId);
+    clusterPeerHealth.noteKnownPeers(dynamicPeers.map((peer) => peer.nodeId));
+    topologyStore.clearRuntimePeerHealth(dynamicPeers.map((peer) => peer.nodeId));
     clusterNetwork.setPeers(dynamicPeers);
     logger.info("cluster topology peers updated", {
       nodeId,
@@ -208,6 +224,37 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       membershipRevision: topology?.membership.revision,
       placementRevision: topology?.placement.revision
     });
+  });
+  const unsubscribeClusterPeerHealth = clusterPeerHealth.subscribe((snapshot) => {
+    topologyStore.setRuntimePeerHealth(snapshot.nodeId, snapshot.status);
+    metrics.increment("cluster.peer_health_update");
+    metrics.increment(`cluster.peer_health_status.${snapshot.status}`);
+    metrics.increment(`cluster.peer_health_source.${snapshot.source}`);
+    logger.info("cluster peer health updated", {
+      nodeId,
+      peerNodeId: snapshot.nodeId,
+      status: snapshot.status,
+      detail: snapshot.detail,
+      source: snapshot.source,
+      reportedByNodeId: snapshot.reportedByNodeId
+    });
+    void clusterNetwork.broadcastPeerHealthRumor(snapshot, {
+      excludeNodeIds: [
+        snapshot.nodeId,
+        ...(snapshot.reportedByNodeId ? [snapshot.reportedByNodeId] : [])
+      ]
+    }).catch((error) => {
+      logger.warn("cluster peer health rumor broadcast failed", {
+        nodeId,
+        peerNodeId: snapshot.nodeId,
+        status: snapshot.status,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+    if (snapshot.status === "dead") {
+      clusterNetwork.disconnectPeer(snapshot.nodeId, "cluster peer marked dead");
+      peerLocator.invalidate();
+    }
   });
   configStore.watch();
   const startedAt = Date.now();
@@ -311,6 +358,7 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       return websocket.forwardClusterHandleAck(payload);
     }
   });
+  clusterNetwork.startPeerProbes();
   const runtimeWebsocket = {
     open(socket: { data?: Record<string, unknown> }) {
       if (socket.data?.kind === "cluster") {
@@ -450,9 +498,11 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
       disposed = true;
       unsubscribeConfig();
       unsubscribeTopology();
+      unsubscribeClusterPeerHealth();
       configStore.dispose();
       websocket.dispose();
       upstreamWebSocketProxy.dispose();
+      clusterPeerHealth.dispose();
       clusterNetwork.dispose();
     },
     async fetch(
