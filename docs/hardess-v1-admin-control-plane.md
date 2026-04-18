@@ -256,8 +256,8 @@ Current implementation stage:
 - stage 1 is a SWIM-ish health overlay, not full distributed membership
 - it combines passive transport observations with active WS `ping/pong` probes
 - it now also disseminates health changes as rumor-style WS control messages
-- it periodically runs per-peer incremental health repair, with reconnect forcing
-  the next sync to behave like a fresh baseline repair
+- it periodically exchanges peer-health digests, requests targeted repair for
+  missing or older entries, and replies with exact rumor snapshots
 - it may temporarily prefer healthy nodes over `suspect` nodes and locally skip
   `dead` nodes
 - it still does not spread durable membership state or override admin route
@@ -266,8 +266,9 @@ Current implementation stage:
 Recommended future evolution:
 
 - primary mode: rumor-style health dissemination between already approved peers
-- fallback mode: periodic anti-entropy repair for missed liveness updates; the
-  current implementation uses full snapshots and can later be optimized
+- fallback mode: periodic digest-based anti-entropy repair for missed liveness
+  updates; digests only summarize state, and repair responses carry the exact
+  requested rumor snapshots
 - hard boundary: both modes stay scoped to health annotation, never desired
   topology ownership
 

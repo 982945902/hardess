@@ -812,8 +812,31 @@ describe("StaticClusterNetwork", () => {
 
     receivedRumors.length = 0;
     await clientNetwork.broadcastPeerHealthSync([...snapshots]);
+    expect(receivedRumors).toEqual([
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-c",
+        status: "alive",
+        incarnation: 5
+      },
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-d",
+        status: "dead",
+        incarnation: 2
+      }
+    ]);
+
+    receivedRumors.length = 0;
+    await clientNetwork.broadcastPeerHealthSync([
+      {
+        ...snapshots[0],
+        status: "unknown"
+      }
+    ]);
     expect(receivedRumors).toEqual([]);
 
+    receivedRumors.length = 0;
     await clientNetwork.broadcastPeerHealthSync([
       {
         ...snapshots[0],
@@ -828,12 +851,18 @@ describe("StaticClusterNetwork", () => {
         nodeId: "node-c",
         status: "suspect",
         incarnation: 6
+      },
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-d",
+        status: "dead",
+        incarnation: 2
       }
     ]);
     expect(metrics.snapshot().counters).toEqual(
       expect.objectContaining({
-        "cluster.peer_health_sync_out": 2,
-        "cluster.peer_health_sync_item_out": 3,
+        "cluster.peer_health_sync_out": 3,
+        "cluster.peer_health_sync_item_out": 6,
         "cluster.peer_health_sync_skip": 1
       })
     );
@@ -842,19 +871,172 @@ describe("StaticClusterNetwork", () => {
     serverNetwork.dispose();
   });
 
-  it("runs periodic peer health sync when anti-entropy is enabled", async () => {
+  it("repairs peer health from digests and can repair again after local state loss", async () => {
+    const metrics = new InMemoryMetrics();
+    const receivedRumors: string[] = [];
+    const serverSnapshots = new Map<
+      string,
+      {
+        nodeId: string;
+        status: "alive" | "suspect" | "dead";
+        incarnation: number;
+        updatedAt: number;
+        lastAliveAt?: number;
+        detail: string;
+        source: "remote";
+        reportedByNodeId: string;
+      }
+    >();
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret",
+      peerHealthSnapshotProvider() {
+        return [...serverSnapshots.values()];
+      },
+      peerHealthObserver: {
+        markAlive() {},
+        markSuspect() {},
+        applyRumor(rumor, fromNodeId) {
+          receivedRumors.push(`${rumor.nodeId}:${rumor.status}:${rumor.incarnation}`);
+          serverSnapshots.set(rumor.nodeId, {
+            nodeId: rumor.nodeId,
+            status: rumor.status,
+            incarnation: rumor.incarnation,
+            updatedAt: Date.now(),
+            lastAliveAt: rumor.lastAliveAt,
+            detail: `gossip:${fromNodeId}`,
+            source: "remote",
+            reportedByNodeId: fromNodeId
+          });
+        }
+      }
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientSnapshots = [
+      {
+        nodeId: "node-c",
+        status: "alive",
+        incarnation: 5,
+        updatedAt: 1,
+        lastAliveAt: 123,
+        detail: "pong",
+        source: "local"
+      },
+      {
+        nodeId: "node-d",
+        status: "suspect",
+        incarnation: 2,
+        updatedAt: 2,
+        detail: "probe_timeout",
+        source: "local"
+      }
+    ] as const;
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        metrics,
+        peerHealthSnapshotProvider() {
+          return [...clientSnapshots];
+        },
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    await clientNetwork.warmConnections();
+    await clientNetwork.broadcastPeerHealthDigest([...clientSnapshots]);
+    await flushMicrotasks();
+
+    expect(receivedRumors).toEqual(["node-c:alive:5", "node-d:suspect:2"]);
+
+    receivedRumors.length = 0;
+    await clientNetwork.broadcastPeerHealthDigest([...clientSnapshots]);
+    await flushMicrotasks();
+    expect(receivedRumors).toEqual([]);
+
+    serverSnapshots.clear();
+    await clientNetwork.broadcastPeerHealthDigest([...clientSnapshots]);
+    await flushMicrotasks();
+    expect(receivedRumors).toEqual(["node-c:alive:5", "node-d:suspect:2"]);
+    expect(metrics.snapshot().counters).toEqual(
+      expect.objectContaining({
+        "cluster.peer_health_digest_out": 3,
+        "cluster.peer_health_digest_item_out": 6,
+        "cluster.peer_health_repair_request_in": 2,
+        "cluster.peer_health_repair_request_item_in": 4,
+        "cluster.peer_health_sync_out": 2,
+        "cluster.peer_health_sync_item_out": 4
+      })
+    );
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("runs periodic peer health digest repair when anti-entropy is enabled", async () => {
     const timers = new ManualTimers();
     const metrics = new InMemoryMetrics();
     const receivedRumors: string[] = [];
     let currentIncarnation = 9;
+    const serverSnapshots = new Map<
+      string,
+      {
+        nodeId: string;
+        status: "alive" | "suspect" | "dead";
+        incarnation: number;
+        updatedAt: number;
+        lastAliveAt?: number;
+        detail: string;
+        source: "remote";
+        reportedByNodeId: string;
+      }
+    >();
     const serverNetwork = new StaticClusterNetwork([], {
       nodeId: "node-b",
       sharedSecret: "secret",
+      peerHealthSnapshotProvider() {
+        return [...serverSnapshots.values()];
+      },
       peerHealthObserver: {
         markAlive() {},
         markSuspect() {},
-        applyRumor(rumor) {
+        applyRumor(rumor, fromNodeId) {
           receivedRumors.push(`${rumor.nodeId}:${rumor.status}:${rumor.incarnation}`);
+          serverSnapshots.set(rumor.nodeId, {
+            nodeId: rumor.nodeId,
+            status: rumor.status,
+            incarnation: rumor.incarnation,
+            updatedAt: Date.now(),
+            lastAliveAt: rumor.lastAliveAt,
+            detail: `gossip:${fromNodeId}`,
+            source: "remote",
+            reportedByNodeId: fromNodeId
+          });
         }
       }
     });
@@ -910,8 +1092,6 @@ describe("StaticClusterNetwork", () => {
 
     clientNetwork.startPeerProbes();
     await flushMicrotasks();
-    timers.tickIntervals();
-    await flushMicrotasks();
 
     expect(receivedRumors).toContain("node-c:suspect:9");
     receivedRumors.length = 0;
@@ -923,7 +1103,16 @@ describe("StaticClusterNetwork", () => {
     timers.tickIntervals();
     await flushMicrotasks();
     expect(receivedRumors).toContain("node-c:suspect:10");
-    expect(metrics.snapshot().counters["cluster.peer_health_sync_skip"]).toBeGreaterThanOrEqual(1);
+    expect(metrics.snapshot().counters).toEqual(
+      expect.objectContaining({
+        "cluster.peer_health_digest_out": 3,
+        "cluster.peer_health_digest_item_out": 3,
+        "cluster.peer_health_repair_request_in": 2,
+        "cluster.peer_health_repair_request_item_in": 2,
+        "cluster.peer_health_sync_out": 2,
+        "cluster.peer_health_sync_item_out": 2
+      })
+    );
 
     clientNetwork.dispose();
     serverNetwork.dispose();

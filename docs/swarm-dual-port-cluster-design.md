@@ -288,8 +288,10 @@ Current implementation stage:
 1. passive transport observations already update local peer health
 2. active WS `ping/pong` probes already mark peers `alive` or `suspect`
 3. health changes are now disseminated as rumor-style WS control messages
-4. periodic anti-entropy repair now runs over the same WS control channel using per-peer incremental sync
-5. connection re-establishment resets that peer's repair state so the next sync acts like a fresh baseline repair
+4. periodic anti-entropy repair now runs over the same WS control channel as a
+   digest -> repair-request -> targeted-sync flow
+5. because repair is driven by receiver-side digest comparison, a peer can
+   recover the same health snapshot again after reconnect or local state loss
 
 Recommended runtime merge rule:
 

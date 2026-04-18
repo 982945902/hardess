@@ -99,6 +99,42 @@ describe("cluster schema helpers", () => {
         }
       ]
     });
+
+    expect(
+      parseClusterSocketMessage(
+        JSON.stringify({
+          type: "peerHealthDigest",
+          digests: [
+            {
+              peerNodeId: "node-b",
+              status: "suspect",
+              incarnation: 2
+            }
+          ]
+        })
+      )
+    ).toEqual({
+      type: "peerHealthDigest",
+      digests: [
+        {
+          peerNodeId: "node-b",
+          status: "suspect",
+          incarnation: 2
+        }
+      ]
+    });
+
+    expect(
+      parseClusterSocketMessage(
+        JSON.stringify({
+          type: "peerHealthRepairRequest",
+          peerNodeIds: ["node-b", "node-c"]
+        })
+      )
+    ).toEqual({
+      type: "peerHealthRepairRequest",
+      peerNodeIds: ["node-b", "node-c"]
+    });
   });
 
   it("parses cluster http/admin responses through shared schema helpers", () => {
