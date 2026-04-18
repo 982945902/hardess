@@ -292,6 +292,29 @@ If you want research artifacts and experiments:
 - [Pingora / workerd as Hardess v2 research](docs/research-pingora-for-hardess-v2.md)
 - [Experimental Pingora + Rust + TS runtime workspace](experiment/README.md)
 
+## Curator SDK Consumption
+
+`hardess` can now be consumed from another repository as a Git dependency for
+the admin/control-plane SDK surface.
+
+The intended import target is:
+
+```ts
+import {
+  HardessAdminClient,
+  HttpAdminTransport,
+  type DesiredHostState,
+  type HostRegistration
+} from "hardess/curator";
+```
+
+This surface is intentionally narrower than the full runtime repo:
+
+- it includes admin protocol types
+- it includes the HTTP admin client and transport
+- it includes planning helpers used by a control plane
+- it does not expose the demo admin mock as the primary integration target
+
 ## What Is Still Open
 
 - Production auth provider integration still replaces only the demo auth path.
