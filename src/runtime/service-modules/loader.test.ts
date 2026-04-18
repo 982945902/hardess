@@ -77,4 +77,40 @@ describe("loadServiceModule", () => {
       "service module must export { protocol, version, actions }"
     );
   });
+
+  it("does not cache a failed service module load permanently when a dependency becomes available", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-service-module-transient-"));
+    cleanupPaths.push(dir);
+
+    const modulePath = join(dir, "chat.ts");
+    const dependencyPath = join(dir, "helper.ts");
+    await writeFile(
+      modulePath,
+      `
+        import { version } from "./helper.ts";
+        export default {
+          protocol: "chat",
+          version,
+          actions: {
+            send: {
+              resolveRecipients() {
+                return ["alice"];
+              }
+            }
+          }
+        };
+      `
+    );
+
+    await expect(loadServiceModule(modulePath)).rejects.toThrow();
+
+    await writeFile(
+      dependencyPath,
+      `export const version = "1.1";`
+    );
+
+    const module = await loadServiceModule(modulePath);
+    expect(module.protocol).toBe("chat");
+    expect(module.version).toBe("1.1");
+  });
 });

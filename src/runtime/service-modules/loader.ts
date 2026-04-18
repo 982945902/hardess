@@ -14,14 +14,15 @@ let shadowCounter = 0;
 export async function loadServiceModule(entry: string): Promise<HardessServiceModule> {
   const absolutePath = resolve(entry);
   const fileStat = await stat(absolutePath);
-  const cached = cache.get(entry);
+  const cached = cache.get(absolutePath);
   if (cached && cached.mtimeMs === fileStat.mtimeMs) {
     return cached.promise;
   }
 
+  let shadowCopyPath: string | undefined;
   const promise = (async () => {
     const source = await readFile(absolutePath, "utf8");
-    const shadowCopyPath = join(
+    shadowCopyPath = join(
       dirname(absolutePath),
       `.${basename(absolutePath, extname(absolutePath))}.hardess-service-module-${fileStat.mtimeMs}-${shadowCounter += 1}${extname(absolutePath)}`
     );
@@ -33,28 +34,46 @@ export async function loadServiceModule(entry: string): Promise<HardessServiceMo
     if (cached?.shadowCopyPath) {
       await rm(cached.shadowCopyPath, { force: true });
     }
-    const nextCached = cache.get(entry);
-    if (nextCached) {
+    const nextCached = cache.get(absolutePath);
+    if (nextCached && shadowCopyPath) {
       nextCached.shadowCopyPath = shadowCopyPath;
     }
 
     return serviceModule;
   })();
 
-  cache.set(entry, {
+  cache.set(absolutePath, {
     mtimeMs: fileStat.mtimeMs,
     promise,
     shadowCopyPath: undefined
   });
-  return promise;
+  try {
+    return await promise;
+  } catch (error) {
+    if (shadowCopyPath) {
+      await rm(shadowCopyPath, { force: true });
+    }
+
+    const nextCached = cache.get(absolutePath);
+    if (nextCached?.promise === promise) {
+      if (cached) {
+        cache.set(absolutePath, cached);
+      } else {
+        cache.delete(absolutePath);
+      }
+    }
+
+    throw error;
+  }
 }
 
 export function invalidateServiceModule(entry: string): void {
-  const cached = cache.get(entry);
+  const absolutePath = resolve(entry);
+  const cached = cache.get(absolutePath);
   if (cached?.shadowCopyPath) {
     void rm(cached.shadowCopyPath, { force: true });
   }
-  cache.delete(entry);
+  cache.delete(absolutePath);
 }
 
 export function invalidateServiceModules(entries?: string[]): void {

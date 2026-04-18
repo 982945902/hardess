@@ -14,6 +14,7 @@ import type { HostStaticCapacity } from "../shared/index.ts";
 declare const Bun: {
   serve(options: {
     port: number;
+    idleTimeout?: number;
     fetch(
       request: Request,
       server: {
@@ -228,6 +229,7 @@ function createListenConfig(): {
 try {
   const { sink: metrics, mode: metricsMode } = createMetricsSink();
   const websocketShutdownGraceMs = envNumber("WS_SHUTDOWN_GRACE_MS") ?? 3_000;
+  const serverIdleTimeoutSeconds = envNumber("SERVER_IDLE_TIMEOUT_SECS");
   const listenConfig = createListenConfig();
   const app = await createRuntimeApp({
     configModulePath: processEnv.CONFIG_MODULE_PATH,
@@ -239,6 +241,7 @@ try {
       sharedSecret: envString("CLUSTER_SHARED_SECRET"),
       requestTimeoutMs: envNumber("CLUSTER_REQUEST_TIMEOUT_MS"),
       outboundMaxQueueMessages: envNumber("CLUSTER_OUTBOUND_MAX_QUEUE_MESSAGES"),
+      outboundMaxQueueBytes: envNumber("CLUSTER_OUTBOUND_MAX_QUEUE_BYTES"),
       outboundBackpressureRetryMs: envNumber("CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS"),
       locatorCacheTtlMs: envNumber("CLUSTER_LOCATOR_CACHE_TTL_MS"),
       transport: parseClusterTransport()
@@ -275,11 +278,16 @@ try {
       control: {
         allowedPathPrefixes: listenConfig.controlAllowedPathPrefixes
       }
+    },
+    internalForward: {
+      httpTimeoutMs: envNumber("INTERNAL_FORWARD_HTTP_TIMEOUT_MS"),
+      wsConnectTimeoutMs: envNumber("INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS")
     }
   });
 
   const businessServer = Bun.serve({
     port: listenConfig.businessPort,
+    idleTimeout: serverIdleTimeoutSeconds,
     async fetch(request, serverRef) {
       return app.fetch(request, serverRef, {
         listener: listenConfig.singleListenerName
@@ -291,6 +299,7 @@ try {
     ? undefined
     : Bun.serve({
         port: listenConfig.controlPort,
+        idleTimeout: serverIdleTimeoutSeconds,
         async fetch(request, serverRef) {
           return app.fetch(request, serverRef, {
             listener: "control"
@@ -333,6 +342,7 @@ try {
     hostGroupId: envString("HOST_GROUP_ID"),
     clusterTransport: parseClusterTransport(),
     clusterPeers: parseClusterPeers().map((peer) => peer.nodeId),
+    serverIdleTimeoutSeconds,
     alertWindowMs: alertMonitor ? alertWindowMs : undefined
   });
   const adminBaseUrl = envString("ADMIN_BASE_URL");

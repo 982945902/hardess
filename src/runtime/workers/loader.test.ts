@@ -156,4 +156,53 @@ describe("loadWorker", () => {
       originalPath: "/personnel/users/42"
     });
   });
+
+  it("does not cache a failed worker load permanently when a dependency becomes available", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-worker-transient-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "dynamic-worker.ts");
+    const dependencyPath = join(dir, "helper.ts");
+    await writeFile(
+      workerPath,
+      `
+        import { render } from "./helper.ts";
+        export default {
+          fetch() {
+            return new Response(render());
+          }
+        };
+      `
+    );
+
+    await expect(loadWorker(workerPath)).rejects.toThrow();
+
+    await writeFile(
+      dependencyPath,
+      `export function render() { return "recovered"; }`
+    );
+
+    const worker = await loadWorker(workerPath);
+    const result = await worker.fetch(
+      new Request("http://localhost/demo"),
+      {
+        auth: {
+          peerId: "alice",
+          tokenId: "demo:alice",
+          capabilities: [],
+          expiresAt: Date.now() + 1000
+        },
+        pipeline: {
+          id: "demo",
+          matchPrefix: "/demo",
+          downstreamOrigin: "http://127.0.0.1:9000"
+        }
+      },
+      {
+        waitUntil() {}
+      }
+    );
+
+    expect(result instanceof Response ? await result.text() : null).toBe("recovered");
+  });
 });

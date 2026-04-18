@@ -67,6 +67,7 @@ function createHttpDeps(nextConfig: HardessConfig, metrics: InMemoryMetrics) {
         return false;
       }
     },
+    internalForward: undefined,
     upstreamWebSocketProxy: new UpstreamWebSocketProxyRuntime({
       logger: new ConsoleLogger(),
       metrics
@@ -249,6 +250,56 @@ describe("handleHttpRequest", () => {
     expect(metrics.counter("http.error")).toBe(1);
   });
 
+  it("streams upstream response bodies without treating total stream duration as a timeout", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            await Bun.sleep(1);
+            controller.enqueue(new TextEncoder().encode('{"ok":'));
+            await Bun.sleep(4);
+            controller.enqueue(new TextEncoder().encode("true"));
+            await Bun.sleep(4);
+            controller.enqueue(new TextEncoder().encode(',"streamed":true}'));
+            controller.close();
+          }
+        }),
+        {
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice"
+        }
+      }),
+      createHttpDeps({
+        pipelines: [
+          {
+            ...config.pipelines[0]!,
+            downstream: {
+              ...config.pipelines[0]!.downstream,
+              connectTimeoutMs: 20,
+              responseTimeoutMs: 5
+            }
+          }
+        ]
+      }, metrics)
+    );
+
+    expect(response).toBeDefined();
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toEqual({ ok: true, streamed: true });
+    expect(metrics.counter("http.upstream_timeout")).toBe(0);
+    expect(metrics.counter("http.upstream_ok")).toBe(1);
+  });
+
   it("internally forwards http requests based on admin topology when the route is not local", async () => {
     globalThis.fetch = mock(async (request: Request) => {
       expect(request.url).toBe("http://host-b.internal/__cluster/http-forward");
@@ -333,5 +384,81 @@ describe("handleHttpRequest", () => {
     });
     expect(metrics.counter("http.internal_forward_ok")).toBe(1);
     expect(metrics.counter("http.route_missing")).toBe(0);
+  });
+
+  it("maps internal forward timeout failures", async () => {
+    globalThis.fetch = mock((request: Request) => {
+      return new Promise<Response>((_, reject) => {
+        request.signal.addEventListener("abort", () => {
+          reject(new Error("aborted"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const metrics = new InMemoryMetrics();
+    const topologyStore = new RuntimeTopologyStore();
+    topologyStore.setTopology({
+      membership: {
+        revision: "topology:2:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-b",
+            nodeId: "node-b",
+            internalBaseUrl: "http://host-b.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:2:placement",
+        generatedAt: 1,
+        deployments: [
+          {
+            deploymentId: "deployment:demo-http",
+            deploymentKind: "http_worker",
+            ownerHostIds: ["host-b"],
+            routes: [
+              {
+                routeId: "route:demo-http",
+                pathPrefix: "/demo",
+                ownerHostIds: ["host-b"]
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const response = await handleHttpRequest(
+      new Request("http://localhost/demo/orders", {
+        headers: {
+          authorization: "Bearer demo:alice",
+          "x-trace-id": "trace-internal-timeout"
+        }
+      }),
+      {
+        ...createHttpDeps({ pipelines: [] }, metrics),
+        nodeId: "node-a",
+        topologyStore,
+        internalForward: {
+          httpTimeoutMs: 5
+        }
+      }
+    );
+
+    expect(response?.status).toBe(504);
+    expect(await response?.json()).toEqual({
+      error: expect.objectContaining({
+        code: "GATEWAY_UPSTREAM_TIMEOUT"
+      })
+    });
+    expect(metrics.counter("http.internal_forward_error")).toBe(1);
+    expect(metrics.counter("http.error")).toBe(1);
   });
 });
