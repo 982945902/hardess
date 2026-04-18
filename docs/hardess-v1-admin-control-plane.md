@@ -207,6 +207,70 @@ So the split for `v1` is:
 That means admin should distribute slow-changing topology projections, while
 runtime continues to discover hot connection location at runtime.
 
+### 7.5 Gossip As A Runtime Health Overlay
+
+Future gossip support must not change the control-plane ownership model above.
+
+The fixed rule for `v1` is:
+
+- admin remains the only authority for desired state
+- admin remains the only authority for deployment, assignment, membership
+  projection, placement, route ownership, and group scope
+- runtime continues to reconcile the admin-projected `DesiredHostState`
+- gossip must not publish, mutate, or override admin desired state
+- gossip must not decide route owners or deployment placement
+
+If added, gossip is only a data-plane enhancement on top of the admin
+projection. Its job is to annotate admin-approved nodes with faster local
+liveness and endpoint observations.
+
+Recommended mental model:
+
+```text
+admin projected topology
+  + gossip observed health
+  = effective runtime peer view
+```
+
+Not:
+
+```text
+gossip membership
+  = control-plane topology
+```
+
+The effective runtime peer view should therefore be constrained by admin:
+
+- a node absent from admin-projected membership must not become routable because
+  gossip saw it
+- a node that gossip marks `dead` or `suspect` may be skipped, degraded, or have
+  local caches invalidated
+- a node that gossip marks `alive` should only be considered if admin has already
+  projected it into the relevant host group and route scope
+
+This keeps route governance centralized while still allowing the data plane to
+react faster to node failure, reconnects, and endpoint changes.
+
+Current implementation stage:
+
+- stage 1 is a SWIM-ish health overlay, not full distributed membership
+- it combines passive transport observations with active WS `ping/pong` probes
+- it now also disseminates health changes as rumor-style WS control messages
+- it periodically runs per-peer incremental health repair, with reconnect forcing
+  the next sync to behave like a fresh baseline repair
+- it may temporarily prefer healthy nodes over `suspect` nodes and locally skip
+  `dead` nodes
+- it still does not spread durable membership state or override admin route
+  ownership
+
+Recommended future evolution:
+
+- primary mode: rumor-style health dissemination between already approved peers
+- fallback mode: periodic anti-entropy repair for missed liveness updates; the
+  current implementation uses full snapshots and can later be optimized
+- hard boundary: both modes stay scoped to health annotation, never desired
+  topology ownership
+
 ## 8. Desired Host State
 
 The long-term `v1` control contract should therefore be host-oriented.

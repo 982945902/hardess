@@ -87,6 +87,10 @@ try {
       outboundMaxQueueBytes: runtimeConfig.cluster.outboundMaxQueueBytes,
       outboundBackpressureRetryMs: runtimeConfig.cluster.outboundBackpressureRetryMs,
       locatorCacheTtlMs: runtimeConfig.cluster.locatorCacheTtlMs,
+      peerProbeIntervalMs: runtimeConfig.cluster.peerProbeIntervalMs,
+      peerPingTimeoutMs: runtimeConfig.cluster.peerPingTimeoutMs,
+      peerSuspectTimeoutMs: runtimeConfig.cluster.peerSuspectTimeoutMs,
+      peerAntiEntropyIntervalMs: runtimeConfig.cluster.peerAntiEntropyIntervalMs,
       transport: runtimeConfig.cluster.transport
     },
     metrics,

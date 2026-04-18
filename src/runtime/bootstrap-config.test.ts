@@ -11,6 +11,10 @@ describe("parseRuntimeBootstrapConfig", () => {
     expect(config.listen.businessPort).toBe(RUNTIME_DEFAULTS.port);
     expect(config.listen.singleListenerName).toBe("default");
     expect(config.cluster.transport).toBe("ws");
+    expect(config.cluster.peerProbeIntervalMs).toBe(RUNTIME_DEFAULTS.clusterPeerProbeIntervalMs);
+    expect(config.cluster.peerPingTimeoutMs).toBe(RUNTIME_DEFAULTS.clusterPeerPingTimeoutMs);
+    expect(config.cluster.peerSuspectTimeoutMs).toBe(RUNTIME_DEFAULTS.clusterPeerSuspectTimeoutMs);
+    expect(config.cluster.peerAntiEntropyIntervalMs).toBe(RUNTIME_DEFAULTS.clusterPeerAntiEntropyIntervalMs);
     expect(config.shutdown.drainMs).toBe(RUNTIME_DEFAULTS.shutdownDrainMs);
     expect(config.shutdown.timeoutMs).toBe(RUNTIME_DEFAULTS.shutdownTimeoutMs);
     expect(config.websocket.heartbeatIntervalMs).toBe(RUNTIME_DEFAULTS.websocketHeartbeatIntervalMs);
@@ -57,6 +61,13 @@ describe("parseRuntimeBootstrapConfig", () => {
         SHUTDOWN_TIMEOUT_MS: "1000"
       })
     ).toThrow("SHUTDOWN_DRAIN_MS must be <= SHUTDOWN_TIMEOUT_MS");
+
+    expect(() =>
+      parseRuntimeBootstrapConfig({
+        CLUSTER_PEER_PING_TIMEOUT_MS: "5000",
+        CLUSTER_PEER_SUSPECT_TIMEOUT_MS: "5000"
+      })
+    ).toThrow("CLUSTER_PEER_SUSPECT_TIMEOUT_MS must be greater than CLUSTER_PEER_PING_TIMEOUT_MS");
   });
 
   it("rejects malformed listener path prefixes", () => {

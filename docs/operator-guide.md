@@ -71,6 +71,10 @@ Runtime env timeouts:
 | cluster transport | request timeout | `CLUSTER_REQUEST_TIMEOUT_MS` | `10000` | locate and request-response timeout for cluster traffic |
 | cluster transport | locate cache TTL | `CLUSTER_LOCATOR_CACHE_TTL_MS` | `250` | not a timeout budget, but part of cluster timing behavior; may be `0` |
 | cluster transport | outbound retry backoff | `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS` | `10` | retry delay after control-channel backpressure |
+| cluster transport | peer probe interval | `CLUSTER_PEER_PROBE_INTERVAL_MS` | `2000` | WS health-probe cadence for admin-approved peers |
+| cluster transport | peer ping timeout | `CLUSTER_PEER_PING_TIMEOUT_MS` | `1000` | how long a WS probe waits for `pong` before marking the peer `suspect` |
+| cluster transport | peer suspect timeout | `CLUSTER_PEER_SUSPECT_TIMEOUT_MS` | `5000` | health-overlay suspect-to-dead escalation; must be greater than ping timeout |
+| cluster transport | peer anti-entropy interval | `CLUSTER_PEER_ANTI_ENTROPY_INTERVAL_MS` | `15000` | periodic incremental health repair loop; may be `0` to disable |
 | internal forward | internal HTTP forward timeout | `INTERNAL_FORWARD_HTTP_TIMEOUT_MS` | `5000` | applies to body reads too, not just headers |
 | internal forward | internal WS connect timeout | `INTERNAL_FORWARD_WS_CONNECT_TIMEOUT_MS` | `5000` | connect budget for forwarded WS upgrades |
 | admin host-agent | reconcile poll interval | `ADMIN_POLL_AFTER_MS` | `5000` | default next-poll delay after a healthy cycle |
@@ -137,6 +141,10 @@ Cluster / multi-node:
 - `CLUSTER_OUTBOUND_MAX_QUEUE_MESSAGES`: per-node internal WS channel outbound queue cap, default `16384`
 - `CLUSTER_OUTBOUND_BACKPRESSURE_RETRY_MS`: retry delay after control-plane cluster WS backpressure, default `10`
 - `CLUSTER_LOCATOR_CACHE_TTL_MS`: remote peer-location cache TTL on each node
+- `CLUSTER_PEER_PROBE_INTERVAL_MS`: WS peer health probe interval for the runtime health overlay, default `2000`
+- `CLUSTER_PEER_PING_TIMEOUT_MS`: WS probe wait budget before the peer is marked `suspect`, default `1000`
+- `CLUSTER_PEER_SUSPECT_TIMEOUT_MS`: suspect-to-dead escalation budget inside the runtime health overlay, default `5000`
+- `CLUSTER_PEER_ANTI_ENTROPY_INTERVAL_MS`: periodic incremental health repair interval for the runtime health overlay, default `15000`; set `0` to disable
 
 Admin / host-agent control plane:
 
@@ -255,11 +263,13 @@ The current multi-node baseline is static-peer based:
 - remote `deliver` and `handleAck` use a long-lived control websocket channel at `GET /__cluster/ws`
 - `CLUSTER_TRANSPORT=http` keeps the older pure-HTTP transport available as a fallback path
 - when `CLUSTER_TRANSPORT=ws`, per-request fallback to the control HTTP endpoints is now used if the cluster WS channel is temporarily unavailable or its outbound queue overflows
+- when `CLUSTER_TRANSPORT=ws`, the runtime also runs active `ping/pong` peer probes against the admin-projected peer set; this is a health overlay only and does not replace admin membership or placement
 - in dual-port deployments, cluster peer `baseUrl` entries should point to the control listener, not the business listener
 
 Current boundary:
 
-- this is a static cluster peer list, not automatic membership or gossip
+- cluster peers may come from static config or from admin-projected topology, but membership is still not autonomously created or removed by runtime gossip
+- the current WS health overlay now includes direct `ping/pong` probes, rumor-style liveness dissemination, and periodic incremental anti-entropy repair between admin-approved peers
 - there is no durable distributed state, only per-node in-memory connection state plus short peer-location caches
 - rollout, retries, channel lifecycle, and topology management still need deployment-specific conventions
 
@@ -299,4 +309,4 @@ Release-gate interpretation:
 
 - external production `AuthProvider` wiring is still intentionally not part of this guide
 - dashboard rollout and Prometheus/Grafana hosting still stay deployment-specific
-- cluster membership is static; there is no leader election, gossip, or shared distributed registry yet
+- cluster membership is still control-plane-projected rather than autonomously coordinated; there is no leader election or shared distributed registry

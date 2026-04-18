@@ -2,6 +2,8 @@ import { describe, expect, it, mock } from "bun:test";
 import { InMemoryMetrics } from "../observability/metrics.ts";
 import { StaticClusterNetwork } from "./network.ts";
 
+type TimerHandle = ReturnType<typeof setTimeout>;
+
 type EventMap = {
   open: Array<() => void>;
   message: Array<(event: { data?: unknown }) => void>;
@@ -76,12 +78,59 @@ class FakeClusterSocket {
   }
 }
 
+class ManualTimers {
+  private nextId = 1;
+  private readonly timeouts = new Map<number, () => void>();
+  private readonly intervals = new Map<number, () => void>();
+
+  setTimeout = (callback: () => void, _delay?: number): TimerHandle => {
+    const id = this.nextId++;
+    this.timeouts.set(id, callback);
+    return id as unknown as TimerHandle;
+  };
+
+  clearTimeout = (id: TimerHandle): void => {
+    this.timeouts.delete(id as unknown as number);
+  };
+
+  setInterval = (callback: () => void, _delay?: number): TimerHandle => {
+    const id = this.nextId++;
+    this.intervals.set(id, callback);
+    return id as unknown as TimerHandle;
+  };
+
+  clearInterval = (id: TimerHandle): void => {
+    this.intervals.delete(id as unknown as number);
+  };
+
+  tickIntervals(): void {
+    for (const callback of this.intervals.values()) {
+      callback();
+    }
+  }
+
+  runNextTimeout(): void {
+    const [id, callback] = this.timeouts.entries().next().value ?? [];
+    if (id === undefined || !callback) {
+      throw new Error("No timeout scheduled");
+    }
+    this.timeouts.delete(id);
+    callback();
+  }
+}
+
 function createSocketPair(): [FakeClusterSocket, FakeClusterSocket] {
   const left = new FakeClusterSocket();
   const right = new FakeClusterSocket();
   left.peer = right;
   right.peer = left;
   return [left, right];
+}
+
+async function flushMicrotasks(rounds = 4): Promise<void> {
+  for (let index = 0; index < rounds; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 describe("StaticClusterNetwork", () => {
@@ -393,6 +442,493 @@ describe("StaticClusterNetwork", () => {
     serverNetwork.dispose();
   });
 
+  it("reports peer health transitions from websocket channel observations", async () => {
+    const observed: string[] = [];
+    let clientSocketRef: FakeClusterSocket | undefined;
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret"
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        peerHealthObserver: {
+          markAlive(nodeId, detail) {
+            observed.push(`alive:${nodeId}:${detail}`);
+          },
+          markSuspect(nodeId, detail) {
+            observed.push(`suspect:${nodeId}:${detail}`);
+          }
+        },
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          clientSocketRef = clientSocket;
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    await clientNetwork.warmConnections();
+    clientSocketRef?.close(1012, "closed");
+
+    expect(observed.some((entry) => entry.startsWith("alive:node-b:"))).toBe(true);
+    expect(observed.some((entry) => entry === "suspect:node-b:channel_closed")).toBe(true);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("actively probes websocket peers and marks them alive on pong", async () => {
+    const timers = new ManualTimers();
+    const observed: string[] = [];
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret"
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        peerProbeIntervalMs: 50,
+        peerPingTimeoutMs: 10,
+        peerHealthObserver: {
+          markAlive(nodeId, detail) {
+            observed.push(`alive:${nodeId}:${detail}`);
+          },
+          markSuspect(nodeId, detail) {
+            observed.push(`suspect:${nodeId}:${detail}`);
+          }
+        },
+        timers,
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    clientNetwork.startPeerProbes();
+    await flushMicrotasks();
+    timers.tickIntervals();
+    await flushMicrotasks();
+
+    expect(observed.some((entry) => entry === "alive:node-b:pong")).toBe(true);
+    expect(observed.some((entry) => entry.startsWith("suspect:node-b:probe_timeout"))).toBe(false);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("marks a websocket peer suspect when an active probe misses pong", async () => {
+    const timers = new ManualTimers();
+    const observed: string[] = [];
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret"
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        peerProbeIntervalMs: 50,
+        peerPingTimeoutMs: 10,
+        peerHealthObserver: {
+          markAlive(nodeId, detail) {
+            observed.push(`alive:${nodeId}:${detail}`);
+          },
+          markSuspect(nodeId, detail) {
+            observed.push(`suspect:${nodeId}:${detail}`);
+          }
+        },
+        timers,
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            const raw = String(event.data ?? "");
+            if (raw.includes('"type":"ping"')) {
+              return;
+            }
+            void serverNetwork.messageServerSocket(serverSocket, raw);
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    clientNetwork.startPeerProbes();
+    await flushMicrotasks();
+    timers.tickIntervals();
+    await flushMicrotasks();
+    timers.runNextTimeout();
+
+    expect(observed.some((entry) => entry === "suspect:node-b:probe_timeout")).toBe(true);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("broadcasts peer health rumors over the websocket cluster channel", async () => {
+    const receivedRumors: Array<{
+      fromNodeId: string;
+      nodeId: string;
+      status: string;
+      incarnation: number;
+    }> = [];
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret",
+      peerHealthObserver: {
+        markAlive() {},
+        markSuspect() {},
+        applyRumor(rumor, fromNodeId) {
+          receivedRumors.push({
+            fromNodeId,
+            nodeId: rumor.nodeId,
+            status: rumor.status,
+            incarnation: rumor.incarnation
+          });
+        }
+      }
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    await clientNetwork.warmConnections();
+    await clientNetwork.broadcastPeerHealthRumor(
+      {
+        nodeId: "node-c",
+        status: "suspect",
+        incarnation: 3,
+        updatedAt: Date.now(),
+        detail: "probe_timeout",
+        source: "local"
+      },
+      {
+        excludeNodeIds: ["node-c"]
+      }
+    );
+
+    expect(receivedRumors).toEqual([
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-c",
+        status: "suspect",
+        incarnation: 3
+      }
+    ]);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("broadcasts peer health sync snapshots over the websocket cluster channel", async () => {
+    const metrics = new InMemoryMetrics();
+    const receivedRumors: Array<{
+      fromNodeId: string;
+      nodeId: string;
+      status: string;
+      incarnation: number;
+    }> = [];
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret",
+      peerHealthObserver: {
+        markAlive() {},
+        markSuspect() {},
+        applyRumor(rumor, fromNodeId) {
+          receivedRumors.push({
+            fromNodeId,
+            nodeId: rumor.nodeId,
+            status: rumor.status,
+            incarnation: rumor.incarnation
+          });
+        }
+      }
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        metrics,
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    await clientNetwork.warmConnections();
+    const snapshots = [
+      {
+        nodeId: "node-c",
+        status: "alive",
+        incarnation: 5,
+        updatedAt: Date.now(),
+        lastAliveAt: 123,
+        detail: "pong",
+        source: "local"
+      },
+      {
+        nodeId: "node-d",
+        status: "dead",
+        incarnation: 2,
+        updatedAt: Date.now(),
+        detail: "channel_closed",
+        source: "local"
+      }
+    ] as const;
+    await clientNetwork.broadcastPeerHealthSync([...snapshots]);
+
+    expect(receivedRumors).toEqual([
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-c",
+        status: "alive",
+        incarnation: 5
+      },
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-d",
+        status: "dead",
+        incarnation: 2
+      }
+    ]);
+
+    receivedRumors.length = 0;
+    await clientNetwork.broadcastPeerHealthSync([...snapshots]);
+    expect(receivedRumors).toEqual([]);
+
+    await clientNetwork.broadcastPeerHealthSync([
+      {
+        ...snapshots[0],
+        status: "suspect",
+        incarnation: 6
+      },
+      snapshots[1]
+    ]);
+    expect(receivedRumors).toEqual([
+      {
+        fromNodeId: "node-a",
+        nodeId: "node-c",
+        status: "suspect",
+        incarnation: 6
+      }
+    ]);
+    expect(metrics.snapshot().counters).toEqual(
+      expect.objectContaining({
+        "cluster.peer_health_sync_out": 2,
+        "cluster.peer_health_sync_item_out": 3,
+        "cluster.peer_health_sync_skip": 1
+      })
+    );
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
+  it("runs periodic peer health sync when anti-entropy is enabled", async () => {
+    const timers = new ManualTimers();
+    const metrics = new InMemoryMetrics();
+    const receivedRumors: string[] = [];
+    let currentIncarnation = 9;
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret",
+      peerHealthObserver: {
+        markAlive() {},
+        markSuspect() {},
+        applyRumor(rumor) {
+          receivedRumors.push(`${rumor.nodeId}:${rumor.status}:${rumor.incarnation}`);
+        }
+      }
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        peerProbeIntervalMs: 50,
+        peerPingTimeoutMs: 10,
+        peerAntiEntropyIntervalMs: 25,
+        metrics,
+        peerHealthSnapshotProvider() {
+          return [
+            {
+              nodeId: "node-c",
+              status: "suspect",
+              incarnation: currentIncarnation,
+              updatedAt: 1,
+              detail: "probe_timeout",
+              source: "local"
+            }
+          ];
+        },
+        timers,
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    clientNetwork.startPeerProbes();
+    await flushMicrotasks();
+    timers.tickIntervals();
+    await flushMicrotasks();
+
+    expect(receivedRumors).toContain("node-c:suspect:9");
+    receivedRumors.length = 0;
+    timers.tickIntervals();
+    await flushMicrotasks();
+    expect(receivedRumors).toEqual([]);
+
+    currentIncarnation = 10;
+    timers.tickIntervals();
+    await flushMicrotasks();
+    expect(receivedRumors).toContain("node-c:suspect:10");
+    expect(metrics.snapshot().counters["cluster.peer_health_sync_skip"]).toBeGreaterThanOrEqual(1);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
+  });
+
   it("falls back to http delivery when the websocket cluster channel is unavailable", async () => {
     const fetchFn = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
       expect(init?.method).toBe("POST");
@@ -445,6 +981,56 @@ describe("StaticClusterNetwork", () => {
 
     expect(delivered).toEqual([{ nodeId: "node-b", connId: "conn-bob", peerId: "bob" }]);
     expect(fetchFn).toHaveBeenCalled();
+  });
+
+  it("can disconnect a peer channel without dropping the configured peer table", async () => {
+    let clientSocketRef: FakeClusterSocket | undefined;
+    const serverNetwork = new StaticClusterNetwork([], {
+      nodeId: "node-b",
+      sharedSecret: "secret"
+    });
+    serverNetwork.setServerHandlers({
+      async deliver(payload) {
+        return payload.targets;
+      },
+      async handleAck() {
+        return true;
+      }
+    });
+
+    const clientNetwork = new StaticClusterNetwork(
+      [{ nodeId: "node-b", baseUrl: "http://node-b.internal" }],
+      {
+        nodeId: "node-a",
+        transport: "ws",
+        sharedSecret: "secret",
+        socketFactory() {
+          const [clientSocket, serverSocket] = createSocketPair();
+          clientSocketRef = clientSocket;
+          serverNetwork.openServerSocket(serverSocket);
+          serverSocket.addEventListener("message", (event: { data?: unknown }) => {
+            void serverNetwork.messageServerSocket(serverSocket, String(event.data ?? ""));
+          });
+          serverSocket.addEventListener("close", () => {
+            serverNetwork.closeServerSocket(serverSocket);
+          });
+          queueMicrotask(() => {
+            serverSocket.open();
+            clientSocket.open();
+          });
+          return clientSocket;
+        }
+      }
+    );
+
+    await clientNetwork.warmConnections();
+    clientNetwork.disconnectPeer("node-b", "peer_dead");
+
+    expect(clientNetwork.listPeers()).toEqual([{ nodeId: "node-b", baseUrl: "http://node-b.internal" }]);
+    expect(clientSocketRef?.readyState).toBe(3);
+
+    clientNetwork.dispose();
+    serverNetwork.dispose();
   });
 
   it("waits for queue capacity before failing with cluster outbound overflow", async () => {

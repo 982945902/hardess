@@ -1,4 +1,9 @@
 import type { AckMode, ConnRef, Envelope } from "../../shared/types.ts";
+import type {
+  ClusterPeerHealthRumor,
+  ClusterPeerHealthSnapshot,
+  ClusterPeerHealthStatus
+} from "./health.ts";
 import {
   parseClusterDeliverResponse,
   parseClusterLocateResponse,
@@ -9,6 +14,8 @@ import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 
 type ClusterMessage = ClusterSocketMessage;
+type TimeoutHandle = ReturnType<typeof setTimeout>;
+type IntervalHandle = ReturnType<typeof setInterval>;
 
 export interface ClusterPeerNode {
   nodeId: string;
@@ -21,7 +28,7 @@ interface ClusterPendingRequest {
   nodeId: string;
   resolve(value: unknown): void;
   reject(error: Error): void;
-  timeout: ReturnType<typeof setTimeout>;
+  timeout: TimeoutHandle;
 }
 
 interface ClusterOutboundMessage {
@@ -29,6 +36,13 @@ interface ClusterOutboundMessage {
   bytes: number;
   resolve(): void;
   reject(error: Error): void;
+}
+
+interface ClusterPeerHealthSyncRumor {
+  peerNodeId: string;
+  status: Exclude<ClusterPeerHealthStatus, "unknown">;
+  incarnation: number;
+  lastAliveAt?: number;
 }
 
 interface ClusterChannel {
@@ -49,6 +63,19 @@ interface ClusterServerHandlers {
     ackFor: string;
     traceId?: string;
   }): Promise<boolean>;
+}
+
+export interface ClusterPeerHealthObserver {
+  markAlive(nodeId: string, detail?: string): void;
+  markSuspect(nodeId: string, detail?: string): void;
+  applyRumor?(rumor: ClusterPeerHealthRumor, fromNodeId: string): boolean | void;
+}
+
+interface ClusterNetworkTimers {
+  setTimeout(callback: () => void, delay: number): TimeoutHandle;
+  clearTimeout(timeout: TimeoutHandle): void;
+  setInterval(callback: () => void, delay: number): IntervalHandle;
+  clearInterval(interval: IntervalHandle): void;
 }
 
 interface ClusterSocketMessageEvent {
@@ -77,11 +104,17 @@ export interface ClusterNetworkOptions {
   outboundMaxQueueMessages?: number;
   outboundMaxQueueBytes?: number;
   outboundBackpressureRetryMs?: number;
+  peerProbeIntervalMs?: number;
+  peerPingTimeoutMs?: number;
+  peerAntiEntropyIntervalMs?: number;
   metrics?: Metrics;
   fetchFn?: typeof fetch;
   transport?: ClusterTransport;
   socketFactory?: (url: string) => ClusterSocket;
   logger?: Logger;
+  peerHealthObserver?: ClusterPeerHealthObserver;
+  peerHealthSnapshotProvider?: () => ClusterPeerHealthSnapshot[];
+  timers?: Partial<ClusterNetworkTimers>;
 }
 
 function parseClusterMessage(raw: unknown): ClusterMessage | null {
@@ -111,24 +144,37 @@ export class StaticClusterNetwork {
   private static readonly DEFAULT_OUTBOUND_BACKPRESSURE_RETRY_MS = 10;
   private static readonly DEFAULT_MAX_OUTBOUND_QUEUE_MESSAGES = 16_384;
   private static readonly DEFAULT_MAX_OUTBOUND_QUEUE_BYTES = 8 * 1024 * 1024;
+  private static readonly DEFAULT_PEER_PROBE_INTERVAL_MS = 2_000;
+  private static readonly DEFAULT_PEER_PING_TIMEOUT_MS = 1_000;
+  private static readonly DEFAULT_PEER_ANTI_ENTROPY_INTERVAL_MS = 15_000;
   private readonly peersByNodeId = new Map<string, ClusterPeerNode>();
   private readonly fetchFn: typeof fetch;
   private readonly requestTimeoutMs: number;
   private readonly outboundMaxQueueMessages: number;
   private readonly outboundMaxQueueBytes: number;
   private readonly outboundBackpressureRetryMs: number;
+  private readonly peerProbeIntervalMs: number;
+  private readonly peerPingTimeoutMs: number;
+  private readonly peerAntiEntropyIntervalMs: number;
   private readonly transport: ClusterTransport;
   private readonly socketFactory: (url: string) => ClusterSocket;
   private readonly metrics: Metrics;
+  private readonly timers: ClusterNetworkTimers;
   private readonly channelsByNodeId = new Map<string, ClusterChannel>();
   private readonly pendingRequests = new Map<string, ClusterPendingRequest>();
+  private readonly pendingProbeByNodeId = new Map<string, { ts: number; timeout: TimeoutHandle }>();
+  private readonly peerHealthSyncStateByPeerNodeId = new Map<string, Map<string, string>>();
   private readonly connectingByNodeId = new Map<string, Promise<ClusterChannel>>();
   private readonly nodeIdBySocket = new WeakMap<ClusterSocket, string>();
   private readonly serverSockets = new Set<ClusterSocket>();
   private readonly outboundQueueBySocket = new WeakMap<ClusterSocket, ClusterOutboundMessage[]>();
   private readonly outboundQueuedBytesBySocket = new WeakMap<ClusterSocket, number>();
-  private readonly outboundDrainTimerBySocket = new WeakMap<ClusterSocket, ReturnType<typeof setTimeout>>();
+  private readonly outboundDrainTimerBySocket = new WeakMap<ClusterSocket, TimeoutHandle>();
   private readonly outboundDrainScheduled = new WeakSet<ClusterSocket>();
+  private readonly peerHealthObserver?: ClusterPeerHealthObserver;
+  private peerProbeTimer?: IntervalHandle;
+  private peerAntiEntropyTimer?: IntervalHandle;
+  private peerProbeInFlight = false;
   private serverHandlers?: ClusterServerHandlers;
 
   constructor(
@@ -144,9 +190,22 @@ export class StaticClusterNetwork {
       options.outboundMaxQueueBytes ?? StaticClusterNetwork.DEFAULT_MAX_OUTBOUND_QUEUE_BYTES;
     this.outboundBackpressureRetryMs =
       options.outboundBackpressureRetryMs ?? StaticClusterNetwork.DEFAULT_OUTBOUND_BACKPRESSURE_RETRY_MS;
+    this.peerProbeIntervalMs =
+      options.peerProbeIntervalMs ?? StaticClusterNetwork.DEFAULT_PEER_PROBE_INTERVAL_MS;
+    this.peerPingTimeoutMs =
+      options.peerPingTimeoutMs ?? StaticClusterNetwork.DEFAULT_PEER_PING_TIMEOUT_MS;
+    this.peerAntiEntropyIntervalMs =
+      options.peerAntiEntropyIntervalMs ?? StaticClusterNetwork.DEFAULT_PEER_ANTI_ENTROPY_INTERVAL_MS;
     this.transport = options.transport ?? "http";
     this.socketFactory = options.socketFactory ?? ((url) => new WebSocket(url) as unknown as ClusterSocket);
     this.metrics = options.metrics ?? new NoopMetrics();
+    this.timers = {
+      setTimeout: options.timers?.setTimeout ?? setTimeout,
+      clearTimeout: options.timers?.clearTimeout ?? clearTimeout,
+      setInterval: options.timers?.setInterval ?? setInterval,
+      clearInterval: options.timers?.clearInterval ?? clearInterval
+    };
+    this.peerHealthObserver = options.peerHealthObserver;
   }
 
   listPeers(): ClusterPeerNode[] {
@@ -163,8 +222,17 @@ export class StaticClusterNetwork {
       if (nextPeersByNodeId.has(nodeId)) {
         continue;
       }
+      this.clearPendingProbe(nodeId);
+      this.peerHealthSyncStateByPeerNodeId.delete(nodeId);
       channel.socket.close(1012, "cluster peer removed");
       this.channelsByNodeId.delete(nodeId);
+    }
+
+    for (const nodeId of this.pendingProbeByNodeId.keys()) {
+      if (nextPeersByNodeId.has(nodeId)) {
+        continue;
+      }
+      this.clearPendingProbe(nodeId);
     }
 
     this.peersByNodeId.clear();
@@ -329,8 +397,9 @@ export class StaticClusterNetwork {
   }
 
   dispose(): void {
+    this.stopPeerProbes();
     for (const pending of this.pendingRequests.values()) {
-      clearTimeout(pending.timeout);
+      this.timers.clearTimeout(pending.timeout);
       pending.reject(new Error("Cluster network disposed"));
     }
     this.pendingRequests.clear();
@@ -339,6 +408,20 @@ export class StaticClusterNetwork {
       channel.socket.close(1012, "cluster network disposed");
     }
     this.channelsByNodeId.clear();
+  }
+
+  disconnectPeer(nodeId: string, reason = "cluster peer disconnected"): void {
+    this.clearPendingProbe(nodeId);
+    const channel = this.channelsByNodeId.get(nodeId);
+    if (!channel) {
+      return;
+    }
+
+    try {
+      channel.socket.close(1012, reason);
+    } catch {}
+    this.channelsByNodeId.delete(nodeId);
+    this.notePeerSuspect(nodeId, reason);
   }
 
   async warmConnections(): Promise<void> {
@@ -353,6 +436,227 @@ export class StaticClusterNetwork {
     );
   }
 
+  async broadcastPeerHealthRumor(
+    snapshot: ClusterPeerHealthSnapshot,
+    options: {
+      excludeNodeIds?: string[];
+    } = {}
+  ): Promise<void> {
+    if (this.transport !== "ws" || snapshot.status === "unknown") {
+      return;
+    }
+
+    const rumor = this.toPeerHealthRumor(snapshot);
+    const excludedNodeIds = new Set(options.excludeNodeIds ?? []);
+    await Promise.allSettled(
+      this.listPeers()
+        .filter((peer) => !excludedNodeIds.has(peer.nodeId))
+        .map(async (peer) => {
+          try {
+            const channel = await this.ensureChannel(peer.nodeId);
+            await this.sendMessage(
+              channel.socket,
+              JSON.stringify({
+                type: "peerHealthRumor",
+                peerNodeId: rumor.nodeId,
+                status: rumor.status,
+                incarnation: rumor.incarnation,
+                lastAliveAt: rumor.lastAliveAt
+              } satisfies ClusterMessage)
+            );
+            this.metrics.increment("cluster.peer_health_rumor_out");
+          } catch {
+            return;
+          }
+        })
+    );
+  }
+
+  async broadcastPeerHealthSync(
+    snapshots: ClusterPeerHealthSnapshot[],
+    options: {
+      excludeNodeIds?: string[];
+    } = {}
+  ): Promise<void> {
+    if (this.transport !== "ws") {
+      return;
+    }
+
+    const eligibleSnapshots = snapshots.filter((snapshot) => snapshot.status !== "unknown");
+    if (eligibleSnapshots.length === 0) {
+      return;
+    }
+
+    const excludedNodeIds = new Set(options.excludeNodeIds ?? []);
+    await Promise.allSettled(
+      this.listPeers()
+        .filter((peer) => !excludedNodeIds.has(peer.nodeId))
+        .map(async (peer) => {
+          const rumors = this.buildIncrementalPeerHealthSync(peer.nodeId, eligibleSnapshots);
+          if (rumors.length === 0) {
+            this.metrics.increment("cluster.peer_health_sync_skip");
+            return;
+          }
+
+          try {
+            const channel = await this.ensureChannel(peer.nodeId);
+            await this.sendMessage(
+              channel.socket,
+              JSON.stringify({
+                type: "peerHealthSync",
+                rumors
+              } satisfies ClusterMessage)
+            );
+            this.recordPeerHealthSync(peer.nodeId, rumors);
+            this.metrics.increment("cluster.peer_health_sync_out");
+            this.metrics.increment("cluster.peer_health_sync_item_out", rumors.length);
+          } catch {
+            return;
+          }
+        })
+    );
+  }
+
+  startPeerProbes(): void {
+    if (this.transport !== "ws" || this.peerProbeTimer !== undefined) {
+      return;
+    }
+
+    this.peerProbeTimer = this.timers.setInterval(() => {
+      void this.runPeerProbes();
+    }, this.peerProbeIntervalMs);
+    void this.runPeerProbes();
+
+    if (this.peerAntiEntropyIntervalMs > 0 && this.peerAntiEntropyTimer === undefined) {
+      this.peerAntiEntropyTimer = this.timers.setInterval(() => {
+        void this.runPeerHealthSync();
+      }, this.peerAntiEntropyIntervalMs);
+      void this.runPeerHealthSync();
+    }
+  }
+
+  stopPeerProbes(): void {
+    if (this.peerProbeTimer !== undefined) {
+      this.timers.clearInterval(this.peerProbeTimer);
+      this.peerProbeTimer = undefined;
+    }
+    if (this.peerAntiEntropyTimer !== undefined) {
+      this.timers.clearInterval(this.peerAntiEntropyTimer);
+      this.peerAntiEntropyTimer = undefined;
+    }
+
+    for (const nodeId of this.pendingProbeByNodeId.keys()) {
+      this.clearPendingProbe(nodeId);
+    }
+  }
+
+  private async runPeerProbes(): Promise<void> {
+    if (this.peerProbeInFlight) {
+      return;
+    }
+
+    this.peerProbeInFlight = true;
+    try {
+      await Promise.allSettled(
+        this.listPeers().map(async (peer) => {
+          await this.probePeer(peer.nodeId);
+        })
+      );
+    } finally {
+      this.peerProbeInFlight = false;
+    }
+  }
+
+  private async probePeer(nodeId: string): Promise<void> {
+    if (this.pendingProbeByNodeId.has(nodeId)) {
+      return;
+    }
+
+    try {
+      const channel = await this.ensureChannel(nodeId);
+      const ts = Date.now();
+      const timeout = this.timers.setTimeout(() => {
+        this.pendingProbeByNodeId.delete(nodeId);
+        this.metrics.increment("cluster.probe_timeout");
+        this.notePeerSuspect(nodeId, "probe_timeout");
+      }, this.peerPingTimeoutMs);
+      this.pendingProbeByNodeId.set(nodeId, { ts, timeout });
+      await this.sendMessage(
+        channel.socket,
+        JSON.stringify({
+          type: "ping",
+          ts
+        } satisfies ClusterMessage)
+      );
+    } catch (error) {
+      this.notePeerSuspect(nodeId, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async runPeerHealthSync(): Promise<void> {
+    const snapshots = this.options.peerHealthSnapshotProvider?.() ?? [];
+    await this.broadcastPeerHealthSync(snapshots);
+  }
+
+  private clearPendingProbe(nodeId: string): void {
+    const pendingProbe = this.pendingProbeByNodeId.get(nodeId);
+    if (!pendingProbe) {
+      return;
+    }
+
+    this.timers.clearTimeout(pendingProbe.timeout);
+    this.pendingProbeByNodeId.delete(nodeId);
+  }
+
+  private notePeerAlive(nodeId: string, detail?: string): void {
+    this.clearPendingProbe(nodeId);
+    this.peerHealthObserver?.markAlive(nodeId, detail);
+  }
+
+  private notePeerSuspect(nodeId: string, detail?: string): void {
+    this.clearPendingProbe(nodeId);
+    this.peerHealthObserver?.markSuspect(nodeId, detail);
+  }
+
+  private toPeerHealthRumor(snapshot: ClusterPeerHealthSnapshot): ClusterPeerHealthRumor {
+    return {
+      nodeId: snapshot.nodeId,
+      status: snapshot.status as Exclude<ClusterPeerHealthStatus, "unknown">,
+      incarnation: snapshot.incarnation,
+      lastAliveAt: snapshot.lastAliveAt
+    };
+  }
+
+  private buildIncrementalPeerHealthSync(
+    peerNodeId: string,
+    snapshots: ClusterPeerHealthSnapshot[]
+  ): ClusterPeerHealthSyncRumor[] {
+    const lastSentByNodeId = this.peerHealthSyncStateByPeerNodeId.get(peerNodeId);
+    return snapshots
+      .map((snapshot) => ({
+        peerNodeId: snapshot.nodeId,
+        status: snapshot.status as Exclude<ClusterPeerHealthStatus, "unknown">,
+        incarnation: snapshot.incarnation,
+        lastAliveAt: snapshot.lastAliveAt
+      }))
+      .filter((rumor) => {
+        const fingerprint = this.peerHealthSyncFingerprint(rumor);
+        return lastSentByNodeId?.get(rumor.peerNodeId) !== fingerprint;
+      });
+  }
+
+  private recordPeerHealthSync(peerNodeId: string, rumors: ClusterPeerHealthSyncRumor[]): void {
+    const peerState = this.peerHealthSyncStateByPeerNodeId.get(peerNodeId) ?? new Map<string, string>();
+    for (const rumor of rumors) {
+      peerState.set(rumor.peerNodeId, this.peerHealthSyncFingerprint(rumor));
+    }
+    this.peerHealthSyncStateByPeerNodeId.set(peerNodeId, peerState);
+  }
+
+  private peerHealthSyncFingerprint(rumor: ClusterPeerHealthSyncRumor): string {
+    return `${rumor.status}:${rumor.incarnation}:${rumor.lastAliveAt ?? ""}`;
+  }
+
   private async sendRequest(
     nodeId: string,
     payload:
@@ -363,9 +667,10 @@ export class StaticClusterNetwork {
     const ref = crypto.randomUUID();
 
     return await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const timeout = this.timers.setTimeout(() => {
         this.pendingRequests.delete(ref);
         this.metrics.increment("cluster.request_timeout");
+        this.notePeerSuspect(nodeId, `request_timeout:${payload.type}`);
         reject(new Error(`Cluster request timed out: ${payload.type} -> ${nodeId}`));
       }, this.requestTimeoutMs);
       this.pendingRequests.set(ref, {
@@ -376,7 +681,7 @@ export class StaticClusterNetwork {
       });
 
       void this.sendMessage(channel.socket, JSON.stringify({ ...payload, ref })).catch((error) => {
-        clearTimeout(timeout);
+        this.timers.clearTimeout(timeout);
         this.pendingRequests.delete(ref);
         reject(error instanceof Error ? error : new Error(String(error)));
       });
@@ -403,11 +708,12 @@ export class StaticClusterNetwork {
           return;
         }
         settled = true;
-        clearTimeout(connectTimer);
+        this.timers.clearTimeout(connectTimer);
         this.connectingByNodeId.delete(nodeId);
         try {
           socket.close(1013, message);
         } catch {}
+        this.notePeerSuspect(nodeId, message);
         reject(new Error(message));
       };
       const finishResolve = (channel: ClusterChannel) => {
@@ -415,11 +721,11 @@ export class StaticClusterNetwork {
           return;
         }
         settled = true;
-        clearTimeout(connectTimer);
+        this.timers.clearTimeout(connectTimer);
         this.connectingByNodeId.delete(nodeId);
         resolve(channel);
       };
-      const connectTimer = setTimeout(() => {
+      const connectTimer = this.timers.setTimeout(() => {
         finishReject(`Cluster socket connect timed out: ${nodeId}`);
       }, this.requestTimeoutMs);
 
@@ -450,6 +756,7 @@ export class StaticClusterNetwork {
               connectedAt: Date.now()
             };
             this.registerChannel(channel);
+            this.notePeerAlive(nodeId, "hello_ack");
             finishResolve(channel);
           }
         }).catch((error) => {
@@ -510,6 +817,7 @@ export class StaticClusterNetwork {
           socket,
           connectedAt: Date.now()
         });
+        this.notePeerAlive(message.nodeId, "hello");
         await this.sendMessage(
           socket,
           JSON.stringify({
@@ -520,12 +828,58 @@ export class StaticClusterNetwork {
         return;
       case "helloAck":
         this.nodeIdBySocket.set(socket, message.nodeId);
+        this.notePeerAlive(message.nodeId, "hello_ack");
         hooks.onHelloAck?.(message.nodeId);
         return;
       case "ping":
+        if (remoteNodeId) {
+          this.notePeerAlive(remoteNodeId, "ping");
+        }
         await this.sendMessage(socket, JSON.stringify({ type: "pong", ts: message.ts } satisfies ClusterMessage));
         return;
       case "pong":
+        if (remoteNodeId) {
+          this.notePeerAlive(remoteNodeId, "pong");
+        }
+        return;
+      case "peerHealthRumor":
+        if (remoteNodeId) {
+          this.notePeerAlive(remoteNodeId, "peer_health_rumor");
+          const applied = this.peerHealthObserver?.applyRumor?.(
+            {
+              nodeId: message.peerNodeId,
+              status: message.status,
+              incarnation: message.incarnation,
+              lastAliveAt: message.lastAliveAt
+            },
+            remoteNodeId
+          );
+          this.metrics.increment("cluster.peer_health_rumor_in");
+          this.metrics.increment(
+            applied === false ? "cluster.peer_health_rumor_ignored" : "cluster.peer_health_rumor_applied"
+          );
+        }
+        return;
+      case "peerHealthSync":
+        if (remoteNodeId) {
+          this.notePeerAlive(remoteNodeId, "peer_health_sync");
+          for (const rumor of message.rumors) {
+            const applied = this.peerHealthObserver?.applyRumor?.(
+              {
+                nodeId: rumor.peerNodeId,
+                status: rumor.status,
+                incarnation: rumor.incarnation,
+                lastAliveAt: rumor.lastAliveAt
+              },
+              remoteNodeId
+            );
+            this.metrics.increment(
+              applied === false ? "cluster.peer_health_sync_item_ignored" : "cluster.peer_health_sync_item_applied"
+            );
+          }
+          this.metrics.increment("cluster.peer_health_sync_in");
+          this.metrics.increment("cluster.peer_health_sync_item_in", message.rumors.length);
+        }
         return;
       case "deliver": {
         if (!this.serverHandlers) {
@@ -576,14 +930,16 @@ export class StaticClusterNetwork {
           return;
         }
 
-        clearTimeout(pending.timeout);
+        this.timers.clearTimeout(pending.timeout);
         this.pendingRequests.delete(message.ref);
         if (message.error) {
           this.metrics.increment("cluster.deliver_error");
+          this.notePeerSuspect(pending.nodeId, `deliver_error:${message.error}`);
           pending.reject(new Error(message.error));
           return;
         }
 
+        this.notePeerAlive(pending.nodeId, "deliver_result");
         pending.resolve({
           deliveredConns: message.deliveredConns
         });
@@ -637,14 +993,19 @@ export class StaticClusterNetwork {
           return;
         }
 
-        clearTimeout(pending.timeout);
+        this.timers.clearTimeout(pending.timeout);
         this.pendingRequests.delete(message.ref);
         if (!message.ok) {
           this.metrics.increment("cluster.handle_ack_error");
+          this.notePeerSuspect(
+            pending.nodeId,
+            `handle_ack_error:${message.error ?? "unknown"}`
+          );
           pending.reject(new Error(message.error ?? "Cluster handleAck failed"));
           return;
         }
 
+        this.notePeerAlive(pending.nodeId, "handle_ack_result");
         pending.resolve(undefined);
         return;
       }
@@ -657,6 +1018,7 @@ export class StaticClusterNetwork {
       existing.socket.close(1000, "cluster channel replaced");
     }
 
+    this.peerHealthSyncStateByPeerNodeId.delete(channel.nodeId);
     this.channelsByNodeId.set(channel.nodeId, channel);
     this.nodeIdBySocket.set(channel.socket, channel.nodeId);
   }
@@ -670,14 +1032,17 @@ export class StaticClusterNetwork {
     this.outboundQueuedBytesBySocket.delete(socket);
     const drainTimer = this.outboundDrainTimerBySocket.get(socket);
     if (drainTimer !== undefined) {
-      clearTimeout(drainTimer);
+      this.timers.clearTimeout(drainTimer);
       this.outboundDrainTimerBySocket.delete(socket);
     }
     this.outboundDrainScheduled.delete(socket);
 
     const nodeId = this.nodeIdBySocket.get(socket);
     if (nodeId) {
+      this.clearPendingProbe(nodeId);
+      this.peerHealthSyncStateByPeerNodeId.delete(nodeId);
       this.metrics.increment("cluster.channel_closed");
+      this.notePeerSuspect(nodeId, "channel_closed");
       const current = this.channelsByNodeId.get(nodeId);
       if (current?.socket === socket) {
         this.channelsByNodeId.delete(nodeId);
@@ -687,7 +1052,7 @@ export class StaticClusterNetwork {
 
     for (const [ref, pending] of this.pendingRequests.entries()) {
       if (pending.nodeId === nodeId) {
-        clearTimeout(pending.timeout);
+        this.timers.clearTimeout(pending.timeout);
         this.pendingRequests.delete(ref);
         pending.reject(new Error(`Cluster channel closed: ${nodeId}`));
       }
@@ -705,7 +1070,7 @@ export class StaticClusterNetwork {
 
   private async request(peer: ClusterPeerNode, path: string, init: RequestInit): Promise<Response> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timeout = this.timers.setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
     try {
       const response = await this.fetchFn(`${peer.baseUrl}${path}`, {
@@ -718,12 +1083,20 @@ export class StaticClusterNetwork {
         }
       });
       if (!response.ok) {
+        this.notePeerSuspect(peer.nodeId, `http_${response.status}`);
         throw new Error(`Cluster request failed: ${peer.nodeId} ${path} ${response.status}`);
       }
 
+      this.notePeerAlive(peer.nodeId, `http_${path}`);
       return response;
+    } catch (error) {
+      this.notePeerSuspect(
+        peer.nodeId,
+        error instanceof Error ? error.message : String(error)
+      );
+      throw error;
     } finally {
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
     }
   }
 
@@ -781,7 +1154,7 @@ export class StaticClusterNetwork {
       return;
     }
 
-    const timer = setTimeout(() => {
+    const timer = this.timers.setTimeout(() => {
       this.outboundDrainTimerBySocket.delete(socket);
       this.scheduleDrain(socket);
     }, this.outboundBackpressureRetryMs);
@@ -839,7 +1212,7 @@ export class StaticClusterNetwork {
       }
 
       await new Promise<void>((resolve) => {
-        setTimeout(resolve, this.outboundBackpressureRetryMs);
+        this.timers.setTimeout(resolve, this.outboundBackpressureRetryMs);
       });
     }
   }

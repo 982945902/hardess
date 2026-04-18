@@ -22,6 +22,10 @@ export const RUNTIME_DEFAULTS = {
   clusterOutboundMaxQueueBytes: 8 * 1024 * 1024,
   clusterOutboundBackpressureRetryMs: 10,
   clusterLocatorCacheTtlMs: 250,
+  clusterPeerProbeIntervalMs: 2_000,
+  clusterPeerPingTimeoutMs: 1_000,
+  clusterPeerSuspectTimeoutMs: 5_000,
+  clusterPeerAntiEntropyIntervalMs: 15_000,
   internalForwardHttpTimeoutMs: 5_000,
   internalForwardWsConnectTimeoutMs: 5_000,
   shutdownDrainMs: 250,
@@ -63,6 +67,10 @@ export interface RuntimeBootstrapConfig {
     outboundMaxQueueBytes: number;
     outboundBackpressureRetryMs: number;
     locatorCacheTtlMs: number;
+    peerProbeIntervalMs: number;
+    peerPingTimeoutMs: number;
+    peerSuspectTimeoutMs: number;
+    peerAntiEntropyIntervalMs: number;
     transport: ClusterTransport;
   };
   websocket: {
@@ -129,6 +137,10 @@ export interface RuntimeTimeoutProfile {
     requestTimeoutMs: number;
     locatorCacheTtlMs: number;
     outboundBackpressureRetryMs: number;
+    peerProbeIntervalMs: number;
+    peerPingTimeoutMs: number;
+    peerSuspectTimeoutMs: number;
+    peerAntiEntropyIntervalMs: number;
   };
   internalForward: {
     httpTimeoutMs: number;
@@ -396,7 +408,11 @@ function createTimeoutProfile(config: Omit<RuntimeBootstrapConfig, "timeoutProfi
     cluster: {
       requestTimeoutMs: config.cluster.requestTimeoutMs,
       locatorCacheTtlMs: config.cluster.locatorCacheTtlMs,
-      outboundBackpressureRetryMs: config.cluster.outboundBackpressureRetryMs
+      outboundBackpressureRetryMs: config.cluster.outboundBackpressureRetryMs,
+      peerProbeIntervalMs: config.cluster.peerProbeIntervalMs,
+      peerPingTimeoutMs: config.cluster.peerPingTimeoutMs,
+      peerSuspectTimeoutMs: config.cluster.peerSuspectTimeoutMs,
+      peerAntiEntropyIntervalMs: config.cluster.peerAntiEntropyIntervalMs
     },
     internalForward: {
       httpTimeoutMs: config.internalForward.httpTimeoutMs,
@@ -481,6 +497,22 @@ export function parseRuntimeBootstrapConfig(env: Env): RuntimeBootstrapConfig {
     throw new Error("Invalid shutdown timeout config: SHUTDOWN_DRAIN_MS must be <= SHUTDOWN_TIMEOUT_MS");
   }
 
+  const clusterPeerPingTimeoutMs = parseRequiredPositiveMs(
+    env,
+    "CLUSTER_PEER_PING_TIMEOUT_MS",
+    RUNTIME_DEFAULTS.clusterPeerPingTimeoutMs
+  );
+  const clusterPeerSuspectTimeoutMs = parseRequiredPositiveMs(
+    env,
+    "CLUSTER_PEER_SUSPECT_TIMEOUT_MS",
+    RUNTIME_DEFAULTS.clusterPeerSuspectTimeoutMs
+  );
+  if (clusterPeerSuspectTimeoutMs <= clusterPeerPingTimeoutMs) {
+    throw new Error(
+      "Invalid cluster peer timing config: CLUSTER_PEER_SUSPECT_TIMEOUT_MS must be greater than CLUSTER_PEER_PING_TIMEOUT_MS"
+    );
+  }
+
   const adminBaseUrl = envString(env, "ADMIN_BASE_URL");
   const adminBusinessBaseUrl = envStringFirst(env, [
     "ADMIN_BUSINESS_BASE_URL",
@@ -549,6 +581,18 @@ export function parseRuntimeBootstrapConfig(env: Env): RuntimeBootstrapConfig {
         env,
         "CLUSTER_LOCATOR_CACHE_TTL_MS",
         RUNTIME_DEFAULTS.clusterLocatorCacheTtlMs
+      ),
+      peerProbeIntervalMs: parseRequiredPositiveMs(
+        env,
+        "CLUSTER_PEER_PROBE_INTERVAL_MS",
+        RUNTIME_DEFAULTS.clusterPeerProbeIntervalMs
+      ),
+      peerPingTimeoutMs: clusterPeerPingTimeoutMs,
+      peerSuspectTimeoutMs: clusterPeerSuspectTimeoutMs,
+      peerAntiEntropyIntervalMs: parseNonNegativeMs(
+        env,
+        "CLUSTER_PEER_ANTI_ENTROPY_INTERVAL_MS",
+        RUNTIME_DEFAULTS.clusterPeerAntiEntropyIntervalMs
       ),
       transport: parseClusterTransportEnv(envString(env, "CLUSTER_TRANSPORT"))
     },

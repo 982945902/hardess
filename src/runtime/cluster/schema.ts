@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { envelopeSchema, formatZodError } from "../../shared/schema.ts";
 import type { AckMode, ConnRef, Envelope } from "../../shared/types.ts";
+import type { ClusterPeerHealthStatus } from "./health.ts";
 import type { ClusterPeerNode, ClusterTransport } from "./network.ts";
 
 const connRefSchema = z.object({
@@ -62,6 +63,28 @@ const clusterPongMessageSchema = z.object({
   ts: z.number()
 });
 
+const clusterPeerHealthStatusSchema = z.enum(["alive", "suspect", "dead"]);
+
+const clusterPeerHealthRumorMessageSchema = z.object({
+  type: z.literal("peerHealthRumor"),
+  peerNodeId: z.string().min(1, "peerNodeId is required"),
+  status: clusterPeerHealthStatusSchema,
+  incarnation: z.number().int().min(1, "incarnation must be >= 1"),
+  lastAliveAt: z.number().optional()
+});
+
+const clusterPeerHealthSyncMessageSchema = z.object({
+  type: z.literal("peerHealthSync"),
+  rumors: z.array(
+    z.object({
+      peerNodeId: z.string().min(1, "peerNodeId is required"),
+      status: clusterPeerHealthStatusSchema,
+      incarnation: z.number().int().min(1, "incarnation must be >= 1"),
+      lastAliveAt: z.number().optional()
+    })
+  )
+});
+
 const clusterDeliverMessageSchema = z.object({
   type: z.literal("deliver"),
   ref: z.string().min(1, "ref is required"),
@@ -112,6 +135,8 @@ const clusterSocketMessageSchema = z.discriminatedUnion("type", [
   clusterHelloAckMessageSchema,
   clusterPingMessageSchema,
   clusterPongMessageSchema,
+  clusterPeerHealthRumorMessageSchema,
+  clusterPeerHealthSyncMessageSchema,
   clusterDeliverMessageSchema,
   clusterDeliverResultMessageSchema,
   clusterHandleAckMessageSchema,
@@ -135,6 +160,22 @@ export type ClusterSocketMessage =
   | {
       type: "pong";
       ts: number;
+    }
+  | {
+      type: "peerHealthRumor";
+      peerNodeId: string;
+      status: Exclude<ClusterPeerHealthStatus, "unknown">;
+      incarnation: number;
+      lastAliveAt?: number;
+    }
+  | {
+      type: "peerHealthSync";
+      rumors: Array<{
+        peerNodeId: string;
+        status: Exclude<ClusterPeerHealthStatus, "unknown">;
+        incarnation: number;
+        lastAliveAt?: number;
+      }>;
     }
   | {
       type: "deliver";

@@ -161,11 +161,49 @@ Dual-port does not change the runtime model. It only changes which listener acce
 
 So the current queueing / ack / bridge model can be reused directly.
 
-## 7. Cluster Membership Modes
+## 7. Cluster Peer Sources And Health Overlay
 
-Hardess should support two membership modes.
+Hardess should treat cluster peers and cluster peer health as two different
+layers.
 
-### 6.1 `config` Mode
+Short version:
+
+1. admin remains the source of truth for desired topology
+2. runtime may still support local discovery backends for non-admin deployments
+3. runtime health probing is only an overlay on top of admin-approved peers
+4. future gossip extends that overlay; it does not become membership authority
+
+Admin-driven runtime behavior:
+
+1. when admin / host-agent mode is enabled, runtime should consume the
+   admin-projected `topology.membership`
+2. that projected membership should feed the same `ClusterPeerNode[]` shape used
+   by the cluster transport
+3. admin-projected placement and route ownership remain the only authority for
+   owner selection and forward targets
+4. gossip must not replace admin placement, route ownership, or host-group
+   boundaries
+
+Current health-overlay behavior:
+
+1. the runtime passively observes control-channel success, failure, close, and
+   request-timeout events
+2. when `CLUSTER_TRANSPORT=ws`, the runtime actively probes admin-approved peers
+   with WS `ping/pong`
+3. missing probe responses mark a peer `suspect`; continued suspicion escalates
+   to `dead` after `CLUSTER_PEER_SUSPECT_TIMEOUT_MS`
+4. `dead` peers are locally skipped for locate probes and route forwarding until
+   a fresh alive observation returns them to service
+
+Future gossip mode:
+
+1. primary dissemination should be rumor-style liveness updates among approved
+   peers
+2. anti-entropy should be a slower repair loop for missed updates, not the hot
+   path
+3. both modes remain constrained by the admin-projected peer set
+
+### 7.1 `config` Mode
 
 This is the current baseline.
 
@@ -189,7 +227,7 @@ Important note:
 1. this is a node table, not a `peerId -> nodeId` table
 2. business peer ownership is still resolved dynamically by `PeerLocator`
 
-### 6.2 `swarm` Mode
+### 7.2 `swarm` Mode
 
 This adds a second source for node discovery.
 
@@ -222,6 +260,51 @@ Swarm mode replaces node discovery only. It does not replace:
 2. `Dispatcher`
 3. `deliver` / `handleAck` protocol behavior
 4. SDK semantics
+
+### 7.3 Gossip Health Overlay
+
+The current runtime has started this as a WS health overlay and rumor path, but
+it must still be treated as an enhancement to runtime health convergence, not as
+a third control plane.
+
+Its allowed responsibilities are:
+
+1. faster `alive` / `suspect` / `dead` propagation between already-known nodes
+2. faster endpoint or incarnation change propagation for already-known nodes
+3. local cache invalidation and channel teardown when a known node degrades
+4. health annotation used to filter or de-prioritize peer targets that admin has
+   already approved
+
+Its forbidden responsibilities are:
+
+1. creating new cluster peers outside admin-projected membership
+2. changing deployment placement
+3. changing route ownership
+4. redefining host-group boundaries
+5. replacing admin as the source of truth for desired topology
+
+Current implementation stage:
+
+1. passive transport observations already update local peer health
+2. active WS `ping/pong` probes already mark peers `alive` or `suspect`
+3. health changes are now disseminated as rumor-style WS control messages
+4. periodic anti-entropy repair now runs over the same WS control channel using per-peer incremental sync
+5. connection re-establishment resets that peer's repair state so the next sync acts like a fresh baseline repair
+
+Recommended runtime merge rule:
+
+```text
+effective peers
+  = admin projected peers
+  + gossip health annotation
+```
+
+Not:
+
+```text
+effective peers
+  = gossip discovered peers
+```
 
 ## 8. Swarm Topology
 
@@ -320,7 +403,7 @@ This change does not attempt to solve:
 
 1. distributed durable routing state
 2. global session registry
-3. gossip membership
+3. gossip replacing admin topology
 4. automatic leader election
 5. control-plane rollout or version management
 6. protocol-level changes to the SDK
@@ -344,7 +427,8 @@ The intended v1 shape is:
 2. one node stays one process
 3. one node keeps one shared connection-routing state space
 4. the network boundary becomes dual-port
-5. cluster node discovery supports both static config and Swarm-backed discovery
+5. cluster peers can come from admin projection, static config, or Swarm-backed discovery
+6. current probing and future gossip only overlay health on top of those approved peers
 
 This keeps the current runtime model intact while making the deployment boundary correct.
 
