@@ -6,9 +6,13 @@ import type {
   HostRegistration,
   MembershipHostState,
   MembershipSnapshot,
+  PlacementIngressGroupRequirement,
   ObservedHostState
 } from "../../shared/index.ts";
 import type { PlacementSnapshot } from "../../shared/index.ts";
+import {
+  toServiceModuleProtocolPackageRef
+} from "../../shared/index.ts";
 
 export type HttpWorkerAssignmentMode = "select-first-n-hosts" | "all-hosts";
 export type HttpWorkerRouteScope = "shared" | "per_host";
@@ -266,6 +270,8 @@ export function buildPlacementSnapshot(input: {
     }
   }
 
+  const ingressGroupRequirements = buildIngressGroupRequirements(input.desiredHostStates);
+
   return {
     revision: input.revision,
     generatedAt: input.generatedAt ?? Date.now(),
@@ -287,7 +293,8 @@ export function buildPlacementSnapshot(input: {
           }))
           .sort((left, right) => left.routeId.localeCompare(right.routeId))
       }))
-      .sort((left, right) => left.deploymentId.localeCompare(right.deploymentId))
+      .sort((left, right) => left.deploymentId.localeCompare(right.deploymentId)),
+    ingressGroupRequirements
   };
 }
 
@@ -726,6 +733,43 @@ function buildRoutePathPrefixForHost(hostId: string, deployment: HttpWorkerDeplo
     return `${deployment.routePathPrefix}/${encodeURIComponent(hostId)}`;
   }
   return deployment.routePathPrefix;
+}
+
+function buildIngressGroupRequirements(desiredHostStates: DesiredHostState[]): PlacementIngressGroupRequirement[] {
+  const requirementsByGroupKey = new Map<
+    string,
+    {
+      groupId?: string;
+      requiredProtocolPackages: Map<string, PlacementIngressGroupRequirement["requiredProtocolPackages"][number]>;
+    }
+  >();
+
+  for (const desired of desiredHostStates) {
+    for (const assignment of desired.assignments) {
+      const protocolPackage = assignment.serviceModule?.protocolPackage;
+      if (!protocolPackage) {
+        continue;
+      }
+      const groupId = assignment.groupId;
+      const groupKey = groupId ?? "__default__";
+      const entry = requirementsByGroupKey.get(groupKey) ?? {
+        groupId,
+        requiredProtocolPackages: new Map()
+      };
+      entry.requiredProtocolPackages.set(protocolPackage.packageId, toServiceModuleProtocolPackageRef(protocolPackage));
+      requirementsByGroupKey.set(groupKey, entry);
+    }
+  }
+
+  return Array.from(requirementsByGroupKey.values())
+    .filter((entry) => entry.requiredProtocolPackages.size > 0)
+    .map((entry) => ({
+      ...(entry.groupId !== undefined ? { groupId: entry.groupId } : {}),
+      requiredProtocolPackages: Array.from(entry.requiredProtocolPackages.values()).sort((left, right) =>
+        left.packageId.localeCompare(right.packageId)
+      )
+    }))
+    .sort((left, right) => (left.groupId ?? "").localeCompare(right.groupId ?? ""));
 }
 
 function buildDesiredRevision(

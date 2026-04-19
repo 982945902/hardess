@@ -184,19 +184,18 @@ export class ServiceModuleManager {
         const prepared = await this.options.artifactStore.stageServiceModule(assignment, artifactManifest);
         const serviceModule = await loadServiceModule(prepared.localEntry);
         const boundProtocolPackage = validateBoundProtocolPackage(assignment, serviceModule);
-        const protocolVersionKey = `${boundProtocolPackage.protocol}:${boundProtocolPackage.version}`;
-        const currentOwner = protocolVersionOwners.get(protocolVersionKey);
+        const currentOwner = protocolVersionOwners.get(boundProtocolPackage.packageId);
         if (currentOwner && currentOwner !== assignment.assignmentId) {
           this.markFailed(input.assignmentStates, assignment.assignmentId, {
             code: "SERVICE_MODULE_CONFLICT",
-            message: `Duplicate service module protocol/version ${protocolVersionKey} on one host`,
+            message: `Duplicate service module protocol package ${boundProtocolPackage.packageId} on one host`,
             retryable: false
           });
           throw new Error(
-            `Duplicate service module protocol/version ${protocolVersionKey} for assignments ${currentOwner} and ${assignment.assignmentId}`
+            `Duplicate service module protocol package ${boundProtocolPackage.packageId} for assignments ${currentOwner} and ${assignment.assignmentId}`
           );
         }
-        protocolVersionOwners.set(protocolVersionKey, assignment.assignmentId);
+        protocolVersionOwners.set(boundProtocolPackage.packageId, assignment.assignmentId);
         nextModules.push({
           assignmentId: assignment.assignmentId,
           protocol: boundProtocolPackage.protocol,
@@ -299,6 +298,7 @@ function validateBoundProtocolPackage(
   assignment: Assignment,
   serviceModule: Awaited<ReturnType<typeof loadServiceModule>>
 ): {
+  packageId: string;
   protocol: string;
   version: string;
 } {
@@ -327,6 +327,7 @@ function validateBoundProtocolPackage(
   }
 
   return {
+    packageId: protocolPackage.packageId,
     protocol: protocolPackage.protocol,
     version: protocolPackage.version
   };

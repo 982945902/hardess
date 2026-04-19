@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { computeServiceModuleProtocolPackageDigest } from "./service-module-protocol-package.ts";
+import {
+  buildServiceModuleProtocolPackageId,
+  computeServiceModuleProtocolPackageDigest
+} from "./service-module-protocol-package.ts";
 import {
   parseArtifactManifest,
   parseAssignment,
@@ -86,6 +89,22 @@ describe("admin protocol schemas", () => {
                 }
               ]
             }
+          ],
+          ingressGroupRequirements: [
+            {
+              groupId: "group-core",
+              requiredProtocolPackages: [
+                {
+                  packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+                  digest: computeServiceModuleProtocolPackageDigest({
+                    packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+                    protocol: "chat",
+                    version: "1.0",
+                    actions: ["send"]
+                  })
+                }
+              ]
+            }
           ]
         }
       },
@@ -133,10 +152,12 @@ describe("admin protocol schemas", () => {
             name: "chat",
             entry: "services/chat.ts",
             protocolPackage: {
+              packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
               protocol: "chat",
               version: "1.0",
               actions: ["send"],
               digest: computeServiceModuleProtocolPackageDigest({
+                packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
                 protocol: "chat",
                 version: "1.0",
                 actions: ["send"]
@@ -164,6 +185,22 @@ describe("admin protocol schemas", () => {
     expect(value.assignments).toHaveLength(2);
     expect(value.topology?.membership.hosts[0]?.state).toBe("ready");
     expect(value.topology?.placement.deployments[0]?.ownerHostIds).toEqual(["host-a"]);
+    expect(value.topology?.placement.ingressGroupRequirements).toEqual([
+      {
+        groupId: "group-core",
+        requiredProtocolPackages: [
+          {
+            packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+            digest: computeServiceModuleProtocolPackageDigest({
+              packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+              protocol: "chat",
+              version: "1.0",
+              actions: ["send"]
+            })
+          }
+        ]
+      }
+    ]);
     expect(value.assignments[0]?.groupId).toBe("group-core");
     expect(value.assignments[0]?.serveApp?.name).toBe("demo-http");
     expect(value.assignments[0]?.serveApp?.deployment?.config).toEqual({
@@ -171,10 +208,12 @@ describe("admin protocol schemas", () => {
     });
     expect(value.assignments[1]?.serviceModule?.name).toBe("chat");
     expect(value.assignments[1]?.serviceModule?.protocolPackage).toEqual({
+      packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
       protocol: "chat",
       version: "1.0",
       actions: ["send"],
       digest: computeServiceModuleProtocolPackageDigest({
+        packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
         protocol: "chat",
         version: "1.0",
         actions: ["send"]
@@ -198,10 +237,12 @@ describe("admin protocol schemas", () => {
           name: "chat",
           entry: "services/chat.ts",
           protocolPackage: {
+            packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
             protocol: "chat",
             version: "1.0",
             actions: ["send"],
             digest: computeServiceModuleProtocolPackageDigest({
+              packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
               protocol: "chat",
               version: "1.0",
               actions: ["send"]
@@ -247,6 +288,7 @@ describe("admin protocol schemas", () => {
         name: "chat",
         entry: "services/chat.ts",
         protocolPackage: {
+          packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
           protocol: "chat",
           version: "1.0",
           actions: ["send"],

@@ -189,6 +189,7 @@ type Assignment = {
     name: string;
     entry: string;
     protocol_package: {
+      package_id: string;
       protocol: string;
       version: string;
       actions: string[];
@@ -402,7 +403,8 @@ Current `v1` implementation boundary:
 - for `serve`, runtime stages the app entry the same way, validates that it
   exports the `serve` module shape, and adapts it into the worker fetch ABI
   before attaching it to the generated HTTP pipeline
-- for `service_module`, admin binds a protocol package together with the module assignment; runtime stages the module source into the same local artifact cache, loads the staged entry, validates that its exported `{ protocol, version, actions }` matches the bound protocol package exactly, verifies the package digest, and then registers it into the runtime WebSocket protocol registry
+- for `service_module`, admin binds a protocol package together with the module assignment; that package now carries a stable `package_id` plus digest so it can be referenced elsewhere in planning and rollout state; runtime stages the module source into the same local artifact cache, loads the staged entry, validates that its exported `{ protocol, version, actions }` matches the bound protocol package exactly, verifies the package digest, and then registers it into the runtime WebSocket protocol registry
+- `topology.placement.ingress_group_requirements` is the slow-changing group-level contract view that says which protocol package refs a WebSocket ingress group must have before it should accept that business traffic
 - when Bun or Deno project files are present in `package_manager`, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
 - for remote `source.uri`, a `digest` is the boundary for reliable cache reuse; without it, runtime should prefer restaging over assuming the cached remote source is still current
 - `v1` keeps Bun as the host runtime, but the worker artifact protocol now allows both Bun and Deno project metadata

@@ -105,6 +105,7 @@ const httpWorkerAssignmentSchema = z.object({
 });
 
 const serviceModuleProtocolPackageSchema = z.object({
+  packageId: z.string().min(1, "serviceModule.protocolPackage.packageId is required"),
   protocol: z.string().min(1, "serviceModule.protocolPackage.protocol is required"),
   version: z.string().min(1, "serviceModule.protocolPackage.version is required"),
   actions: z.array(z.string().min(1, "serviceModule.protocolPackage.actions entries must be non-empty"))
@@ -123,6 +124,11 @@ const serviceModuleProtocolPackageSchema = z.object({
       }
     }),
   digest: z.string().min(1, "serviceModule.protocolPackage.digest is required")
+});
+
+const serviceModuleProtocolPackageRefSchema = z.object({
+  packageId: z.string().min(1, "placement.ingressGroupRequirements.requiredProtocolPackages.packageId is required"),
+  digest: z.string().min(1, "placement.ingressGroupRequirements.requiredProtocolPackages.digest is required")
 });
 
 const serviceModuleAssignmentSchema = z.object({
@@ -271,7 +277,13 @@ const placementDeploymentSchema = z.object({
 const placementSnapshotSchema = z.object({
   revision: z.string().min(1, "placement.revision is required"),
   generatedAt: z.number().finite().nonnegative(),
-  deployments: z.array(placementDeploymentSchema)
+  deployments: z.array(placementDeploymentSchema),
+  ingressGroupRequirements: z.array(
+    z.object({
+      groupId: z.string().min(1).optional(),
+      requiredProtocolPackages: z.array(serviceModuleProtocolPackageRefSchema)
+    })
+  ).optional()
 });
 
 const desiredTopologySchema = z.object({

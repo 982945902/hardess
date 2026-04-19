@@ -1,5 +1,8 @@
 import { describe, expect, it, mock } from "bun:test";
-import { computeServiceModuleProtocolPackageDigest } from "../../shared/index.ts";
+import {
+  buildServiceModuleProtocolPackageId,
+  computeServiceModuleProtocolPackageDigest
+} from "../../shared/index.ts";
 import type { DesiredHostState } from "../../shared/index.ts";
 import { InMemoryMetrics } from "../observability/metrics.ts";
 import { RuntimeHostAdapter } from "./runtime-host-adapter.ts";
@@ -434,10 +437,12 @@ describe("RuntimeHostAdapter", () => {
             name: "chat",
             entry: "services/chat.ts",
             protocolPackage: {
+              packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
               protocol: "chat",
               version: "1.0",
               actions: ["send"],
               digest: computeServiceModuleProtocolPackageDigest({
+                packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
                 protocol: "chat",
                 version: "1.0",
                 actions: ["send"]
