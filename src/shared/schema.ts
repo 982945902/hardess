@@ -20,6 +20,7 @@ import type {
 } from "./types.ts";
 
 const stringRecordSchema = z.record(z.string(), z.string());
+const unknownRecordSchema = z.record(z.string(), z.unknown());
 const errorCodeSchema = z.enum(
   Object.values(ERROR_CODES) as [typeof ERROR_CODES[keyof typeof ERROR_CODES], ...typeof ERROR_CODES[keyof typeof ERROR_CODES][]]
 );
@@ -44,7 +45,12 @@ export const pipelineConfigSchema = z.object({
   }),
   worker: z.object({
     entry: z.string().min(1, "worker.entry is required"),
-    timeoutMs: z.number().int().positive("worker.timeoutMs must be > 0")
+    timeoutMs: z.number().int().positive("worker.timeoutMs must be > 0"),
+    deployment: z.object({
+      config: unknownRecordSchema.optional(),
+      bindings: unknownRecordSchema.optional(),
+      secrets: stringRecordSchema.optional()
+    }).optional()
   }).optional()
 });
 
@@ -182,6 +188,7 @@ export const serveModuleExportSchema = z.custom<HardessServeModule>(
       kind?: unknown;
       routes?: unknown;
       middleware?: unknown;
+      deployment?: unknown;
     };
     if (moduleValue.kind !== "serve") {
       return false;
@@ -192,6 +199,12 @@ export const serveModuleExportSchema = z.custom<HardessServeModule>(
     if (
       moduleValue.middleware !== undefined &&
       !Array.isArray(moduleValue.middleware)
+    ) {
+      return false;
+    }
+    if (
+      moduleValue.deployment !== undefined &&
+      typeof moduleValue.deployment !== "function"
     ) {
       return false;
     }
@@ -209,9 +222,15 @@ export const serveModuleExportSchema = z.custom<HardessServeModule>(
         typeof routeValue.method === "string" &&
         typeof routeValue.path === "string" &&
         routeValue.path.startsWith("/") &&
-        typeof routeValue.handler === "function"
+        (
+          typeof routeValue.handler === "function" ||
+          (typeof routeValue.handler === "string" && routeValue.handler.length > 0)
+        )
       );
-    }) && (moduleValue.middleware ?? []).every((middleware) => {
+    }) && (
+      moduleValue.deployment !== undefined ||
+      moduleValue.routes.every((route) => typeof (route as { handler?: unknown }).handler === "function")
+    ) && (moduleValue.middleware ?? []).every((middleware) => {
       if (!middleware || typeof middleware !== "object") {
         return false;
       }
@@ -227,7 +246,7 @@ export const serveModuleExportSchema = z.custom<HardessServeModule>(
       );
     });
   },
-  "serve module must export { kind: \"serve\", routes, middleware? }"
+  "serve module must export { kind: \"serve\", routes, middleware?, deployment? }"
 );
 
 export function formatZodError(error: ZodError): string {

@@ -157,6 +157,115 @@ describe("loadWorker", () => {
     });
   });
 
+  it("supports class-based serve deployments with per-pipeline injected state", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-serve-deployment-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "orders-serve.ts");
+    const sdkPath = resolve(process.cwd(), "src/sdk/index.ts");
+    await writeFile(
+      workerPath,
+      `
+        import { defineServe } from ${JSON.stringify(sdkPath)};
+
+        class OrdersServe {
+          constructor(ctx) {
+            this.region = String(ctx.config.region);
+            this.catalog = String(ctx.bindings.catalogBaseUrl);
+            this.counter = 0;
+          }
+
+          getOrder(_request, _env, ctx) {
+            this.counter += 1;
+            return Response.json({
+              id: ctx.params.id,
+              region: this.region,
+              catalog: this.catalog,
+              counter: this.counter
+            });
+          }
+        }
+
+        export default defineServe({
+          kind: "serve",
+          deployment: OrdersServe,
+          routes: [
+            {
+              method: "GET",
+              path: "/orders/:id",
+              handler: "getOrder"
+            }
+          ]
+        });
+      `
+    );
+
+    const worker = await loadWorker(workerPath);
+    const ctx = {
+      waitUntil() {}
+    };
+
+    const firstEnv = {
+      auth: {
+        peerId: "alice",
+        tokenId: "demo:alice",
+        capabilities: [],
+        expiresAt: Date.now() + 1000
+      },
+      pipeline: {
+        id: "orders-a",
+        matchPrefix: "/orders",
+        downstreamOrigin: "http://127.0.0.1:9000"
+      },
+      deployment: {
+        config: {
+          region: "cn-sh-1"
+        },
+        bindings: {
+          catalogBaseUrl: "https://catalog-a.internal"
+        }
+      }
+    };
+
+    const responseA1 = await worker.fetch(new Request("http://localhost/orders/orders/1"), firstEnv, ctx);
+    const responseA2 = await worker.fetch(new Request("http://localhost/orders/orders/2"), firstEnv, ctx);
+    expect(responseA1 instanceof Response ? await responseA1.json() : responseA1?.response ? await responseA1.response.json() : null).toEqual({
+      id: "1",
+      region: "cn-sh-1",
+      catalog: "https://catalog-a.internal",
+      counter: 1
+    });
+    expect(responseA2 instanceof Response ? await responseA2.json() : responseA2?.response ? await responseA2.response.json() : null).toEqual({
+      id: "2",
+      region: "cn-sh-1",
+      catalog: "https://catalog-a.internal",
+      counter: 2
+    });
+
+    const secondEnv = {
+      ...firstEnv,
+      pipeline: {
+        ...firstEnv.pipeline,
+        id: "orders-b"
+      },
+      deployment: {
+        config: {
+          region: "us-west-2"
+        },
+        bindings: {
+          catalogBaseUrl: "https://catalog-b.internal"
+        }
+      }
+    };
+    const responseB1 = await worker.fetch(new Request("http://localhost/orders/orders/3"), secondEnv, ctx);
+    expect(responseB1 instanceof Response ? await responseB1.json() : responseB1?.response ? await responseB1.response.json() : null).toEqual({
+      id: "3",
+      region: "us-west-2",
+      catalog: "https://catalog-b.internal",
+      counter: 1
+    });
+  });
+
   it("does not cache a failed worker load permanently when a dependency becomes available", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-worker-transient-"));
     cleanupPaths.push(dir);

@@ -1,6 +1,6 @@
 import {
   normalizeWorkerResult,
-  type HardessExecutionContext,
+  type HardessServeDeploymentInstance,
   type HardessServeContext,
   type HardessServeHandlerResult,
   type HardessServeMiddleware,
@@ -20,6 +20,7 @@ interface CompiledRoute {
 
 export function createWorkerFromServeModule(module: HardessServeModule): HardessWorkerModule {
   const compiledRoutes = module.routes.map(compileRoute);
+  const deploymentInstancesByPipelineId = new Map<string, HardessServeDeploymentInstance>();
   const middleware = (module.middleware ?? []).map((entry) => ({
     pathPrefix: normalizePathPrefix(entry.pathPrefix),
     handler: entry.handler
@@ -50,13 +51,70 @@ export function createWorkerFromServeModule(module: HardessServeModule): Hardess
         .filter((entry) => pathStartsWithPrefix(routedPath, entry.pathPrefix))
         .map((entry) => entry.handler);
 
-      const response = await runMiddlewareChain(chain, routedRequest, env, serveContext, async () =>
-        routeMatch.route.handler(routedRequest, env, serveContext)
-      );
+      const response = await runMiddlewareChain(chain, routedRequest, env, serveContext, async () => {
+        const handler = resolveRouteHandler(
+          routeMatch.route.handler,
+          module,
+          deploymentInstancesByPipelineId,
+          env
+        );
+        return await handler(routedRequest, env, serveContext);
+      });
 
       return normalizeWorkerResult(response);
     }
   };
+}
+
+function resolveRouteHandler(
+  handler: HardessServeModule["routes"][number]["handler"],
+  module: HardessServeModule,
+  deploymentInstancesByPipelineId: Map<string, HardessServeDeploymentInstance>,
+  env: HardessWorkerEnv
+): (
+  request: Request,
+  env: HardessWorkerEnv,
+  ctx: HardessServeContext
+) => Promise<HardessServeHandlerResult> | HardessServeHandlerResult {
+  if (typeof handler === "function") {
+    return handler;
+  }
+
+  const instance = getDeploymentInstance(module, deploymentInstancesByPipelineId, env);
+  const method = instance[handler];
+  if (typeof method !== "function") {
+    throw new Error(`Serve deployment method is not a function: ${handler}`);
+  }
+
+  return method.bind(instance) as (
+    request: Request,
+    env: HardessWorkerEnv,
+    ctx: HardessServeContext
+  ) => Promise<HardessServeHandlerResult> | HardessServeHandlerResult;
+}
+
+function getDeploymentInstance(
+  module: HardessServeModule,
+  deploymentInstancesByPipelineId: Map<string, HardessServeDeploymentInstance>,
+  env: HardessWorkerEnv
+): HardessServeDeploymentInstance {
+  if (!module.deployment) {
+    throw new Error("Serve route uses a deployment method but no deployment class is configured");
+  }
+
+  const existing = deploymentInstancesByPipelineId.get(env.pipeline.id);
+  if (existing) {
+    return existing;
+  }
+
+  const created = new module.deployment({
+    config: { ...(env.deployment?.config ?? {}) },
+    bindings: { ...(env.deployment?.bindings ?? {}) },
+    secrets: { ...(env.deployment?.secrets ?? {}) },
+    pipeline: { ...env.pipeline }
+  });
+  deploymentInstancesByPipelineId.set(env.pipeline.id, created);
+  return created;
 }
 
 async function runMiddlewareChain(

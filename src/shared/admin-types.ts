@@ -75,6 +75,11 @@ export interface Assignment {
     name: string;
     entry: string;
     routeRefs?: string[];
+    deployment?: {
+      config?: Record<string, unknown>;
+      bindings?: Record<string, unknown>;
+      secrets?: Record<string, string>;
+    };
   };
   serviceModule?: {
     name: string;
@@ -84,6 +89,11 @@ export interface Assignment {
     name: string;
     entry: string;
     routeRefs?: string[];
+    deployment?: {
+      config?: Record<string, unknown>;
+      bindings?: Record<string, unknown>;
+      secrets?: Record<string, string>;
+    };
   };
   authPolicyRef?: string;
   secretRefs?: string[];

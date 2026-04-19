@@ -294,6 +294,11 @@ export interface HardessWorkerEnv {
     downstreamOrigin: string;
     groupId?: string;
   };
+  deployment?: {
+    config?: Record<string, unknown>;
+    bindings?: Record<string, unknown>;
+    secrets?: Record<string, string>;
+  };
   traceId?: string;
 }
 
@@ -340,6 +345,8 @@ export type HardessServeHandler = (
   | Promise<HardessServeHandlerResult>
   | HardessServeHandlerResult;
 
+export type HardessServeRouteHandlerTarget = HardessServeHandler | string;
+
 export type HardessServeNext = () => Promise<HardessServeHandlerResult>;
 
 export type HardessServeMiddleware = (
@@ -354,7 +361,7 @@ export type HardessServeMiddleware = (
 export interface HardessServeRouteDefinition {
   method: HardessServeMethod;
   path: string;
-  handler: HardessServeHandler;
+  handler: HardessServeRouteHandlerTarget;
 }
 
 export interface HardessServeMiddlewareDefinition {
@@ -362,10 +369,26 @@ export interface HardessServeMiddlewareDefinition {
   handler: HardessServeMiddleware;
 }
 
+export interface HardessServeDeploymentContext {
+  config: Record<string, unknown>;
+  bindings: Record<string, unknown>;
+  secrets: Record<string, string>;
+  pipeline: HardessWorkerEnv["pipeline"];
+}
+
+export interface HardessServeDeploymentInstance {
+  [key: string]: unknown;
+}
+
+export type HardessServeDeploymentClass = new (
+  ctx: HardessServeDeploymentContext
+) => HardessServeDeploymentInstance;
+
 export interface HardessServeModule {
   kind: "serve";
   routes: HardessServeRouteDefinition[];
   middleware?: HardessServeMiddlewareDefinition[];
+  deployment?: HardessServeDeploymentClass;
 }
 
 export interface PipelineConfig {
@@ -386,6 +409,11 @@ export interface PipelineConfig {
   worker?: {
     entry: string;
     timeoutMs: number;
+    deployment?: {
+      config?: Record<string, unknown>;
+      bindings?: Record<string, unknown>;
+      secrets?: Record<string, string>;
+    };
   };
 }
 

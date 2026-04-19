@@ -143,4 +143,56 @@ describe("runWorker", () => {
       error: "background failed"
     });
   });
+
+  it("passes deployment injection values into worker env", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-worker-deployment-env-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "deployment-worker.ts");
+    await writeFile(
+      workerPath,
+      `export default {
+        fetch(_request, env) {
+          return Response.json(env.deployment);
+        }
+      };`
+    );
+
+    const result = await runWorker(
+      new Request("http://localhost/demo"),
+      auth,
+      {
+        ...pipeline,
+        worker: {
+          entry: workerPath,
+          timeoutMs: 100,
+          deployment: {
+            config: {
+              region: "cn-sh-1"
+            },
+            bindings: {
+              catalogBaseUrl: "https://catalog.internal"
+            },
+            secrets: {
+              apiToken: "secret-token"
+            }
+          }
+        }
+      },
+      "trace-deployment-env",
+      new ConsoleLogger()
+    );
+
+    expect(result.response ? await result.response.json() : null).toEqual({
+      config: {
+        region: "cn-sh-1"
+      },
+      bindings: {
+        catalogBaseUrl: "https://catalog.internal"
+      },
+      secrets: {
+        apiToken: "secret-token"
+      }
+    });
+  });
 });

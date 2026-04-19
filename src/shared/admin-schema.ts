@@ -96,7 +96,12 @@ export const deploymentSchema = z.object({
 const httpWorkerAssignmentSchema = z.object({
   name: z.string().min(1, "httpWorker.name is required"),
   entry: z.string().min(1, "httpWorker.entry is required"),
-  routeRefs: z.array(z.string().min(1)).optional()
+  routeRefs: z.array(z.string().min(1)).optional(),
+  deployment: z.object({
+    config: z.record(z.string(), z.unknown()).optional(),
+    bindings: z.record(z.string(), z.unknown()).optional(),
+    secrets: z.record(z.string(), z.string()).optional()
+  }).optional()
 });
 
 const serviceModuleAssignmentSchema = z.object({
@@ -107,7 +112,12 @@ const serviceModuleAssignmentSchema = z.object({
 const serveAppAssignmentSchema = z.object({
   name: z.string().min(1, "serveApp.name is required"),
   entry: z.string().min(1, "serveApp.entry is required"),
-  routeRefs: z.array(z.string().min(1)).optional()
+  routeRefs: z.array(z.string().min(1)).optional(),
+  deployment: z.object({
+    config: z.record(z.string(), z.unknown()).optional(),
+    bindings: z.record(z.string(), z.unknown()).optional(),
+    secrets: z.record(z.string(), z.string()).optional()
+  }).optional()
 });
 
 export const assignmentSchema = z.object({
