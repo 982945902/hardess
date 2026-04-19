@@ -857,8 +857,8 @@ app.get("/health", () => new Response("ok"));
 export default defineServe(app);
 ```
 
-Class-style serve creates one deployment instance per runtime pipeline /
-assignment and supports constructor injection:
+Class-style serve creates one deployment instance per `serve` assignment /
+replica and supports constructor injection:
 
 ```ts
 export default defineServe({
@@ -888,9 +888,14 @@ Rules:
    pipeline metadata.
 2. `routes[].handler` may be a function or a method name string.
 3. Method-name handlers require a `deployment` class.
-4. Instance fields are replica-local process memory; they are not durable and
+4. One `serve` may expand into multiple runtime pipelines internally, but those
+   pipelines must share one deployment instance for that assignment / replica.
+5. Runtime-generated pipelines use the assignment identity as the deployment
+   instance key; static config may omit it and fall back to pipeline-local
+   instances.
+6. Instance fields are replica-local process memory; they are not durable and
    must not be used as cross-replica coordination state.
-5. Admin-published desired host state is the source of deployment injection;
+7. Admin-published desired host state is the source of deployment injection;
    runtime only projects those values into `env.deployment`.
 
 ### 10.3 Worker Runtime API Boundary

@@ -47,6 +47,7 @@ export const pipelineConfigSchema = z.object({
     entry: z.string().min(1, "worker.entry is required"),
     timeoutMs: z.number().int().positive("worker.timeoutMs must be > 0"),
     deployment: z.object({
+      instanceKey: z.string().min(1, "worker.deployment.instanceKey must be non-empty").optional(),
       config: unknownRecordSchema.optional(),
       bindings: unknownRecordSchema.optional(),
       secrets: stringRecordSchema.optional()

@@ -226,7 +226,7 @@ describe("RuntimeHostAdapter", () => {
           serveApp: {
             name: "personnel-serve",
             entry: "apps/personnel-serve.ts",
-            routeRefs: ["route-serve-a"],
+            routeRefs: ["route-serve-a", "route-serve-b"],
             deployment: {
               config: {
                 region: "cn-sh-1"
@@ -247,6 +247,15 @@ describe("RuntimeHostAdapter", () => {
             routeId: "route-serve-a",
             match: {
               pathPrefix: "/personnel"
+            },
+            upstream: {
+              baseUrl: "http://upstream.internal"
+            }
+          },
+          {
+            routeId: "route-serve-b",
+            match: {
+              pathPrefix: "/personnel/stats"
             },
             upstream: {
               baseUrl: "http://upstream.internal"
@@ -274,6 +283,35 @@ describe("RuntimeHostAdapter", () => {
               entry: "/tmp/staged/personnel-serve.ts",
               timeoutMs: 1000,
               deployment: {
+                instanceKey: "assign-serve-1",
+                config: {
+                  region: "cn-sh-1"
+                },
+                bindings: {
+                  catalogBaseUrl: "https://catalog.internal"
+                },
+                secrets: {
+                  apiToken: "serve-secret"
+                }
+              }
+            }
+          },
+          {
+            id: "assign-serve-1:route-serve-b",
+            matchPrefix: "/personnel/stats",
+            groupId: "group-personnel",
+            auth: { required: true },
+            downstream: {
+              origin: "http://upstream.internal",
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000,
+              websocket: undefined
+            },
+            worker: {
+              entry: "/tmp/staged/personnel-serve.ts",
+              timeoutMs: 1000,
+              deployment: {
+                instanceKey: "assign-serve-1",
                 config: {
                   region: "cn-sh-1"
                 },
