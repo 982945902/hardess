@@ -659,13 +659,20 @@ export default defineServe({
 
 Rules:
 
-- one `serve` deployment instance is created per runtime pipeline / assignment
+- one `serve` assignment / replica owns exactly one instance
+- one `serve` may expand into multiple HTTP route pipelines internally, but all
+  of those pipelines must share that same instance
+- runtime-generated pipelines should therefore carry the assignment identity as
+  the deployment instance key
 - constructor input is explicit deployment context, not ambient globals
 - supported injection buckets are `config`, `bindings`, and `secrets`
 - route handlers may be functions for the old app/router style or method names
   for class-based deployments
 - mutable member variables are replica-local only; they are not durable and are
   not shared across hosts or replicas
+- this instance-sharing rule is a hard requirement for `v1`; otherwise multiple
+  HTTP entry methods on one `serve` deployment would observe inconsistent
+  member-variable state
 - admin remains responsible for publishing injected values into desired host
   state; runtime only consumes the host-local projection
 

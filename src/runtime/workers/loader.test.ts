@@ -266,6 +266,94 @@ describe("loadWorker", () => {
     });
   });
 
+  it("shares one serve deployment instance across multiple pipelines when instanceKey matches", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-serve-shared-instance-"));
+    cleanupPaths.push(dir);
+
+    const workerPath = join(dir, "inventory-serve.ts");
+    const sdkPath = resolve(process.cwd(), "src/sdk/index.ts");
+    await writeFile(
+      workerPath,
+      `
+        import { defineServe } from ${JSON.stringify(sdkPath)};
+
+        class InventoryServe {
+          constructor(ctx) {
+            this.region = String(ctx.config.region);
+            this.calls = 0;
+          }
+
+          getInventory(_request, _env, ctx) {
+            this.calls += 1;
+            return Response.json({
+              sku: ctx.params.sku,
+              region: this.region,
+              calls: this.calls
+            });
+          }
+        }
+
+        export default defineServe({
+          kind: "serve",
+          deployment: InventoryServe,
+          routes: [
+            {
+              method: "GET",
+              path: "/inventory/:sku",
+              handler: "getInventory"
+            }
+          ]
+        });
+      `
+    );
+
+    const worker = await loadWorker(workerPath);
+    const ctx = {
+      waitUntil() {}
+    };
+
+    const envA = {
+      auth: {
+        peerId: "alice",
+        tokenId: "demo:alice",
+        capabilities: [],
+        expiresAt: Date.now() + 1000
+      },
+      pipeline: {
+        id: "assign-serve-1:route-a",
+        matchPrefix: "/inventory",
+        downstreamOrigin: "http://127.0.0.1:9000"
+      },
+      deployment: {
+        instanceKey: "assign-serve-1",
+        config: {
+          region: "cn-sh-1"
+        }
+      }
+    };
+    const envB = {
+      ...envA,
+      pipeline: {
+        ...envA.pipeline,
+        id: "assign-serve-1:route-b"
+      }
+    };
+
+    const responseA = await worker.fetch(new Request("http://localhost/inventory/inventory/sku-a"), envA, ctx);
+    const responseB = await worker.fetch(new Request("http://localhost/inventory/inventory/sku-b"), envB, ctx);
+
+    expect(responseA instanceof Response ? await responseA.json() : responseA?.response ? await responseA.response.json() : null).toEqual({
+      sku: "sku-a",
+      region: "cn-sh-1",
+      calls: 1
+    });
+    expect(responseB instanceof Response ? await responseB.json() : responseB?.response ? await responseB.response.json() : null).toEqual({
+      sku: "sku-b",
+      region: "cn-sh-1",
+      calls: 2
+    });
+  });
+
   it("does not cache a failed worker load permanently when a dependency becomes available", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-worker-transient-"));
     cleanupPaths.push(dir);

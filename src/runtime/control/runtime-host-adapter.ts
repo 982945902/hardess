@@ -318,6 +318,13 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
         continue;
       }
 
+      const deploymentConfig = assignment.deploymentKind === "serve"
+        ? {
+            instanceKey: assignment.assignmentId,
+            ...(httpExecutable.deployment ?? {})
+          }
+        : httpExecutable.deployment;
+
       try {
         const routeRefs = httpExecutable.routeRefs ?? [];
         const artifactManifest = artifacts.get(assignment.artifact.manifestId);
@@ -364,9 +371,9 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
             worker: {
               entry: prepared.localEntry,
               timeoutMs: this.options.defaultWorkerTimeoutMs ?? 1_000,
-              ...(httpExecutable.deployment !== undefined
+              ...(deploymentConfig !== undefined
                 ? {
-                    deployment: httpExecutable.deployment
+                    deployment: deploymentConfig
                   }
                 : {})
             }

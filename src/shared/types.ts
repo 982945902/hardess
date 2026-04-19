@@ -295,6 +295,7 @@ export interface HardessWorkerEnv {
     groupId?: string;
   };
   deployment?: {
+    instanceKey?: string;
     config?: Record<string, unknown>;
     bindings?: Record<string, unknown>;
     secrets?: Record<string, string>;
@@ -410,6 +411,7 @@ export interface PipelineConfig {
     entry: string;
     timeoutMs: number;
     deployment?: {
+      instanceKey?: string;
       config?: Record<string, unknown>;
       bindings?: Record<string, unknown>;
       secrets?: Record<string, string>;

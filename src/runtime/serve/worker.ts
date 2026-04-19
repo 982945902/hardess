@@ -20,7 +20,7 @@ interface CompiledRoute {
 
 export function createWorkerFromServeModule(module: HardessServeModule): HardessWorkerModule {
   const compiledRoutes = module.routes.map(compileRoute);
-  const deploymentInstancesByPipelineId = new Map<string, HardessServeDeploymentInstance>();
+  const deploymentInstancesByInstanceKey = new Map<string, HardessServeDeploymentInstance>();
   const middleware = (module.middleware ?? []).map((entry) => ({
     pathPrefix: normalizePathPrefix(entry.pathPrefix),
     handler: entry.handler
@@ -55,7 +55,7 @@ export function createWorkerFromServeModule(module: HardessServeModule): Hardess
         const handler = resolveRouteHandler(
           routeMatch.route.handler,
           module,
-          deploymentInstancesByPipelineId,
+          deploymentInstancesByInstanceKey,
           env
         );
         return await handler(routedRequest, env, serveContext);
@@ -69,7 +69,7 @@ export function createWorkerFromServeModule(module: HardessServeModule): Hardess
 function resolveRouteHandler(
   handler: HardessServeModule["routes"][number]["handler"],
   module: HardessServeModule,
-  deploymentInstancesByPipelineId: Map<string, HardessServeDeploymentInstance>,
+  deploymentInstancesByInstanceKey: Map<string, HardessServeDeploymentInstance>,
   env: HardessWorkerEnv
 ): (
   request: Request,
@@ -80,7 +80,7 @@ function resolveRouteHandler(
     return handler;
   }
 
-  const instance = getDeploymentInstance(module, deploymentInstancesByPipelineId, env);
+  const instance = getDeploymentInstance(module, deploymentInstancesByInstanceKey, env);
   const method = instance[handler];
   if (typeof method !== "function") {
     throw new Error(`Serve deployment method is not a function: ${handler}`);
@@ -95,14 +95,15 @@ function resolveRouteHandler(
 
 function getDeploymentInstance(
   module: HardessServeModule,
-  deploymentInstancesByPipelineId: Map<string, HardessServeDeploymentInstance>,
+  deploymentInstancesByInstanceKey: Map<string, HardessServeDeploymentInstance>,
   env: HardessWorkerEnv
 ): HardessServeDeploymentInstance {
   if (!module.deployment) {
     throw new Error("Serve route uses a deployment method but no deployment class is configured");
   }
 
-  const existing = deploymentInstancesByPipelineId.get(env.pipeline.id);
+  const instanceKey = env.deployment?.instanceKey ?? env.pipeline.id;
+  const existing = deploymentInstancesByInstanceKey.get(instanceKey);
   if (existing) {
     return existing;
   }
@@ -113,7 +114,7 @@ function getDeploymentInstance(
     secrets: { ...(env.deployment?.secrets ?? {}) },
     pipeline: { ...env.pipeline }
   });
-  deploymentInstancesByPipelineId.set(env.pipeline.id, created);
+  deploymentInstancesByInstanceKey.set(instanceKey, created);
   return created;
 }
 
