@@ -1,4 +1,8 @@
-import type { ArtifactManifest, Assignment } from "../../shared/index.ts";
+import {
+  type ArtifactManifest,
+  type Assignment,
+  verifyServiceModuleProtocolPackageDigest
+} from "../../shared/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import { loadServiceModule } from "../service-modules/loader.ts";
 import type { ServerProtocolRegistry } from "../protocol/registry.ts";
@@ -179,7 +183,8 @@ export class ServiceModuleManager {
         const artifactManifest = input.artifacts.get(assignment.artifact.manifestId);
         const prepared = await this.options.artifactStore.stageServiceModule(assignment, artifactManifest);
         const serviceModule = await loadServiceModule(prepared.localEntry);
-        const protocolVersionKey = `${serviceModule.protocol}:${serviceModule.version}`;
+        const boundProtocolPackage = validateBoundProtocolPackage(assignment, serviceModule);
+        const protocolVersionKey = `${boundProtocolPackage.protocol}:${boundProtocolPackage.version}`;
         const currentOwner = protocolVersionOwners.get(protocolVersionKey);
         if (currentOwner && currentOwner !== assignment.assignmentId) {
           this.markFailed(input.assignmentStates, assignment.assignmentId, {
@@ -194,8 +199,8 @@ export class ServiceModuleManager {
         protocolVersionOwners.set(protocolVersionKey, assignment.assignmentId);
         nextModules.push({
           assignmentId: assignment.assignmentId,
-          protocol: serviceModule.protocol,
-          version: serviceModule.version,
+          protocol: boundProtocolPackage.protocol,
+          version: boundProtocolPackage.version,
           localEntry: prepared.localEntry,
           module: serviceModule,
           assignment
@@ -288,4 +293,41 @@ export class ServiceModuleManager {
     }
     return undefined;
   }
+}
+
+function validateBoundProtocolPackage(
+  assignment: Assignment,
+  serviceModule: Awaited<ReturnType<typeof loadServiceModule>>
+): {
+  protocol: string;
+  version: string;
+} {
+  const protocolPackage = assignment.serviceModule?.protocolPackage;
+  if (!protocolPackage) {
+    throw new Error(`Missing serviceModule.protocolPackage for assignment ${assignment.assignmentId}`);
+  }
+
+  verifyServiceModuleProtocolPackageDigest(protocolPackage);
+
+  if (serviceModule.protocol !== protocolPackage.protocol || serviceModule.version !== protocolPackage.version) {
+    throw new Error(
+      `Service module protocol package mismatch for assignment ${assignment.assignmentId}: expected ${protocolPackage.protocol}@${protocolPackage.version}, got ${serviceModule.protocol}@${serviceModule.version}`
+    );
+  }
+
+  const declaredActions = [...protocolPackage.actions].sort();
+  const implementedActions = Object.keys(serviceModule.actions).sort();
+  if (
+    declaredActions.length !== implementedActions.length ||
+    declaredActions.some((action, index) => action !== implementedActions[index])
+  ) {
+    throw new Error(
+      `Service module action set mismatch for assignment ${assignment.assignmentId}: expected [${declaredActions.join(", ")}], got [${implementedActions.join(", ")}]`
+    );
+  }
+
+  return {
+    protocol: protocolPackage.protocol,
+    version: protocolPackage.version
+  };
 }

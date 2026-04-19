@@ -104,9 +104,31 @@ const httpWorkerAssignmentSchema = z.object({
   }).optional()
 });
 
+const serviceModuleProtocolPackageSchema = z.object({
+  protocol: z.string().min(1, "serviceModule.protocolPackage.protocol is required"),
+  version: z.string().min(1, "serviceModule.protocolPackage.version is required"),
+  actions: z.array(z.string().min(1, "serviceModule.protocolPackage.actions entries must be non-empty"))
+    .min(1, "serviceModule.protocolPackage.actions must contain at least one action")
+    .superRefine((value, ctx) => {
+      const seen = new Set<string>();
+      for (const action of value) {
+        if (seen.has(action)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `serviceModule.protocolPackage.actions must be unique: ${action}`
+          });
+          return;
+        }
+        seen.add(action);
+      }
+    }),
+  digest: z.string().min(1, "serviceModule.protocolPackage.digest is required")
+});
+
 const serviceModuleAssignmentSchema = z.object({
   name: z.string().min(1, "serviceModule.name is required"),
-  entry: z.string().min(1, "serviceModule.entry is required")
+  entry: z.string().min(1, "serviceModule.entry is required"),
+  protocolPackage: serviceModuleProtocolPackageSchema
 });
 
 const serveAppAssignmentSchema = z.object({
