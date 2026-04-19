@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   HardessError,
+  buildServiceModuleProtocolPackageId,
   computeServiceModuleProtocolPackageDigest,
   type ArtifactManifest,
   type Assignment
@@ -38,10 +39,12 @@ function createServiceAssignment(sourceUri: string, version = "ws-v1"): Assignme
       name: "chat",
       entry: "services/chat.ts",
       protocolPackage: {
+        packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
         protocol: "chat",
         version: "1.0",
         actions: ["send"],
         digest: computeServiceModuleProtocolPackageDigest({
+          packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
           protocol: "chat",
           version: "1.0",
           actions: ["send"]
@@ -313,10 +316,12 @@ describe("ServiceModuleManager", () => {
     assignment.serviceModule = {
       ...assignment.serviceModule!,
       protocolPackage: {
+        packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
         protocol: "chat",
         version: "1.0",
         actions: ["send", "typing"],
         digest: computeServiceModuleProtocolPackageDigest({
+          packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
           protocol: "chat",
           version: "1.0",
           actions: ["send", "typing"]

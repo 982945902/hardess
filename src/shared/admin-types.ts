@@ -1,6 +1,12 @@
 export type DeploymentKind = "http_worker" | "service_module" | "serve";
 
+export interface ServiceModuleProtocolPackageRef {
+  packageId: string;
+  digest: string;
+}
+
 export interface ServiceModuleProtocolPackage {
+  packageId: string;
   protocol: string;
   version: string;
   actions: string[];
@@ -142,10 +148,16 @@ export interface PlacementDeployment {
   }>;
 }
 
+export interface PlacementIngressGroupRequirement {
+  groupId?: string;
+  requiredProtocolPackages: ServiceModuleProtocolPackageRef[];
+}
+
 export interface PlacementSnapshot {
   revision: string;
   generatedAt: number;
   deployments: PlacementDeployment[];
+  ingressGroupRequirements?: PlacementIngressGroupRequirement[];
 }
 
 export interface DesiredTopology {

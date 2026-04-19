@@ -8,6 +8,10 @@ import {
   planHttpWorkerDeploymentOwners,
   projectHttpWorkerDesiredState
 } from "./planning.ts";
+import {
+  buildServiceModuleProtocolPackageId,
+  computeServiceModuleProtocolPackageDigest
+} from "../../shared/index.ts";
 
 describe("admin planning helpers", () => {
   it("projects desired host state for shared and per-host http worker deployments", () => {
@@ -327,6 +331,122 @@ describe("admin planning helpers", () => {
             routeId: "route:personnel",
             pathPrefix: "/personnel",
             ownerHostIds: ["host-a"]
+          }
+        ]
+      }
+    ]);
+    expect(placement.ingressGroupRequirements).toEqual([]);
+  });
+
+  it("builds ingress group protocol package requirements from service_module assignments", () => {
+    const personnelChatPackage = {
+      packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+      protocol: "demo-chat",
+      version: "1.0",
+      actions: ["send"],
+      digest: computeServiceModuleProtocolPackageDigest({
+        packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+        protocol: "demo-chat",
+        version: "1.0",
+        actions: ["send"]
+      })
+    };
+    const personnelAuditPackage = {
+      packageId: buildServiceModuleProtocolPackageId("demo-audit", "2.0"),
+      protocol: "demo-audit",
+      version: "2.0",
+      actions: ["append"],
+      digest: computeServiceModuleProtocolPackageDigest({
+        packageId: buildServiceModuleProtocolPackageId("demo-audit", "2.0"),
+        protocol: "demo-audit",
+        version: "2.0",
+        actions: ["append"]
+      })
+    };
+
+    const placement = buildPlacementSnapshot({
+      revision: "topology:service-module:placement",
+      generatedAt: 12,
+      desiredHostStates: [
+        {
+          hostId: "host-a",
+          revision: "rev-a",
+          generatedAt: 1,
+          assignments: [
+            {
+              assignmentId: "assign:host-a:deployment:chat",
+              hostId: "host-a",
+              deploymentId: "deployment:chat",
+              deploymentKind: "service_module",
+              groupId: "group-personnel",
+              declaredVersion: "chat/v1",
+              artifact: {
+                manifestId: "manifest:chat",
+                sourceUri: "https://admin.example/chat.ts"
+              },
+              serviceModule: {
+                name: "chat-service-module",
+                entry: "services/chat.ts",
+                protocolPackage: personnelChatPackage
+              }
+            },
+            {
+              assignmentId: "assign:host-a:deployment:audit",
+              hostId: "host-a",
+              deploymentId: "deployment:audit",
+              deploymentKind: "service_module",
+              groupId: "group-personnel",
+              declaredVersion: "audit/v2",
+              artifact: {
+                manifestId: "manifest:audit",
+                sourceUri: "https://admin.example/audit.ts"
+              },
+              serviceModule: {
+                name: "audit-service-module",
+                entry: "services/audit.ts",
+                protocolPackage: personnelAuditPackage
+              }
+            }
+          ]
+        },
+        {
+          hostId: "host-b",
+          revision: "rev-b",
+          generatedAt: 1,
+          assignments: [
+            {
+              assignmentId: "assign:host-b:deployment:chat",
+              hostId: "host-b",
+              deploymentId: "deployment:chat",
+              deploymentKind: "service_module",
+              groupId: "group-personnel",
+              declaredVersion: "chat/v1",
+              artifact: {
+                manifestId: "manifest:chat",
+                sourceUri: "https://admin.example/chat.ts"
+              },
+              serviceModule: {
+                name: "chat-service-module",
+                entry: "services/chat.ts",
+                protocolPackage: personnelChatPackage
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(placement.ingressGroupRequirements).toEqual([
+      {
+        groupId: "group-personnel",
+        requiredProtocolPackages: [
+          {
+            packageId: personnelAuditPackage.packageId,
+            digest: personnelAuditPackage.digest
+          },
+          {
+            packageId: personnelChatPackage.packageId,
+            digest: personnelChatPackage.digest
           }
         ]
       }

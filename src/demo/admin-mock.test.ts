@@ -1,4 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import {
+  buildServiceModuleProtocolPackageId,
+  computeServiceModuleProtocolPackageDigest
+} from "../shared/index.ts";
 import { createDemoAdminApp } from "./admin-mock.ts";
 
 function createRegistrationRequest(
@@ -168,6 +172,22 @@ describe("createDemoAdminApp", () => {
     );
     expect(servePlacement.groupId).toBe("group-personnel");
     expect(servePlacement.ownerHostIds).toEqual(["host-demo-a", "host-demo-b"]);
+    expect(desiredA.desired.topology.placement.ingressGroupRequirements).toEqual([
+      {
+        groupId: "group-personnel",
+        requiredProtocolPackages: [
+          {
+            packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+            digest: computeServiceModuleProtocolPackageDigest({
+              packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+              protocol: "demo-chat",
+              version: "1.0",
+              actions: ["send"]
+            })
+          }
+        ]
+      }
+    ]);
     expect(desiredA.desired.revision).toContain("demo-rev:1:");
     expect(desiredB.desired.revision).toContain("demo-rev:1:");
 
@@ -404,6 +424,22 @@ describe("createDemoAdminApp", () => {
     expect(state.artifactManifests).toHaveLength(4);
     expect(state.topology.membership.hosts).toHaveLength(2);
     expect(state.topology.placement.deployments).toHaveLength(4);
+    expect(state.topology.placement.ingressGroupRequirements).toEqual([
+      {
+        groupId: "group-personnel",
+        requiredProtocolPackages: [
+          {
+            packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+            digest: computeServiceModuleProtocolPackageDigest({
+              packageId: buildServiceModuleProtocolPackageId("demo-chat", "1.0"),
+              protocol: "demo-chat",
+              version: "1.0",
+              actions: ["send"]
+            })
+          }
+        ]
+      }
+    ]);
     expect(state.rolloutState.sharedDeploymentReplicas).toBe(2);
     expect(state.rolloutState.revisionToken).toBe(2);
     const sharedDeploymentSummary = state.rolloutSummary.find(

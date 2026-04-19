@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildServiceModuleProtocolPackageId,
   computeServiceModuleProtocolPackageDigest,
   type ArtifactManifest,
   type Assignment
@@ -71,10 +72,12 @@ function createServiceModuleAssignment(sourceUri: string): Assignment {
       name: "chat",
       entry: "services/chat.ts",
       protocolPackage: {
+        packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
         protocol: "chat",
         version: "1.0",
         actions: ["send"],
         digest: computeServiceModuleProtocolPackageDigest({
+          packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
           protocol: "chat",
           version: "1.0",
           actions: ["send"]

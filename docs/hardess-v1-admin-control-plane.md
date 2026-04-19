@@ -312,6 +312,7 @@ type DesiredHostState = {
     name: string;
     entry: string;
     protocol_package: {
+      package_id: string;
       protocol: string;
       version: string;
       actions: string[];
@@ -632,6 +633,8 @@ Binding rule for `v1`:
 
 - admin publishes the protocol package and the implementation together in one
   assignment
+- the protocol package now has a stable `package_id`, so placement and ingress
+  policy can refer to it without re-inlining the whole contract everywhere
 - the bound protocol package carries its own digest so publish / rollback can be
   pinned to a stable contract identity
 - runtime must reject a module whose exported `protocol`, `version`, or action
@@ -908,6 +911,8 @@ The main remaining `v1` work is now narrower and more product-facing:
      target host group, or
    - ingress must be partitioned so only a known host pool accepts that package
      and its actions
+   - planning should therefore emit group-level required protocol-package refs,
+     rather than leaving ingress capability implicit in scattered assignments
 2. finish the real admin publish / rollback shape beyond the current mock admin
    replica and owner-set demo endpoints
 3. keep the broader runtime-production items outside this document moving in
