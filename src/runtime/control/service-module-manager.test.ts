@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HardessError, type ArtifactManifest, type Assignment } from "../../shared/index.ts";
+import {
+  HardessError,
+  computeServiceModuleProtocolPackageDigest,
+  type ArtifactManifest,
+  type Assignment
+} from "../../shared/index.ts";
 import { ServerProtocolRegistry } from "../protocol/registry.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import { ServiceModuleManager } from "./service-module-manager.ts";
@@ -31,7 +36,17 @@ function createServiceAssignment(sourceUri: string, version = "ws-v1"): Assignme
     },
     serviceModule: {
       name: "chat",
-      entry: "services/chat.ts"
+      entry: "services/chat.ts",
+      protocolPackage: {
+        protocol: "chat",
+        version: "1.0",
+        actions: ["send"],
+        digest: computeServiceModuleProtocolPackageDigest({
+          protocol: "chat",
+          version: "1.0",
+          actions: ["send"]
+        })
+      }
     }
   };
 }
@@ -262,5 +277,140 @@ describe("ServiceModuleManager", () => {
 
     expect(registry.get("chat", "1.0", "send")).toBeDefined();
     expect(manager.listDrainingAssignments()).toEqual([]);
+  });
+
+  it("fails when the bound protocol package does not match the loaded service module", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-service-module-manager-"));
+    cleanupPaths.push(dir);
+
+    const sourcePath = join(dir, "chat.ts");
+    await writeFile(
+      sourcePath,
+      `export default {
+        protocol: "chat",
+        version: "1.0",
+        actions: {
+          send: {
+            resolveRecipients() {
+              return ["alice"];
+            }
+          }
+        }
+      };`,
+      "utf8"
+    );
+
+    const registry = new ServerProtocolRegistry();
+    const manager = new ServiceModuleManager({
+      registry,
+      artifactStore: new ArtifactStore({
+        rootDir: join(dir, "cache")
+      }),
+      logger: createLogger(),
+      drainGraceMs: 30
+    });
+    const assignment = createServiceAssignment(sourcePath);
+    assignment.serviceModule = {
+      ...assignment.serviceModule!,
+      protocolPackage: {
+        protocol: "chat",
+        version: "1.0",
+        actions: ["send", "typing"],
+        digest: computeServiceModuleProtocolPackageDigest({
+          protocol: "chat",
+          version: "1.0",
+          actions: ["send", "typing"]
+        })
+      }
+    };
+    const assignmentStates = new Map<string, AssignmentState>([
+      [
+        "assign-ws-1",
+        {
+          state: "preparing" as const
+        }
+      ]
+    ]);
+
+    await expect(
+      manager.applyAssignments({
+        assignments: [assignment],
+        artifacts: new Map([
+          ["manifest-ws-1", createServiceManifest(`file://${sourcePath}`)]
+        ]),
+        assignmentStates,
+        revision: "rev-1",
+        revisionGenerationId: "admin:rev-1"
+      })
+    ).rejects.toThrow("Service module action set mismatch");
+
+    expect(assignmentStates.get("assign-ws-1")).toMatchObject({
+      state: "failed"
+    });
+    expect(() => registry.get("chat", "1.0", "send")).toThrow(HardessError);
+  });
+
+  it("fails when the bound protocol package digest is tampered", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-service-module-manager-"));
+    cleanupPaths.push(dir);
+
+    const sourcePath = join(dir, "chat.ts");
+    await writeFile(
+      sourcePath,
+      `export default {
+        protocol: "chat",
+        version: "1.0",
+        actions: {
+          send: {
+            resolveRecipients() {
+              return ["alice"];
+            }
+          }
+        }
+      };`,
+      "utf8"
+    );
+
+    const registry = new ServerProtocolRegistry();
+    const manager = new ServiceModuleManager({
+      registry,
+      artifactStore: new ArtifactStore({
+        rootDir: join(dir, "cache")
+      }),
+      logger: createLogger(),
+      drainGraceMs: 30
+    });
+    const assignment = createServiceAssignment(sourcePath);
+    assignment.serviceModule = {
+      ...assignment.serviceModule!,
+      protocolPackage: {
+        ...assignment.serviceModule!.protocolPackage,
+        digest: "sha256:tampered"
+      }
+    };
+    const assignmentStates = new Map<string, AssignmentState>([
+      [
+        "assign-ws-1",
+        {
+          state: "preparing" as const
+        }
+      ]
+    ]);
+
+    await expect(
+      manager.applyAssignments({
+        assignments: [assignment],
+        artifacts: new Map([
+          ["manifest-ws-1", createServiceManifest(`file://${sourcePath}`)]
+        ]),
+        assignmentStates,
+        revision: "rev-1",
+        revisionGenerationId: "admin:rev-1"
+      })
+    ).rejects.toThrow("Service module protocol package digest mismatch");
+
+    expect(assignmentStates.get("assign-ws-1")).toMatchObject({
+      state: "failed"
+    });
   });
 });

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import {
   ADMIN_TRANSPORT_OPERATIONS,
   MockAdminTransport,
+  computeServiceModuleProtocolPackageDigest,
   buildPlacementCandidateHosts,
   buildMembershipSnapshot,
   buildPlacementSnapshot,
@@ -56,6 +57,12 @@ interface DemoServiceModuleDeploymentPlan {
   sourceDigest?: string;
   serviceName: string;
   serviceEntry: string;
+  protocolPackage: {
+    protocol: string;
+    version: string;
+    actions: string[];
+    digest: string;
+  };
   assignmentMode?: "all-hosts";
   metadataAnnotations?: Record<string, string>;
 }
@@ -371,6 +378,16 @@ function buildDemoServiceModuleDeployments(): DemoServiceModuleDeploymentPlan[] 
       sourceUri: "",
       serviceName: "demo-chat-service-module",
       serviceEntry: "services/demo-chat-service-module.ts",
+      protocolPackage: {
+        protocol: "demo-chat",
+        version: "1.0",
+        actions: ["send"],
+        digest: computeServiceModuleProtocolPackageDigest({
+          protocol: "demo-chat",
+          version: "1.0",
+          actions: ["send"]
+        })
+      },
       assignmentMode: "all-hosts",
       metadataAnnotations: {
         demo: "true",
@@ -824,7 +841,13 @@ function buildServiceModuleAssignmentForHost(
     },
     serviceModule: {
       name: deployment.serviceName,
-      entry: deployment.serviceEntry
+      entry: deployment.serviceEntry,
+      protocolPackage: {
+        protocol: deployment.protocolPackage.protocol,
+        version: deployment.protocolPackage.version,
+        actions: [...deployment.protocolPackage.actions],
+        digest: deployment.protocolPackage.digest
+      }
     }
   };
 }

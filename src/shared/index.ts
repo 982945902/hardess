@@ -5,4 +5,5 @@ export * from "./envelope.ts";
 export * from "./errors.ts";
 export * from "./protocols.ts";
 export * from "./schema.ts";
+export * from "./service-module-protocol-package.ts";
 export * from "./types.ts";

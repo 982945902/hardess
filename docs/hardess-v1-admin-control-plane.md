@@ -308,10 +308,16 @@ type DesiredHostState = {
       entry: string;
       route_refs?: string[];
     };
-    service_module?: {
-      name: string;
-      entry: string;
+  service_module?: {
+    name: string;
+    entry: string;
+    protocol_package: {
+      protocol: string;
+      version: string;
+      actions: string[];
+      digest: string;
     };
+  };
     serve_app?: {
       name: string;
       entry: string;
@@ -584,6 +590,7 @@ protocol surface, but not by deployment lifecycle:
 - runtime adapts `serve` to the same `fetch(request, env, ctx)` worker ABI
   internally, so `worker` remains the low-level runtime primitive
 - `serviceModule` exports the explicit `ServerProtocolModule` object shape:
+- `serviceModule` is published together with a bound protocol package:
 
 ```ts
 export default {
@@ -618,8 +625,21 @@ export default {
 
 That means `serviceModule` is aligned with `http_worker` at the control-plane
 layer, but its runtime activation path is "stage artifact -> load module ->
-register protocol actions into the WebSocket registry", not "compile into HTTP
-pipeline config".
+validate against the bound protocol package -> register protocol actions into
+the WebSocket registry", not "compile into HTTP pipeline config".
+
+Binding rule for `v1`:
+
+- admin publishes the protocol package and the implementation together in one
+  assignment
+- the bound protocol package carries its own digest so publish / rollback can be
+  pinned to a stable contract identity
+- runtime must reject a module whose exported `protocol`, `version`, or action
+  set does not exactly match the bound package
+- the module may not widen its action surface beyond the bound package
+- version bumps require a new package binding, not an in-place mutation
+- the package digest should be computed from the normalized package payload so
+  action ordering does not change the contract identity
 
 For HTTP specifically, the current `v1` layering is therefore:
 
@@ -884,9 +904,10 @@ The main remaining `v1` work is now narrower and more product-facing:
 
 1. define the deployment convention for `serviceModule` on multi-node WebSocket
    ingress:
-   - either every business `/ws` ingress node must carry the module
-   - or ingress must be partitioned so only a known host pool accepts those
-     protocol actions
+   - each bound protocol package must be present on every ingress node in the
+     target host group, or
+   - ingress must be partitioned so only a known host pool accepts that package
+     and its actions
 2. finish the real admin publish / rollback shape beyond the current mock admin
    replica and owner-set demo endpoints
 3. keep the broader runtime-production items outside this document moving in

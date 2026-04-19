@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { computeServiceModuleProtocolPackageDigest } from "./service-module-protocol-package.ts";
 import {
   parseArtifactManifest,
   parseAssignment,
@@ -130,7 +131,17 @@ describe("admin protocol schemas", () => {
           },
           serviceModule: {
             name: "chat",
-            entry: "services/chat.ts"
+            entry: "services/chat.ts",
+            protocolPackage: {
+              protocol: "chat",
+              version: "1.0",
+              actions: ["send"],
+              digest: computeServiceModuleProtocolPackageDigest({
+                protocol: "chat",
+                version: "1.0",
+                actions: ["send"]
+              })
+            }
           }
         }
       ],
@@ -159,6 +170,16 @@ describe("admin protocol schemas", () => {
       region: "cn-sh-1"
     });
     expect(value.assignments[1]?.serviceModule?.name).toBe("chat");
+    expect(value.assignments[1]?.serviceModule?.protocolPackage).toEqual({
+      protocol: "chat",
+      version: "1.0",
+      actions: ["send"],
+      digest: computeServiceModuleProtocolPackageDigest({
+        protocol: "chat",
+        version: "1.0",
+        actions: ["send"]
+      })
+    });
   });
 
   it("rejects mismatched assignment payloads", () => {
@@ -175,10 +196,66 @@ describe("admin protocol schemas", () => {
         },
         serviceModule: {
           name: "chat",
+          entry: "services/chat.ts",
+          protocolPackage: {
+            protocol: "chat",
+            version: "1.0",
+            actions: ["send"],
+            digest: computeServiceModuleProtocolPackageDigest({
+              protocol: "chat",
+              version: "1.0",
+              actions: ["send"]
+            })
+          }
+        }
+      })
+    ).toThrow("Invalid Assignment");
+  });
+
+  it("rejects service modules without a bound protocol package", () => {
+    expect(() =>
+      parseAssignment({
+        assignmentId: "assign-ws-1",
+        hostId: "host-a",
+        deploymentId: "deploy-ws",
+        deploymentKind: "service_module",
+        declaredVersion: "ws-v3",
+        artifact: {
+          manifestId: "manifest-ws-1",
+          sourceUri: "https://admin.example/artifacts/chat-module.tgz"
+        },
+        serviceModule: {
+          name: "chat",
           entry: "services/chat.ts"
         }
       })
     ).toThrow("Invalid Assignment");
+  });
+
+  it("accepts service modules with a malformed digest field at schema layer only if non-empty, leaving semantic digest checks to runtime", () => {
+    const assignment = parseAssignment({
+      assignmentId: "assign-ws-2",
+      hostId: "host-a",
+      deploymentId: "deploy-ws",
+      deploymentKind: "service_module",
+      declaredVersion: "ws-v4",
+      artifact: {
+        manifestId: "manifest-ws-2",
+        sourceUri: "https://admin.example/artifacts/chat-module.tgz"
+      },
+      serviceModule: {
+        name: "chat",
+        entry: "services/chat.ts",
+        protocolPackage: {
+          protocol: "chat",
+          version: "1.0",
+          actions: ["send"],
+          digest: "sha256:not-a-real-digest"
+        }
+      }
+    });
+
+    expect(assignment.serviceModule?.protocolPackage.digest).toBe("sha256:not-a-real-digest");
   });
 
   it("parses observed host state and bun artifact manifest", () => {

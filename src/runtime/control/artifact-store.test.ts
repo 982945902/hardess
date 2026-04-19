@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ArtifactManifest, Assignment } from "../../shared/index.ts";
+import {
+  computeServiceModuleProtocolPackageDigest,
+  type ArtifactManifest,
+  type Assignment
+} from "../../shared/index.ts";
 import { InMemoryMetrics } from "../observability/metrics.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 
@@ -65,7 +69,17 @@ function createServiceModuleAssignment(sourceUri: string): Assignment {
     },
     serviceModule: {
       name: "chat",
-      entry: "services/chat.ts"
+      entry: "services/chat.ts",
+      protocolPackage: {
+        protocol: "chat",
+        version: "1.0",
+        actions: ["send"],
+        digest: computeServiceModuleProtocolPackageDigest({
+          protocol: "chat",
+          version: "1.0",
+          actions: ["send"]
+        })
+      }
     }
   };
 }

@@ -1,5 +1,12 @@
 export type DeploymentKind = "http_worker" | "service_module" | "serve";
 
+export interface ServiceModuleProtocolPackage {
+  protocol: string;
+  version: string;
+  actions: string[];
+  digest: string;
+}
+
 export interface HostStaticCapacity {
   maxHttpWorkerAssignments?: number;
   maxServiceModuleAssignments?: number;
@@ -84,6 +91,7 @@ export interface Assignment {
   serviceModule?: {
     name: string;
     entry: string;
+    protocolPackage: ServiceModuleProtocolPackage;
   };
   serveApp?: {
     name: string;

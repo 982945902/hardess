@@ -188,6 +188,12 @@ type Assignment = {
   service_module?: {
     name: string;
     entry: string;
+    protocol_package: {
+      protocol: string;
+      version: string;
+      actions: string[];
+      digest: string;
+    };
   };
   serve_app?: {
     name: string;
@@ -396,7 +402,7 @@ Current `v1` implementation boundary:
 - for `serve`, runtime stages the app entry the same way, validates that it
   exports the `serve` module shape, and adapts it into the worker fetch ABI
   before attaching it to the generated HTTP pipeline
-- for `service_module`, runtime stages the module source into the same local artifact cache, loads the staged entry, validates that it exports `{ protocol, version, actions }`, and registers it into the runtime WebSocket protocol registry
+- for `service_module`, admin binds a protocol package together with the module assignment; runtime stages the module source into the same local artifact cache, loads the staged entry, validates that its exported `{ protocol, version, actions }` matches the bound protocol package exactly, verifies the package digest, and then registers it into the runtime WebSocket protocol registry
 - when Bun or Deno project files are present in `package_manager`, runtime currently resolves them relative to the worker source location unless they are given as absolute refs, and stages them into the same local artifact directory
 - for remote `source.uri`, a `digest` is the boundary for reliable cache reuse; without it, runtime should prefer restaging over assuming the cached remote source is still current
 - `v1` keeps Bun as the host runtime, but the worker artifact protocol now allows both Bun and Deno project metadata
@@ -542,7 +548,7 @@ It is:
 
 1. document the multi-node deployment rule for `service_module` so protocol
    actions do not land on a WebSocket ingress node that does not carry the
-   required module
+   required bound protocol package + module pair
 2. finish the real admin publish / rollback shape beyond the current mock
    admin flow
 
