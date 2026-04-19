@@ -316,6 +316,11 @@ type DesiredHostState = {
       name: string;
       entry: string;
       route_refs?: string[];
+      deployment?: {
+        config?: Record<string, unknown>;
+        bindings?: Record<string, unknown>;
+        secrets?: Record<string, string>;
+      };
     };
     auth_policy_ref?: string;
     secret_refs?: string[];
@@ -575,11 +580,9 @@ For the current `v1` runtime, the concrete execution ABI now diverges by
 protocol surface, but not by deployment lifecycle:
 
 - `http_worker` exports `fetch(request, env, ctx)`
-- `serve` is a higher-level HTTP app abstraction authored in TypeScript with
-  app/router style APIs such as `createApp()`, `app.use()`, and `app.get()`
-- runtime adapts `serve` to the same `fetch(request, env, ctx)` worker ABI at
-  load time, so `worker` remains the primitive and `serve` is sugar plus a
-  structured route/middleware model
+- `serve` is the standard business-facing HTTP deployment abstraction
+- runtime adapts `serve` to the same `fetch(request, env, ctx)` worker ABI
+  internally, so `worker` remains the low-level runtime primitive
 - `serviceModule` exports the explicit `ServerProtocolModule` object shape:
 
 ```ts
@@ -621,9 +624,74 @@ pipeline config".
 For HTTP specifically, the current `v1` layering is therefore:
 
 - `worker` is the lowest-level runtime primitive
-- `serve` is a higher-level authoring form for one HTTP app
+- `serve` is the standard authoring and deployment form for one HTTP service
 - admin still deploys and scales both through the same deployment / assignment
   lifecycle
+
+### 13.1 `serve` Deployment Model
+
+`serve` should move toward a Ray Serve-style deployment model while still
+running on the existing worker ABI.
+
+The standard `serve` shape is:
+
+```ts
+export default defineServe({
+  deployment: class OrderServe {
+    private readonly region: string;
+
+    constructor(ctx) {
+      this.region = String(ctx.config.region);
+    }
+
+    getOrder(_request, _env, ctx) {
+      return Response.json({
+        id: ctx.params.id,
+        region: this.region
+      });
+    }
+  },
+  routes: [
+    { method: "GET", path: "/orders/:id", handler: "getOrder" }
+  ]
+});
+```
+
+Rules:
+
+- one `serve` deployment instance is created per runtime pipeline / assignment
+- constructor input is explicit deployment context, not ambient globals
+- supported injection buckets are `config`, `bindings`, and `secrets`
+- route handlers may be functions for the old app/router style or method names
+  for class-based deployments
+- mutable member variables are replica-local only; they are not durable and are
+  not shared across hosts or replicas
+- admin remains responsible for publishing injected values into desired host
+  state; runtime only consumes the host-local projection
+
+The assignment payload may carry explicit injection values:
+
+```ts
+serve_app: {
+  name: "orders",
+  entry: "apps/orders.ts",
+  route_refs: ["route-orders"],
+  deployment: {
+    config: { region: "cn-sh-1" },
+    bindings: { catalog_base_url: "https://catalog.internal" },
+    secrets: { api_token: "runtime-injected-secret" }
+  }
+}
+```
+
+This keeps the boundary clear:
+
+- `serve` is the product-level business abstraction
+- `worker` is the compatibility and execution ABI
+- deployment injection is versioned with admin desired state
+- secrets are still explicit data in the current mock/control protocol and
+  should later become secret references resolved by runtime-owned secret
+  materialization
 
 One important `serviceModule` semantic is now fixed for `v1`:
 

@@ -58,6 +58,48 @@ describe("ModuleConfigStore", () => {
     store.dispose();
   });
 
+  it("loads worker deployment injection config from the config module", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-config-deployment-"));
+    cleanupPaths.push(dir);
+
+    const configPath = join(dir, "hardess.config.ts");
+    await writeFile(
+      configPath,
+      `export const hardessConfig = {
+        pipelines: [
+          {
+            id: "orders-http",
+            matchPrefix: "/orders",
+            downstream: {
+              origin: "http://127.0.0.1:9000",
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000
+            },
+            worker: {
+              entry: "./apps/orders.ts",
+              timeoutMs: 1000,
+              deployment: {
+                config: { region: "cn-sh-1" },
+                bindings: { catalogBaseUrl: "https://catalog.internal" },
+                secrets: { apiToken: "secret-token" }
+              }
+            }
+          }
+        ]
+      };`
+    );
+
+    const store = new ModuleConfigStore(configPath);
+    const config = await store.reload();
+
+    expect(config.pipelines[0]?.worker?.deployment).toEqual({
+      config: { region: "cn-sh-1" },
+      bindings: { catalogBaseUrl: "https://catalog.internal" },
+      secrets: { apiToken: "secret-token" }
+    });
+    store.dispose();
+  });
+
   it("loads config from a default export", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-config-default-"));
     cleanupPaths.push(dir);

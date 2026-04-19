@@ -808,6 +808,11 @@ export interface HardessWorkerEnv {
     matchPrefix: string;
     downstreamOrigin: string;
   };
+  deployment?: {
+    config?: Record<string, unknown>;
+    bindings?: Record<string, unknown>;
+    secrets?: Record<string, string>;
+  };
   traceId?: string;
 }
 
@@ -836,8 +841,59 @@ Rules:
 4. Returning `{ request }` continues upstream proxying with the replacement request.
 5. Worker return values should be runtime-validated so invalid extension results fail fast instead of silently mutating platform behavior.
 6. `ctx.waitUntil()` is allowed for side effects such as async logging, but it must not delay the main request path.
+7. Deployment-scope values must be injected through `env.deployment`; worker or
+   serve code should not read process environment variables as a contract.
 
-### 10.2 Worker Runtime API Boundary
+### 10.2 Serve Deployment Contract
+`serve` is the standard business-facing HTTP abstraction. It is adapted to the
+worker ABI internally, but user-facing code should prefer `serve` for routed
+HTTP services.
+
+Function-style serve remains supported:
+
+```ts
+const app = createApp();
+app.get("/health", () => new Response("ok"));
+export default defineServe(app);
+```
+
+Class-style serve creates one deployment instance per runtime pipeline /
+assignment and supports constructor injection:
+
+```ts
+export default defineServe({
+  kind: "serve",
+  deployment: class PersonnelServe {
+    private readonly region: string;
+
+    constructor(ctx) {
+      this.region = String(ctx.config.region);
+    }
+
+    getUser(_request, _env, ctx) {
+      return Response.json({
+        id: ctx.params.id,
+        region: this.region
+      });
+    }
+  },
+  routes: [
+    { method: "GET", path: "/users/:id", handler: "getUser" }
+  ]
+});
+```
+
+Rules:
+1. `serve` constructor context contains `config`, `bindings`, `secrets`, and
+   pipeline metadata.
+2. `routes[].handler` may be a function or a method name string.
+3. Method-name handlers require a `deployment` class.
+4. Instance fields are replica-local process memory; they are not durable and
+   must not be used as cross-replica coordination state.
+5. Admin-published desired host state is the source of deployment injection;
+   runtime only projects those values into `env.deployment`.
+
+### 10.3 Worker Runtime API Boundary
 Allowed APIs in MVP:
 1. Web-standard `Request`, `Response`, `Headers`, `URL`, `fetch`, `crypto`, `TextEncoder`, `TextDecoder`.
 2. `ctx.waitUntil()` for fire-and-forget side effects.

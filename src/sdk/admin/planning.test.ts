@@ -333,6 +333,51 @@ describe("admin planning helpers", () => {
     ]);
   });
 
+  it("projects serve deployment injection values into host assignments", () => {
+    const desired = projectHttpWorkerDesiredState({
+      hostId: "host-a",
+      upstreamBaseUrl: "http://127.0.0.1:9000",
+      revisionToken: 4,
+      registeredHostIds: ["host-a"],
+      deployments: [
+        {
+          deploymentId: "deployment:orders",
+          deploymentKind: "serve",
+          declaredVersion: "serve/v2",
+          manifestId: "manifest:orders",
+          sourceUri: "https://admin.example/orders-serve.ts",
+          workerName: "orders-serve",
+          workerEntry: "apps/orders-serve.ts",
+          routeId: "route:orders",
+          routePathPrefix: "/orders",
+          deployment: {
+            config: {
+              region: "cn-sh-1"
+            },
+            bindings: {
+              catalogBaseUrl: "https://catalog.internal"
+            },
+            secrets: {
+              apiToken: "secret-token"
+            }
+          }
+        }
+      ]
+    });
+
+    expect(desired.assignments[0]?.serveApp?.deployment).toEqual({
+      config: {
+        region: "cn-sh-1"
+      },
+      bindings: {
+        catalogBaseUrl: "https://catalog.internal"
+      },
+      secrets: {
+        apiToken: "secret-token"
+      }
+    });
+  });
+
   it("places replicas using labels, schedulable state, and capacity instead of plain hostId order", () => {
     const candidateHosts = buildPlacementCandidateHosts({
       registrations: [

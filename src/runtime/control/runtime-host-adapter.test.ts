@@ -226,7 +226,18 @@ describe("RuntimeHostAdapter", () => {
           serveApp: {
             name: "personnel-serve",
             entry: "apps/personnel-serve.ts",
-            routeRefs: ["route-serve-a"]
+            routeRefs: ["route-serve-a"],
+            deployment: {
+              config: {
+                region: "cn-sh-1"
+              },
+              bindings: {
+                catalogBaseUrl: "https://catalog.internal"
+              },
+              secrets: {
+                apiToken: "serve-secret"
+              }
+            }
           }
         }
       ],
@@ -261,7 +272,18 @@ describe("RuntimeHostAdapter", () => {
             },
             worker: {
               entry: "/tmp/staged/personnel-serve.ts",
-              timeoutMs: 1000
+              timeoutMs: 1000,
+              deployment: {
+                config: {
+                  region: "cn-sh-1"
+                },
+                bindings: {
+                  catalogBaseUrl: "https://catalog.internal"
+                },
+                secrets: {
+                  apiToken: "serve-secret"
+                }
+              }
             }
           }
         ]

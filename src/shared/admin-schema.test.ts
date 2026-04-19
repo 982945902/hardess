@@ -104,7 +104,18 @@ describe("admin protocol schemas", () => {
           serveApp: {
             name: "demo-http",
             entry: "apps/demo-serve.ts",
-            routeRefs: ["route-a"]
+            routeRefs: ["route-a"],
+            deployment: {
+              config: {
+                region: "cn-sh-1"
+              },
+              bindings: {
+                catalogBaseUrl: "https://catalog.internal"
+              },
+              secrets: {
+                apiToken: "token-1"
+              }
+            }
           }
         },
         {
@@ -144,6 +155,9 @@ describe("admin protocol schemas", () => {
     expect(value.topology?.placement.deployments[0]?.ownerHostIds).toEqual(["host-a"]);
     expect(value.assignments[0]?.groupId).toBe("group-core");
     expect(value.assignments[0]?.serveApp?.name).toBe("demo-http");
+    expect(value.assignments[0]?.serveApp?.deployment?.config).toEqual({
+      region: "cn-sh-1"
+    });
     expect(value.assignments[1]?.serviceModule?.name).toBe("chat");
   });
 

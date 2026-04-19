@@ -51,6 +51,11 @@ export interface HttpWorkerDeploymentPlan {
   denoLock?: string;
   frozenLock?: boolean;
   metadataAnnotations?: Record<string, string>;
+  deployment?: {
+    config?: Record<string, unknown>;
+    bindings?: Record<string, unknown>;
+    secrets?: Record<string, string>;
+  };
   stickyHostIds?: string[];
   ownerHostIds?: string[];
   scheduling?: {
@@ -611,14 +616,24 @@ function buildAssignmentForHost(hostId: string, deployment: HttpWorkerDeployment
       ? {
           name: deployment.workerName,
           entry: deployment.workerEntry,
-          routeRefs: [buildRouteIdForHost(hostId, deployment)]
+          routeRefs: [buildRouteIdForHost(hostId, deployment)],
+          ...(deployment.deployment !== undefined
+            ? {
+                deployment: deployment.deployment
+              }
+            : {})
         }
       : undefined,
     serveApp: (deployment.deploymentKind ?? "http_worker") === "serve"
       ? {
           name: deployment.workerName,
           entry: deployment.workerEntry,
-          routeRefs: [buildRouteIdForHost(hostId, deployment)]
+          routeRefs: [buildRouteIdForHost(hostId, deployment)],
+          ...(deployment.deployment !== undefined
+            ? {
+                deployment: deployment.deployment
+              }
+            : {})
         }
       : undefined
   };

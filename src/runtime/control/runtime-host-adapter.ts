@@ -363,7 +363,12 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
             },
             worker: {
               entry: prepared.localEntry,
-              timeoutMs: this.options.defaultWorkerTimeoutMs ?? 1_000
+              timeoutMs: this.options.defaultWorkerTimeoutMs ?? 1_000,
+              ...(httpExecutable.deployment !== undefined
+                ? {
+                    deployment: httpExecutable.deployment
+                  }
+                : {})
             }
           });
         }

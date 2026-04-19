@@ -45,6 +45,7 @@ export async function runWorker(
           downstreamOrigin: pipeline.downstream.origin,
           groupId: pipeline.groupId
         },
+        deployment: pipeline.worker?.deployment,
         traceId
       },
       ctx
