@@ -74,10 +74,12 @@ try {
     runtimeConfig.metrics.mode,
     runtimeConfig.metrics.maxTimingsPerMetric
   );
+  let serviceModuleManager: ServiceModuleManager | undefined;
   const app = await createRuntimeApp({
     configModulePath: runtimeConfig.configModulePath,
     nodeId: runtimeConfig.nodeId,
     hostGroupId: runtimeConfig.hostGroupId,
+    listActiveProtocolPackages: () => serviceModuleManager?.listActiveProtocolPackages() ?? [],
     prometheusPrefix: runtimeConfig.prometheusPrefix,
     cluster: {
       peers: runtimeConfig.cluster.peers,
@@ -194,7 +196,7 @@ try {
             logger: app.logger,
             metrics: app.metrics
           });
-          const serviceModuleManager = new ServiceModuleManager({
+          serviceModuleManager = new ServiceModuleManager({
             registry: app.registry,
             artifactStore,
             logger: app.logger,

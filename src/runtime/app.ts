@@ -25,6 +25,7 @@ import { ServerProtocolRegistry } from "./protocol/registry.ts";
 import { Dispatcher } from "./routing/dispatcher.ts";
 import { InMemoryPeerLocator } from "./routing/peer-locator.ts";
 import { invalidateWorkers } from "./workers/loader.ts";
+import type { ServiceModuleProtocolPackageRef } from "../shared/index.ts";
 
 export interface RuntimeAppOptions {
   configModulePath?: string;
@@ -32,6 +33,7 @@ export interface RuntimeAppOptions {
   metrics?: Metrics;
   nodeId?: string;
   hostGroupId?: string;
+  listActiveProtocolPackages?: () => ServiceModuleProtocolPackageRef[];
   prometheusPrefix?: string;
   cluster?: {
     peers?: ClusterPeerNode[];
@@ -334,6 +336,8 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
     peerLocator: localPeerLocator,
     dispatcher,
     clusterNetwork: clusterNetwork.hasPeers() ? clusterNetwork : undefined,
+    topologyStore,
+    listActiveProtocolPackages: options.listActiveProtocolPackages,
     registry,
     logger,
     metrics,

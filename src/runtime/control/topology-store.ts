@@ -1,6 +1,6 @@
 import type { ClusterPeerNode } from "../cluster/network.ts";
 import type { ClusterPeerHealthStatus } from "../cluster/health.ts";
-import type { DesiredTopology, MembershipHost } from "../../shared/index.ts";
+import type { DesiredTopology, MembershipHost, ServiceModuleProtocolPackageRef } from "../../shared/index.ts";
 
 type TopologyListener = (topology: DesiredTopology | undefined) => void;
 
@@ -67,6 +67,15 @@ export class RuntimeTopologyStore {
     }
 
     return allowedHostIds === undefined ? undefined : [];
+  }
+
+  listIngressGroupRequiredProtocolPackages(groupId?: string): ServiceModuleProtocolPackageRef[] {
+    const requirement = (this.topology?.placement.ingressGroupRequirements ?? []).find(
+      (entry) => entry.groupId === groupId
+    );
+    return [...(requirement?.requiredProtocolPackages ?? [])].sort((left, right) =>
+      left.packageId.localeCompare(right.packageId)
+    );
   }
 
   private buildClusterPeers(

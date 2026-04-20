@@ -188,6 +188,68 @@ describe("RuntimeTopologyStore", () => {
     expect(store.listClusterPeerNodeIds("node-a")).toEqual(["node-b", "node-c"]);
   });
 
+  it("returns required ingress protocol packages for the current host group", () => {
+    const store = new RuntimeTopologyStore();
+    store.setTopology({
+      membership: {
+        revision: "topology:3:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-a",
+            groupId: "group-chat",
+            nodeId: "node-a",
+            internalBaseUrl: "http://node-a.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:3:placement",
+        generatedAt: 1,
+        deployments: [],
+        ingressGroupRequirements: [
+          {
+            groupId: "group-chat",
+            requiredProtocolPackages: [
+              {
+                packageId: "chat@1.0",
+                digest: "sha256:chat"
+              }
+            ]
+          },
+          {
+            requiredProtocolPackages: [
+              {
+                packageId: "demo@1.0",
+                digest: "sha256:demo"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    expect(store.listIngressGroupRequiredProtocolPackages("group-chat")).toEqual([
+      {
+        packageId: "chat@1.0",
+        digest: "sha256:chat"
+      }
+    ]);
+    expect(store.listIngressGroupRequiredProtocolPackages(undefined)).toEqual([
+      {
+        packageId: "demo@1.0",
+        digest: "sha256:demo"
+      }
+    ]);
+    expect(store.listIngressGroupRequiredProtocolPackages("group-missing")).toEqual([]);
+  });
+
   it("excludes dead peers from topology-scoped locate probes", () => {
     const store = new RuntimeTopologyStore();
     store.setTopology({
