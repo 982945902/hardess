@@ -384,7 +384,8 @@ describe("RuntimeHostAdapter", () => {
             state.preparedAt = Date.now();
           }
         },
-        listDrainingAssignments: () => []
+        listDrainingAssignments: () => [],
+        listActiveProtocolPackages: () => []
       } as never,
       hostId: "host-a",
       runtimeVersion: "1.0.0"
@@ -556,6 +557,7 @@ describe("RuntimeHostAdapter", () => {
       runtimeVersion: "1.0.0",
       serviceModuleManager: {
         applyAssignments: async () => {},
+        listActiveProtocolPackages: () => [],
         listDrainingAssignments: () => [
           {
             assignmentId: "assign-ws-1",

@@ -1,6 +1,7 @@
 import {
   ERROR_CODES,
   HardessError,
+  buildServiceModuleProtocolPackageId,
   parseSysAuthPayload,
   parseSysHandleAckPayload,
   parseSysPingPayload,
@@ -8,10 +9,12 @@ import {
   type AckMode,
   type AuthContext,
   type ConnRef,
-  type Envelope
+  type Envelope,
+  type ServiceModuleProtocolPackageRef
 } from "../../shared/index.ts";
 import type { AuthService } from "../auth/service.ts";
 import type { StaticClusterNetwork } from "../cluster/network.ts";
+import type { RuntimeTopologyStore } from "../control/topology-store.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
 import { Dispatcher } from "../routing/dispatcher.ts";
@@ -63,6 +66,8 @@ export interface WebSocketRuntimeDeps {
   peerLocator: InMemoryPeerLocator;
   dispatcher: Dispatcher;
   clusterNetwork?: StaticClusterNetwork;
+  topologyStore?: RuntimeTopologyStore;
+  listActiveProtocolPackages?: () => ServiceModuleProtocolPackageRef[];
   registry: ServerProtocolRegistry;
   logger: Logger;
   metrics?: Metrics;
@@ -174,6 +179,43 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       detail: "retry_on_another_healthy_node",
       refMsgId
     });
+  }
+
+  function ensureIngressProtocolPackageAvailable(envelope: Envelope<unknown>): void {
+    const requiredPackages = deps.topologyStore?.listIngressGroupRequiredProtocolPackages(deps.hostGroupId) ?? [];
+    if (requiredPackages.length === 0) {
+      return;
+    }
+
+    const requiredPackageId = buildServiceModuleProtocolPackageId(envelope.protocol, envelope.version);
+    const requiredPackage = requiredPackages.find((entry) => entry.packageId === requiredPackageId);
+    if (!requiredPackage) {
+      return;
+    }
+
+    const activePackages = deps.listActiveProtocolPackages?.() ?? [];
+    const isLocallyReady = activePackages.some(
+      (entry) => entry.packageId === requiredPackage.packageId && entry.digest === requiredPackage.digest
+    );
+    if (isLocallyReady) {
+      return;
+    }
+
+    metrics.increment("ws.ingress_protocol_unavailable");
+    throw new HardessError(
+      ERROR_CODES.INGRESS_PROTOCOL_UNAVAILABLE,
+      `Ingress host is not ready for required protocol package ${requiredPackage.packageId}`,
+      {
+        retryable: true,
+        detail: {
+          groupId: deps.hostGroupId,
+          packageId: requiredPackage.packageId,
+          digest: requiredPackage.digest,
+          retryHint: "retry_on_another_healthy_node"
+        },
+        refMsgId: envelope.msgId
+      }
+    );
   }
 
   function currentSocketBufferedAmount(connection: ConnectionState): number {
@@ -677,6 +719,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     if (!isValid) {
       throw new HardessError(ERROR_CODES.AUTH_REVOKED_TOKEN, "Authentication is no longer valid");
     }
+    ensureIngressProtocolPackageAvailable(envelope);
 
     const hooks = deps.registry.get(envelope.protocol, envelope.version, envelope.action);
     const ctx = {

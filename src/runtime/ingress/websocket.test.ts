@@ -11,6 +11,7 @@ import { demoServerModule } from "../protocol/demo-module.ts";
 import { ServerProtocolRegistry } from "../protocol/registry.ts";
 import { Dispatcher } from "../routing/dispatcher.ts";
 import { InMemoryPeerLocator } from "../routing/peer-locator.ts";
+import { RuntimeTopologyStore } from "../control/topology-store.ts";
 
 interface TestSocket {
   data: {
@@ -297,6 +298,206 @@ describe("createWebSocketHandlers", () => {
       .map((raw) => parseEnvelope(raw)?.action)
       .filter((value): value is string => value !== undefined);
     expect(actions.slice(-2)).toEqual(["recvAck", "handleAck"]);
+  });
+
+  it("rejects business messages when the ingress group requires a protocol package that is not active locally", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    const topologyStore = new RuntimeTopologyStore();
+    registry.register(demoServerModule);
+    topologyStore.setTopology({
+      membership: {
+        revision: "topology:1:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-a",
+            groupId: "group-a",
+            nodeId: "local",
+            internalBaseUrl: "http://node-a.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:1:placement",
+        generatedAt: 1,
+        deployments: [],
+        ingressGroupRequirements: [
+          {
+            groupId: "group-a",
+            requiredProtocolPackages: [
+              {
+                packageId: "demo@1.0",
+                digest: "sha256:demo-required"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      hostGroupId: "group-a",
+      authService,
+      peerLocator,
+      dispatcher,
+      topologyStore,
+      listActiveProtocolPackages: () => [],
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-biz-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    );
+
+    expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe(
+      "INGRESS_PROTOCOL_UNAVAILABLE"
+    );
+    handlers.dispose();
+  });
+
+  it("allows business messages when the required ingress protocol package is active locally", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    const topologyStore = new RuntimeTopologyStore();
+    registry.register(terminalServerModule);
+    topologyStore.setTopology({
+      membership: {
+        revision: "topology:1:membership",
+        generatedAt: 1,
+        hosts: [
+          {
+            hostId: "host-a",
+            groupId: "group-a",
+            nodeId: "local",
+            internalBaseUrl: "http://node-a.internal",
+            publicListenerEnabled: true,
+            internalListenerEnabled: true,
+            state: "ready",
+            staticLabels: {},
+            staticCapabilities: [],
+            staticCapacity: {}
+          }
+        ]
+      },
+      placement: {
+        revision: "topology:1:placement",
+        generatedAt: 1,
+        deployments: [],
+        ingressGroupRequirements: [
+          {
+            groupId: "group-a",
+            requiredProtocolPackages: [
+              {
+                packageId: "terminal@1.0",
+                digest: "sha256:terminal-required"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      hostGroupId: "group-a",
+      authService,
+      peerLocator,
+      dispatcher,
+      topologyStore,
+      listActiveProtocolPackages: () => [
+        {
+          packageId: "terminal@1.0",
+          digest: "sha256:terminal-required"
+        }
+      ],
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-biz-1",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "terminal",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          content: "hello"
+        }
+      })
+    );
+
+    expect(lastEnvelope(alice)?.action).toBe("handleAck");
+    handlers.dispose();
   });
 
   it("uses hostGroupId instead of trusting client-selected auth group", async () => {

@@ -1,6 +1,7 @@
 import {
   type ArtifactManifest,
   type Assignment,
+  type ServiceModuleProtocolPackageRef,
   verifyServiceModuleProtocolPackageDigest
 } from "../../shared/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
@@ -27,6 +28,8 @@ interface ActiveServiceModule {
   assignmentId: string;
   deploymentId: string;
   declaredVersion: string;
+  packageId: string;
+  digest: string;
   protocol: string;
   version: string;
   localEntry: string;
@@ -109,6 +112,8 @@ export class ServiceModuleManager {
         assignmentId: nextModule.assignmentId,
         deploymentId: nextModule.assignment.deploymentId,
         declaredVersion: nextModule.assignment.declaredVersion,
+        packageId: nextModule.packageId,
+        digest: nextModule.digest,
         protocol: nextModule.protocol,
         version: nextModule.version,
         localEntry: nextModule.localEntry,
@@ -140,6 +145,15 @@ export class ServiceModuleManager {
       }));
   }
 
+  listActiveProtocolPackages(): ServiceModuleProtocolPackageRef[] {
+    return Array.from(this.activeByAssignmentId.values())
+      .map((active) => ({
+        packageId: active.packageId,
+        digest: active.digest
+      }))
+      .sort((left, right) => left.packageId.localeCompare(right.packageId));
+  }
+
   private async prepareAssignments(input: {
     assignments: Assignment[];
     artifacts: Map<string, ArtifactManifest>;
@@ -149,6 +163,8 @@ export class ServiceModuleManager {
   }): Promise<
     Array<{
       assignmentId: string;
+      packageId: string;
+      digest: string;
       protocol: string;
       version: string;
       localEntry: string;
@@ -158,6 +174,8 @@ export class ServiceModuleManager {
   > {
     const nextModules: Array<{
       assignmentId: string;
+      packageId: string;
+      digest: string;
       protocol: string;
       version: string;
       localEntry: string;
@@ -198,6 +216,8 @@ export class ServiceModuleManager {
         protocolVersionOwners.set(boundProtocolPackage.packageId, assignment.assignmentId);
         nextModules.push({
           assignmentId: assignment.assignmentId,
+          packageId: boundProtocolPackage.packageId,
+          digest: boundProtocolPackage.digest,
           protocol: boundProtocolPackage.protocol,
           version: boundProtocolPackage.version,
           localEntry: prepared.localEntry,
@@ -299,6 +319,7 @@ function validateBoundProtocolPackage(
   serviceModule: Awaited<ReturnType<typeof loadServiceModule>>
 ): {
   packageId: string;
+  digest: string;
   protocol: string;
   version: string;
 } {
@@ -328,6 +349,7 @@ function validateBoundProtocolPackage(
 
   return {
     packageId: protocolPackage.packageId,
+    digest: protocolPackage.digest,
     protocol: protocolPackage.protocol,
     version: protocolPackage.version
   };

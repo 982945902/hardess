@@ -907,12 +907,15 @@ The main remaining `v1` work is now narrower and more product-facing:
 
 1. define the deployment convention for `serviceModule` on multi-node WebSocket
    ingress:
-   - each bound protocol package must be present on every ingress node in the
-     target host group, or
-   - ingress must be partitioned so only a known host pool accepts that package
-     and its actions
-   - planning should therefore emit group-level required protocol-package refs,
-     rather than leaving ingress capability implicit in scattered assignments
+   - planning now emits group-level required protocol-package refs for each
+     ingress host group
+   - runtime now enforces the minimal safe `v1` gate: if an inbound business
+     envelope targets a required `protocolPackage`, the ingress node must have
+     the same `package_id + digest` active locally or it rejects that message as
+     retryable
+   - the remaining product choice is whether future rollout should strengthen
+     this from package-scoped admission to full-group readiness or explicit
+     ingress partitioning / redirect
 2. finish the real admin publish / rollback shape beyond the current mock admin
    replica and owner-set demo endpoints
 3. keep the broader runtime-production items outside this document moving in
