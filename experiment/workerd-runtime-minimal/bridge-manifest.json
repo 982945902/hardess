@@ -1,0 +1,24 @@
+{
+  "assignmentId": "exp-workerd-minimal-http-worker-v1",
+  "deploymentKind": "http_worker",
+  "workerd": {
+    "listenAddress": "127.0.0.1:6285",
+    "compatibilityDate": "2025-08-01",
+    "compatibilityFlags": [
+      "typescript_strip_types"
+    ]
+  },
+  "httpWorker": {
+    "name": "minimal-http-worker",
+    "entry": "worker.ts",
+    "deployment": {
+      "bindings": {
+        "DEMO_SECRET": "hardess-workerd-secret",
+        "RUNTIME_META": {
+          "runtime": "workerd",
+          "experiment": "minimal-validation"
+        }
+      }
+    }
+  }
+}
