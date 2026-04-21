@@ -10,6 +10,10 @@ Can we run a minimal `workerd`-based HTTP worker locally, from inside the Hardes
 - a basic text binding
 - a basic JSON binding
 - request body handling
+- a minimal WebSocket upgrade path
+- a Hardess-style assignment object that stays separate from runtime adapter config
+- a minimal planning fragment that resolves routeRefs into an actual route table
+- a minimal protocol package that resolves route actions and method/websocket policy
 
 This is intentionally not a Hardess runtime integration. It is only a feasibility spike.
 
@@ -19,24 +23,35 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - a modules-based TypeScript worker can serve HTTP traffic
 - capability-style bindings can be injected into the worker
 - a small request/response path works without Bun
-- a Hardess-flavored static manifest can be translated into `workerd` config
+- a Hardess-style assignment object can be translated into `workerd` config through a thin adapter
+- routeRefs can be resolved against a planning fragment and enforced at runtime
+- protocol-package actions can drive worker dispatch and negative method checks
+- a minimal WebSocket echo path works through the same local runtime
 
 ## What this does not prove
 
 - no Hardess control-plane integration
 - no dynamic artifact loading
 - no multi-service planning or placement
-- no websocket path
 - no singleton serve semantics
 
 ## Files
 
-- `bridge-manifest.json`: Hardess-flavored static input for the runtime bridge
-- `generate-config.ts`: converts the manifest into a runnable `workerd` config
+- `assignment.json`: Hardess-flavored assignment input
+- `runtime-adapter.json`: workerd-specific runtime adapter input
+- `planning-fragment.json`: minimal route planning input
+- `protocol-package.json`: minimal protocol-package input for ingress actions
+- `bad-fixtures/`: intentionally invalid inputs used by generator negative checks
+- `config-model.ts`: typed input schemas plus JSON loading
+- `config-validation.ts`: structural validation and route resolution
+- `config-render.ts`: renders runnable `workerd` config from validated inputs
+- `generate-config.ts`: thin CLI entry that loads inputs and writes the generated config
 - `config.capnp`: hand-written baseline config for comparison
 - `worker.ts`: TypeScript worker entry
+- `ws-smoke.ts`: local WebSocket validation client
 - `run.sh`: starts the local server
 - `verify.sh`: boots the server, sends requests, and checks responses
+- `verify-negative.sh`: checks that invalid inputs fail during config generation
 
 ## Run
 
@@ -52,7 +67,21 @@ Before starting `workerd`, the script generates:
 
 from:
 
-- `bridge-manifest.json`
+- `assignment.json`
+- `runtime-adapter.json`
+- `planning-fragment.json`
+- `protocol-package.json`
+
+The generator also supports overriding any input file:
+
+```bash
+bun run ./experiment/workerd-runtime-minimal/generate-config.ts \
+  --assignment ./experiment/workerd-runtime-minimal/assignment.json \
+  --runtime-adapter ./experiment/workerd-runtime-minimal/runtime-adapter.json \
+  --planning-fragment ./experiment/workerd-runtime-minimal/planning-fragment.json \
+  --protocol-package ./experiment/workerd-runtime-minimal/protocol-package.json \
+  --output ./experiment/workerd-runtime-minimal/.generated.config.capnp
+```
 
 ## Verify
 
@@ -64,7 +93,31 @@ The script checks:
 
 - `GET /`
 - `POST /echo`
-- manifest-to-config generation
+- `GET /echo` negative method check
+- `GET /ws` websocket upgrade and echo
+- assignment-plus-adapter-plus-planning-plus-protocol-package to config generation
+
+## Verify Negative Cases
+
+```bash
+./experiment/workerd-runtime-minimal/verify-negative.sh
+```
+
+The script currently locks in two generator failures:
+
+- assignment references a `routeRef` that planning does not contain
+- planning resolves to an `actionId` that the protocol package does not contain
+
+It also locks in a few structural validation failures:
+
+- duplicate `routeRef` inside assignment
+- invalid `listenAddress` or duplicate runtime compatibility flags inside runtime adapter
+- duplicate `routeId` or duplicate `pathPrefix` inside planning
+- malformed `pathPrefix` such as trailing slash or double slash
+- invalid HTTP method shape or duplicate methods inside the protocol package
+- invalid `websocket` action declaration inside the protocol package
+- websocket route planning that forgets to enable upstream websocket support
+- upstream `baseUrl` scheme that does not match the resolved action kind
 
 ## Graduation bar
 

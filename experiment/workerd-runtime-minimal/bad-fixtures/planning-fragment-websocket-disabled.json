@@ -1,0 +1,36 @@
+{
+  "sharedHttpForwardConfig": {
+    "routes": [
+      {
+        "routeId": "route.demo.workerd.root",
+        "match": {
+          "pathPrefix": "/"
+        },
+        "actionId": "http.info",
+        "upstream": {
+          "baseUrl": "http://workerd.local/root"
+        }
+      },
+      {
+        "routeId": "route.demo.workerd.echo",
+        "match": {
+          "pathPrefix": "/echo"
+        },
+        "actionId": "http.echo",
+        "upstream": {
+          "baseUrl": "http://workerd.local/echo"
+        }
+      },
+      {
+        "routeId": "route.demo.workerd.ws",
+        "match": {
+          "pathPrefix": "/ws"
+        },
+        "actionId": "ws.echo",
+        "upstream": {
+          "baseUrl": "ws://workerd.local/ws"
+        }
+      }
+    ]
+  }
+}
