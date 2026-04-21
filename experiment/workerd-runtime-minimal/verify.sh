@@ -4,47 +4,47 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SCRIPT="$ROOT_DIR/run.sh"
-BASE_URL="http://127.0.0.1:6285"
+source "$ROOT_DIR/verify-lib.sh"
 LOG_FILE="$(mktemp -t workerd-minimal-log.XXXXXX)"
 GENERATED_CONFIG="$ROOT_DIR/.generated.config.capnp"
-RESOLVED_MODEL="$(cd "$ROOT_DIR" && rtk bun run ./print-resolved-model.ts)"
-RUNTIME_SUMMARY="$(cd "$ROOT_DIR" && rtk bun run ./print-runtime-summary.ts)"
+GENERATED_CONFIG_NO_COMPAT="$(mktemp -t workerd-minimal-no-compat.XXXXXX)"
+
+PORT="${PORT:-$(pick_port)}"
+LISTEN_ADDRESS="127.0.0.1:${PORT}"
+BASE_URL="http://${LISTEN_ADDRESS}"
+WS_URL="ws://${LISTEN_ADDRESS}/ws"
+RESOLVED_MODEL="$(cd "$ROOT_DIR" && rtk bun run ./print-resolved-model.ts --listen-address "$LISTEN_ADDRESS")"
+RUNTIME_SUMMARY="$(cd "$ROOT_DIR" && rtk bun run ./print-runtime-summary.ts --listen-address "$LISTEN_ADDRESS")"
+RESOLVED_MODEL_NO_COMPAT="$(cd "$ROOT_DIR" && rtk bun run ./print-resolved-model.ts --runtime-adapter ./runtime-adapter-no-compatibility-bindings.json --listen-address "$LISTEN_ADDRESS")"
 
 cleanup() {
-  if [[ -n "${SERVER_PID:-}" ]]; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-    for _ in {1..20}; do
-      if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 0.1
-    done
-    if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-      kill -9 "$SERVER_PID" >/dev/null 2>&1 || true
-    fi
-    wait "$SERVER_PID" >/dev/null 2>&1 || true
-  fi
+  cleanup_server "${SERVER_PID:-}"
   rm -f "$LOG_FILE"
+  rm -f "$GENERATED_CONFIG_NO_COMPAT"
 }
 trap cleanup EXIT
 
-"$RUN_SCRIPT" >"$LOG_FILE" 2>&1 &
+"$RUN_SCRIPT" --listen-address "$LISTEN_ADDRESS" >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
-for _ in {1..50}; do
-  if curl -fsS "$BASE_URL/" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.2
-done
+wait_for_http_ready "$BASE_URL" "$LOG_FILE" "$SERVER_PID" "standard runtime"
 
 GET_RESPONSE="$(curl -fsS "$BASE_URL/")"
 POST_RESPONSE="$(curl -fsS -X POST "$BASE_URL/echo" --data 'hardess-workerd')"
 INVALID_METHOD_RESPONSE="$(curl -sS -X GET "$BASE_URL/echo")"
-WS_RESPONSE="$(cd "$ROOT_DIR" && bun run ./ws-smoke.ts)"
+WS_RESPONSE="$(cd "$ROOT_DIR" && rtk bun run ./ws-smoke.ts --url "$WS_URL")"
+
+(
+  cd "$ROOT_DIR"
+  rtk bun run ./generate-config.ts \
+    --runtime-adapter ./runtime-adapter-no-compatibility-bindings.json \
+    --listen-address "$LISTEN_ADDRESS" \
+    --output "$GENERATED_CONFIG_NO_COMPAT" >/dev/null
+)
 
 test -f "$GENERATED_CONFIG"
-grep -q 'address = "127.0.0.1:6285"' "$GENERATED_CONFIG"
+test -f "$GENERATED_CONFIG_NO_COMPAT"
+grep -q "address = \"$LISTEN_ADDRESS\"" "$GENERATED_CONFIG"
 grep -q 'text = "hardess-workerd-secret"' "$GENERATED_CONFIG"
 grep -q 'text = "hardess-workerd-token"' "$GENERATED_CONFIG"
 grep -q 'HARDESS_ASSIGNMENT_META' "$GENERATED_CONFIG"
@@ -54,13 +54,25 @@ grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$GENERATED_CONFIG"
 grep -q 'route.demo.workerd.ws' "$GENERATED_CONFIG"
 grep -q 'HARDESS_PROTOCOL_PACKAGE' "$GENERATED_CONFIG"
 grep -q 'workerd-http-ingress@v1' "$GENERATED_CONFIG"
-echo "$RESOLVED_MODEL" | grep -q '"listenAddress": "127.0.0.1:6285"'
+grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$GENERATED_CONFIG_NO_COMPAT"
+if grep -q 'HARDESS_ROUTE_TABLE' "$GENERATED_CONFIG_NO_COMPAT"; then
+  echo 'unexpected HARDESS_ROUTE_TABLE in no-compat generated config' >&2
+  exit 1
+fi
+if grep -q 'HARDESS_PROTOCOL_PACKAGE' "$GENERATED_CONFIG_NO_COMPAT"; then
+  echo 'unexpected HARDESS_PROTOCOL_PACKAGE in no-compat generated config' >&2
+  exit 1
+fi
+echo "$RESOLVED_MODEL" | grep -q '"schemaVersion": "hardess.workerd.resolved-runtime-model.v1"'
+echo "$RESOLVED_MODEL" | grep -q "\"listenAddress\": \"$LISTEN_ADDRESS\""
 echo "$RESOLVED_MODEL" | grep -q '"actionCount": 3'
 echo "$RESOLVED_MODEL" | grep -q '"actionIds": \['
 echo "$RESOLVED_MODEL" | grep -q '"http.info"'
 echo "$RESOLVED_MODEL" | grep -q '"primaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
 echo "$RESOLVED_MODEL" | grep -q '"compatibilityBindings": \['
 echo "$RESOLVED_MODEL" | grep -q '"metadataBindings": \['
+echo "$RESOLVED_MODEL_NO_COMPAT" | grep -q '"compatibilityBindings": \[\]'
+echo "$RUNTIME_SUMMARY" | grep -q '"schemaVersion": "hardess.workerd.runtime-summary.v1"'
 echo "$RUNTIME_SUMMARY" | grep -q '"primaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
 echo "$RUNTIME_SUMMARY" | grep -q '"routeCount": 3'
 echo "$RUNTIME_SUMMARY" | grep -q '"highestAdvisorySeverity": "warning"'
@@ -95,7 +107,7 @@ echo "$GET_RESPONSE" | grep -q '"actionId": "http.info"'
 echo "$GET_RESPONSE" | grep -q '"protocolPackageId": "workerd-http-ingress@v1"'
 echo "$GET_RESPONSE" | grep -q '"dispatchSource": "resolved_runtime_model"'
 echo "$GET_RESPONSE" | grep -q '"resolvedRouteCount": 3'
-echo "$GET_RESPONSE" | grep -q '"resolvedListenAddress": "127.0.0.1:6285"'
+echo "$GET_RESPONSE" | grep -q "\"resolvedListenAddress\": \"$LISTEN_ADDRESS\""
 echo "$GET_RESPONSE" | grep -q '"resolvedProtocolActionCount": 3'
 echo "$GET_RESPONSE" | grep -q '"resolvedProtocolActionIds": \['
 echo "$GET_RESPONSE" | grep -q '"resolvedPrimaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
@@ -143,6 +155,8 @@ printf '\n%s\n' 'POST /echo response:'
 printf '%s\n' "$POST_RESPONSE"
 printf '\n%s\n' 'Resolved runtime model:'
 printf '%s\n' "$RESOLVED_MODEL"
+printf '\n%s\n' 'Resolved runtime model without compatibility bindings:'
+printf '%s\n' "$RESOLVED_MODEL_NO_COMPAT"
 printf '\n%s\n' 'Runtime summary:'
 printf '%s\n' "$RUNTIME_SUMMARY"
 printf '\n%s\n' 'GET /echo invalid method response:'

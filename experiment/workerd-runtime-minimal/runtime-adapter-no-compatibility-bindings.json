@@ -6,7 +6,7 @@
     "typescript_strip_types"
   ],
   "compatibilityBindings": {
-    "routeTable": true,
-    "protocolPackage": true
+    "routeTable": false,
+    "protocolPackage": false
   }
 }

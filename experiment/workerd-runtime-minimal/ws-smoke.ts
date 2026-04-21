@@ -1,4 +1,8 @@
-const ws = new WebSocket("ws://127.0.0.1:6285/ws");
+const urlOptionIndex = process.argv.indexOf("--url");
+const wsUrl =
+  urlOptionIndex >= 0 && process.argv[urlOptionIndex + 1] ? process.argv[urlOptionIndex + 1] : "ws://127.0.0.1:6285/ws";
+
+const ws = new WebSocket(wsUrl);
 
 const result = await new Promise<string>((resolve, reject) => {
   let sawOpenMessage = false;

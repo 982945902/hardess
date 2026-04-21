@@ -1,4 +1,11 @@
 import type { Assignment, PlanningFragment, ProtocolAction, ProtocolPackage, Route, RuntimeAdapter } from "./config-model";
+import { isIP } from "node:net";
+
+export const RESOLVED_RUNTIME_MODEL_SCHEMA_VERSION = "hardess.workerd.resolved-runtime-model.v1";
+export const RESOLVED_RUNTIME_SUMMARY_SCHEMA_VERSION = "hardess.workerd.runtime-summary.v1";
+
+export type CompatibilityBindingName = "HARDESS_ROUTE_TABLE" | "HARDESS_PROTOCOL_PACKAGE";
+export type MetadataBindingName = "HARDESS_ASSIGNMENT_META" | "HARDESS_CONFIG";
 
 export interface ResolvedRoute {
   routeId: string;
@@ -21,6 +28,7 @@ export interface ResolvedRuntimeAdvisory {
 }
 
 export interface ResolvedRuntimeSummary {
+  schemaVersion: typeof RESOLVED_RUNTIME_SUMMARY_SCHEMA_VERSION;
   assignmentId: string;
   deploymentId: string;
   runtime: {
@@ -28,8 +36,8 @@ export interface ResolvedRuntimeSummary {
     socketName: string;
   };
   primaryRuntimeBinding: "HARDESS_RESOLVED_RUNTIME_MODEL";
-  compatibilityBindings: Array<"HARDESS_ROUTE_TABLE" | "HARDESS_PROTOCOL_PACKAGE">;
-  metadataBindings: Array<"HARDESS_ASSIGNMENT_META" | "HARDESS_CONFIG">;
+  compatibilityBindings: CompatibilityBindingName[];
+  metadataBindings: MetadataBindingName[];
   routeCount: number;
   httpRouteCount: number;
   websocketRouteCount: number;
@@ -50,6 +58,7 @@ export interface ResolvedRuntimeSummary {
 }
 
 export interface ResolvedRuntimeModel {
+  schemaVersion: typeof RESOLVED_RUNTIME_MODEL_SCHEMA_VERSION;
   assignment: {
     assignmentId: string;
     hostId: string;
@@ -80,8 +89,8 @@ export interface ResolvedRuntimeModel {
   };
   bindingContract: {
     primaryRuntimeBinding: "HARDESS_RESOLVED_RUNTIME_MODEL";
-    compatibilityBindings: Array<"HARDESS_ROUTE_TABLE" | "HARDESS_PROTOCOL_PACKAGE">;
-    metadataBindings: Array<"HARDESS_ASSIGNMENT_META" | "HARDESS_CONFIG">;
+    compatibilityBindings: CompatibilityBindingName[];
+    metadataBindings: MetadataBindingName[];
   };
   diagnostics: {
     routeCount: number;
@@ -169,6 +178,20 @@ function computeAdvisories(routes: ResolvedRoute[]): ResolvedRuntimeAdvisory[] {
   return advisories;
 }
 
+function resolveCompatibilityBindings(runtimeAdapter: RuntimeAdapter): CompatibilityBindingName[] {
+  const bindings: CompatibilityBindingName[] = [];
+
+  if (runtimeAdapter.compatibilityBindings.routeTable) {
+    bindings.push("HARDESS_ROUTE_TABLE");
+  }
+
+  if (runtimeAdapter.compatibilityBindings.protocolPackage) {
+    bindings.push("HARDESS_PROTOCOL_PACKAGE");
+  }
+
+  return bindings;
+}
+
 function isValidUrlScheme(value: string, schemes: string[]): boolean {
   try {
     const url = new URL(value);
@@ -182,18 +205,71 @@ function validateAssignment(assignment: Assignment): void {
   assertUniqueValues(assignment.httpWorker.routeRefs, "assignment routeRef");
 }
 
+function validateCompatibilityDate(value: string): void {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) {
+    throw new Error(`runtime-adapter compatibilityDate must be YYYY-MM-DD: ${value}`);
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day
+  ) {
+    throw new Error(`runtime-adapter compatibilityDate must be real calendar date: ${value}`);
+  }
+}
+
+function validateListenAddress(value: string): void {
+  let host = "";
+  let portText = "";
+
+  if (value.startsWith("[")) {
+    const match = /^\[([^\]]+)\]:(\d+)$/.exec(value);
+    if (!match) {
+      throw new Error(`runtime-adapter listenAddress must be host:port: ${value}`);
+    }
+    host = match[1];
+    portText = match[2];
+
+    if (isIP(host) !== 6) {
+      throw new Error(`runtime-adapter bracketed host must be valid IPv6: ${value}`);
+    }
+  } else {
+    const separatorIndex = value.lastIndexOf(":");
+    if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
+      throw new Error(`runtime-adapter listenAddress must be host:port: ${value}`);
+    }
+
+    host = value.slice(0, separatorIndex);
+    portText = value.slice(separatorIndex + 1);
+
+    if (host.includes(":")) {
+      throw new Error(`runtime-adapter IPv6 listenAddress must use brackets: ${value}`);
+    }
+
+    const isIpv4 = isIP(host) === 4;
+    const isHostname = /^[A-Za-z0-9.-]+$/.test(host) && !host.startsWith(".") && !host.endsWith(".");
+    if (!isIpv4 && !isHostname) {
+      throw new Error(`runtime-adapter host must be IPv4, hostname, or bracketed IPv6: ${value}`);
+    }
+  }
+
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`runtime-adapter port must be between 1 and 65535: ${value}`);
+  }
+}
+
 function validateRuntimeAdapter(runtimeAdapter: RuntimeAdapter): void {
   assertUniqueValues(runtimeAdapter.compatibilityFlags, "runtime-adapter compatibilityFlag");
-
-  const separatorIndex = runtimeAdapter.listenAddress.lastIndexOf(":");
-  if (separatorIndex <= 0 || separatorIndex === runtimeAdapter.listenAddress.length - 1) {
-    throw new Error(`runtime-adapter listenAddress must be host:port: ${runtimeAdapter.listenAddress}`);
-  }
-
-  const port = Number(runtimeAdapter.listenAddress.slice(separatorIndex + 1));
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`runtime-adapter port must be between 1 and 65535: ${runtimeAdapter.listenAddress}`);
-  }
+  validateCompatibilityDate(runtimeAdapter.compatibilityDate);
+  validateListenAddress(runtimeAdapter.listenAddress);
 }
 
 function validateProtocolAction(action: ProtocolAction): void {
@@ -330,6 +406,7 @@ export function resolveRuntimeModel(
   const websocketRouteCount = routes.filter((route) => route.actionKind === "websocket").length;
   const rootRoute = routes.find((route) => route.pathPrefix === "/") ?? null;
   const advisories = computeAdvisories(routes);
+  const compatibilityBindings = resolveCompatibilityBindings(runtimeAdapter);
   const advisorySeverityCounts = {
     info: advisories.filter((advisory) => advisory.severity === "info").length,
     warning: advisories.filter((advisory) => advisory.severity === "warning").length
@@ -338,6 +415,7 @@ export function resolveRuntimeModel(
     advisorySeverityCounts.warning > 0 ? "warning" : advisorySeverityCounts.info > 0 ? "info" : "none";
 
   return {
+    schemaVersion: RESOLVED_RUNTIME_MODEL_SCHEMA_VERSION,
     assignment: {
       assignmentId: assignment.assignmentId,
       hostId: assignment.hostId,
@@ -368,7 +446,7 @@ export function resolveRuntimeModel(
     },
     bindingContract: {
       primaryRuntimeBinding: "HARDESS_RESOLVED_RUNTIME_MODEL",
-      compatibilityBindings: ["HARDESS_ROUTE_TABLE", "HARDESS_PROTOCOL_PACKAGE"],
+      compatibilityBindings,
       metadataBindings: ["HARDESS_ASSIGNMENT_META", "HARDESS_CONFIG"]
     },
     diagnostics: {
@@ -386,6 +464,7 @@ export function resolveRuntimeModel(
       highestAdvisorySeverity
     },
     summary: {
+      schemaVersion: RESOLVED_RUNTIME_SUMMARY_SCHEMA_VERSION,
       assignmentId: assignment.assignmentId,
       deploymentId: assignment.deploymentId,
       runtime: {
@@ -393,7 +472,7 @@ export function resolveRuntimeModel(
         socketName: runtimeAdapter.socketName
       },
       primaryRuntimeBinding: "HARDESS_RESOLVED_RUNTIME_MODEL",
-      compatibilityBindings: ["HARDESS_ROUTE_TABLE", "HARDESS_PROTOCOL_PACKAGE"],
+      compatibilityBindings,
       metadataBindings: ["HARDESS_ASSIGNMENT_META", "HARDESS_CONFIG"],
       routeCount: routes.length,
       httpRouteCount,

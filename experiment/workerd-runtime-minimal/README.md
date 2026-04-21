@@ -33,6 +33,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - advisories are severity-ranked so callers can distinguish informational signals from warnings
 - runtime dispatch now reads protocol metadata from the resolved model; `HARDESS_ROUTE_TABLE` and `HARDESS_PROTOCOL_PACKAGE` remain only as compatibility bindings
 - the resolved model now carries an explicit binding contract describing the primary runtime binding and retained compatibility/metadata bindings
+- resolved model and summary now carry explicit schema versions, and compatibility bindings can be disabled from the runtime adapter
 
 ## What this does not prove
 
@@ -45,6 +46,9 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 
 - `assignment.json`: Hardess-flavored assignment input
 - `runtime-adapter.json`: workerd-specific runtime adapter input
+- `runtime-adapter-route-table-only.json`: variant adapter that keeps only `HARDESS_ROUTE_TABLE`
+- `runtime-adapter-protocol-package-only.json`: variant adapter that keeps only `HARDESS_PROTOCOL_PACKAGE`
+- `runtime-adapter-no-compatibility-bindings.json`: variant adapter input that disables compatibility bindings
 - `planning-fragment.json`: minimal route planning input
 - `protocol-package.json`: minimal protocol-package input for ingress actions
 - `bad-fixtures/`: intentionally invalid inputs used by generator negative checks
@@ -58,7 +62,12 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `worker.ts`: TypeScript worker entry
 - `ws-smoke.ts`: local WebSocket validation client
 - `run.sh`: starts the local server
+- `verify-lib.sh`: shared helpers for runtime smoke verification
 - `verify.sh`: boots the server, sends requests, and checks responses
+- `verify-binding-matrix.sh`: checks all compatibility-binding combinations at model and config level
+- `verify-binding-runtime-matrix.sh`: boots all compatibility-binding variants and checks runtime behavior
+- `verify-no-compat-runtime.sh`: boots the server with compatibility bindings disabled and proves runtime dispatch still works
+- `verify-all.sh`: runs standard, no-compat, and negative verification as one local matrix
 - `verify-negative.sh`: checks that invalid inputs fail during config generation
 
 ## Run
@@ -91,6 +100,21 @@ bun run ./experiment/workerd-runtime-minimal/generate-config.ts \
   --output ./experiment/workerd-runtime-minimal/.generated.config.capnp
 ```
 
+It also supports overriding `listenAddress` without editing the adapter file:
+
+```bash
+bun run ./experiment/workerd-runtime-minimal/generate-config.ts \
+  --listen-address 127.0.0.1:7299
+```
+
+The runtime adapter may disable legacy compatibility bindings while keeping `HARDESS_RESOLVED_RUNTIME_MODEL` as the primary runtime contract:
+
+```bash
+./experiment/workerd-runtime-minimal/run.sh \
+  --listen-address 127.0.0.1:7299 \
+  --runtime-adapter ./experiment/workerd-runtime-minimal/runtime-adapter-no-compatibility-bindings.json
+```
+
 To inspect the resolved runtime model directly:
 
 ```bash
@@ -110,7 +134,8 @@ bun run ./experiment/workerd-runtime-minimal/print-resolved-model.ts \
   --assignment ./experiment/workerd-runtime-minimal/assignment.json \
   --runtime-adapter ./experiment/workerd-runtime-minimal/runtime-adapter.json \
   --planning-fragment ./experiment/workerd-runtime-minimal/planning-fragment.json \
-  --protocol-package ./experiment/workerd-runtime-minimal/protocol-package.json
+  --protocol-package ./experiment/workerd-runtime-minimal/protocol-package.json \
+  --listen-address 127.0.0.1:7299
 ```
 
 ## Verify
@@ -126,11 +151,54 @@ The script checks:
 - `GET /echo` negative method check
 - `GET /ws` websocket upgrade and echo
 - assignment-plus-adapter-plus-planning-plus-protocol-package to config generation
+- compatibility-binding disablement at config-generation time
+
+To lock in all compatibility-binding combinations:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-binding-matrix.sh
+```
+
+That script currently verifies four adapter variants:
+
+- default: `HARDESS_ROUTE_TABLE` and `HARDESS_PROTOCOL_PACKAGE`
+- route-table-only
+- protocol-package-only
+- no compatibility bindings
+
+To prove those same four variants also work at runtime:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-binding-runtime-matrix.sh
+```
+
+To prove the runtime itself does not require compatibility bindings:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-no-compat-runtime.sh
+```
+
+That script boots `workerd` with `runtime-adapter-no-compatibility-bindings.json` and checks:
+
+- `GET /`
+- `POST /echo`
+- `GET /echo` negative method check
+- `GET /ws` websocket upgrade and echo
+- generated config omits `HARDESS_ROUTE_TABLE` and `HARDESS_PROTOCOL_PACKAGE`
+- runtime responses still dispatch correctly from `HARDESS_RESOLVED_RUNTIME_MODEL`
+
+Both verification scripts now pick an ephemeral local port automatically, so they do not depend on `127.0.0.1:6285` being free.
 
 ## Verify Negative Cases
 
 ```bash
 ./experiment/workerd-runtime-minimal/verify-negative.sh
+```
+
+To run the whole local verification matrix in one command:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-all.sh
 ```
 
 The script currently locks in two core failures:
@@ -147,6 +215,9 @@ It also locks in a few structural validation failures:
 
 - duplicate `routeRef` inside assignment
 - invalid `listenAddress` or duplicate runtime compatibility flags inside runtime adapter
+- malformed `listenAddress`, unbracketed IPv6, or invalid `compatibilityDate` inside runtime adapter
+- invalid CLI `--listen-address` override
+- unknown, duplicate, or positional CLI arguments
 - duplicate `routeId` or duplicate `pathPrefix` inside planning
 - malformed `pathPrefix` such as trailing slash or double slash
 - invalid HTTP method shape or duplicate methods inside the protocol package

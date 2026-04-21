@@ -1,4 +1,5 @@
 import type { Assignment, PlanningFragment, ProtocolPackage, RuntimeAdapter } from "./config-model";
+import { dirname, relative, resolve } from "node:path";
 import { resolveRuntimeModel } from "./resolved-runtime-model";
 
 function renderCapnpString(value: string): string {
@@ -21,7 +22,7 @@ function collectBindings(
 ): Array<[string, unknown]> {
   const deployment = assignment.httpWorker.deployment;
   const resolvedModel = resolveRuntimeModel(assignment, runtimeAdapter, planningFragment, protocolPackage);
-  return [
+  const bindings: Array<[string, unknown]> = [
     ...Object.entries(deployment.bindings),
     ...Object.entries(deployment.secrets),
     [
@@ -36,10 +37,18 @@ function collectBindings(
       }
     ],
     ["HARDESS_CONFIG", deployment.config],
-    ["HARDESS_ROUTE_TABLE", resolvedModel.routes],
     ["HARDESS_RESOLVED_RUNTIME_MODEL", resolvedModel],
-    ["HARDESS_PROTOCOL_PACKAGE", protocolPackage]
   ];
+
+  if (resolvedModel.bindingContract.compatibilityBindings.includes("HARDESS_ROUTE_TABLE")) {
+    bindings.push(["HARDESS_ROUTE_TABLE", resolvedModel.routes]);
+  }
+
+  if (resolvedModel.bindingContract.compatibilityBindings.includes("HARDESS_PROTOCOL_PACKAGE")) {
+    bindings.push(["HARDESS_PROTOCOL_PACKAGE", protocolPackage]);
+  }
+
+  return bindings;
 }
 
 function renderBindings(
@@ -68,8 +77,11 @@ export function renderConfig(
   assignment: Assignment,
   runtimeAdapter: RuntimeAdapter,
   planningFragment: PlanningFragment,
-  protocolPackage: ProtocolPackage
+  protocolPackage: ProtocolPackage,
+  outputPath: string
 ): string {
+  const workerEntryPath = relative(dirname(outputPath), resolve(import.meta.dir, assignment.httpWorker.entry));
+
   return `using Workerd = import "/workerd/workerd.capnp";
 
 # Generated from assignment.json, runtime-adapter.json, planning-fragment.json, and protocol-package.json.
@@ -87,7 +99,7 @@ const config :Workerd.Config = (
 
 const demoWorker :Workerd.Worker = (
   modules = [
-    (name = "worker", esModule = embed ${renderCapnpString(assignment.httpWorker.entry)}),
+    (name = "worker", esModule = embed ${renderCapnpString(workerEntryPath)}),
   ],
 
 ${renderBindings(assignment, runtimeAdapter, planningFragment, protocolPackage)}
