@@ -1,0 +1,30 @@
+{
+  "packageId": "workerd-http-ingress@v1",
+  "protocol": "workerd-http-ingress",
+  "version": "v1",
+  "actions": [
+    {
+      "actionId": "http.info",
+      "kind": "http",
+      "methods": [
+        "GET"
+      ],
+      "websocket": true
+    },
+    {
+      "actionId": "http.echo",
+      "kind": "http",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "actionId": "ws.echo",
+      "kind": "websocket",
+      "methods": [
+        "GET"
+      ],
+      "websocket": true
+    }
+  ]
+}

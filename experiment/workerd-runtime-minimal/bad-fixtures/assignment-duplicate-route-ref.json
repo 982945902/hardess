@@ -1,0 +1,36 @@
+{
+  "assignmentId": "exp-workerd-minimal-http-worker-v2",
+  "hostId": "exp-workerd-host-a",
+  "deploymentId": "demo-workerd-http-worker",
+  "deploymentKind": "http_worker",
+  "declaredVersion": "v1",
+  "artifact": {
+    "manifestId": "manifest_demo-workerd-minimal_v1",
+    "sourceUri": "file://experiment/workerd-runtime-minimal"
+  },
+  "httpWorker": {
+    "name": "minimal-http-worker",
+    "entry": "worker.ts",
+    "routeRefs": [
+      "route.demo.workerd.root",
+      "route.demo.workerd.echo",
+      "route.demo.workerd.echo",
+      "route.demo.workerd.ws"
+    ],
+    "deployment": {
+      "config": {
+        "experiment": "minimal-validation"
+      },
+      "bindings": {
+        "DEMO_SECRET": "hardess-workerd-secret",
+        "RUNTIME_META": {
+          "runtime": "workerd",
+          "experiment": "minimal-validation"
+        }
+      },
+      "secrets": {
+        "DEMO_TOKEN": "hardess-workerd-token"
+      }
+    }
+  }
+}

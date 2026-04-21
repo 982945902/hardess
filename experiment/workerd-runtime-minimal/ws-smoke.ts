@@ -47,6 +47,18 @@ const result = await new Promise<string>((resolve, reject) => {
       return;
     }
 
+    if ((payload as { routeId?: string }).routeId !== "route.demo.workerd.ws") {
+      clearTimeout(timer);
+      reject(new Error(`unexpected websocket routeId: ${(payload as { routeId?: string }).routeId}`));
+      return;
+    }
+
+    if ((payload as { actionId?: string }).actionId !== "ws.echo") {
+      clearTimeout(timer);
+      reject(new Error(`unexpected websocket actionId: ${(payload as { actionId?: string }).actionId}`));
+      return;
+    }
+
     if (payload.echo !== "hardess-workerd-ws") {
       clearTimeout(timer);
       reject(new Error(`unexpected websocket echo payload: ${payload.echo}`));
