@@ -7,6 +7,6 @@
   ],
   "compatibilityBindings": {
     "routeTable": true,
-    "protocolPackage": true
+    "protocolPackage": false
   }
 }

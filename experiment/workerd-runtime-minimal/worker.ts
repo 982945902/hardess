@@ -26,7 +26,7 @@ interface Env {
   HARDESS_CONFIG: {
     experiment: string;
   };
-  HARDESS_ROUTE_TABLE: ResolvedRouteEntry[];
+  HARDESS_ROUTE_TABLE?: ResolvedRouteEntry[];
   HARDESS_RESOLVED_RUNTIME_MODEL: {
     runtime: {
       listenAddress: string;
@@ -67,7 +67,7 @@ interface Env {
     }>;
     routes: ResolvedRouteEntry[];
   };
-  HARDESS_PROTOCOL_PACKAGE: {
+  HARDESS_PROTOCOL_PACKAGE?: {
     packageId: string;
   };
 }

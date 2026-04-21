@@ -1,7 +1,7 @@
 {
   "socketName": "http",
   "listenAddress": "127.0.0.1:6285",
-  "compatibilityDate": "2025-08-01",
+  "compatibilityDate": "2025-02-30",
   "compatibilityFlags": [
     "typescript_strip_types"
   ],
