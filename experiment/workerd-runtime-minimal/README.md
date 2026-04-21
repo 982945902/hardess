@@ -10,6 +10,7 @@ Can we run a minimal `workerd`-based HTTP worker locally, from inside the Hardes
 - a basic text binding
 - a basic JSON binding
 - request body handling
+- a minimal WebSocket upgrade path
 
 This is intentionally not a Hardess runtime integration. It is only a feasibility spike.
 
@@ -20,6 +21,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - capability-style bindings can be injected into the worker
 - a small request/response path works without Bun
 - a Hardess-flavored static manifest can be translated into `workerd` config
+- a minimal WebSocket echo path works through the same local runtime
 
 ## What this does not prove
 
@@ -35,6 +37,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `generate-config.ts`: converts the manifest into a runnable `workerd` config
 - `config.capnp`: hand-written baseline config for comparison
 - `worker.ts`: TypeScript worker entry
+- `ws-smoke.ts`: local WebSocket validation client
 - `run.sh`: starts the local server
 - `verify.sh`: boots the server, sends requests, and checks responses
 
@@ -64,6 +67,7 @@ The script checks:
 
 - `GET /`
 - `POST /echo`
+- `GET /ws` websocket upgrade and echo
 - manifest-to-config generation
 
 ## Graduation bar

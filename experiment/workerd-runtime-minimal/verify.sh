@@ -29,6 +29,7 @@ done
 
 GET_RESPONSE="$(curl -fsS "$BASE_URL/")"
 POST_RESPONSE="$(curl -fsS -X POST "$BASE_URL/echo" --data 'hardess-workerd')"
+WS_RESPONSE="$(cd "$ROOT_DIR" && bun run ./ws-smoke.ts)"
 
 test -f "$GENERATED_CONFIG"
 grep -q 'address = "127.0.0.1:6285"' "$GENERATED_CONFIG"
@@ -37,9 +38,14 @@ echo "$GET_RESPONSE" | grep -q '"runtime": "workerd"'
 echo "$GET_RESPONSE" | grep -q '"secret": "hardess-workerd-secret"'
 echo "$POST_RESPONSE" | grep -q '"echo": "hardess-workerd"'
 echo "$POST_RESPONSE" | grep -q '"length": 15'
+echo "$WS_RESPONSE" | grep -q '"type":"echo"'
+echo "$WS_RESPONSE" | grep -q '"runtime":"workerd"'
+echo "$WS_RESPONSE" | grep -q '"echo":"hardess-workerd-ws"'
 
 printf '%s\n' 'GET / response:'
 printf '%s\n' "$GET_RESPONSE"
 printf '\n%s\n' 'POST /echo response:'
 printf '%s\n' "$POST_RESPONSE"
+printf '\n%s\n' 'GET /ws websocket response:'
+printf '%s\n' "$WS_RESPONSE"
 printf '\n%s\n' 'Verification passed.'

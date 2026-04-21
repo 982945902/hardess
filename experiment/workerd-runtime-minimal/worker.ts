@@ -19,6 +19,51 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "GET" && url.pathname === "/ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return json(
+          {
+            ok: false,
+            error: "upgrade_required",
+            path: url.pathname,
+          },
+          { status: 426 },
+        );
+      }
+
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+
+      server.accept();
+      server.addEventListener("message", (event) => {
+        const text = typeof event.data === "string" ? event.data : String(event.data);
+        server.send(
+          JSON.stringify({
+            ok: true,
+            type: "echo",
+            runtime: env.RUNTIME_META.runtime,
+            echo: text,
+          }),
+        );
+      });
+      server.addEventListener("close", (event) => {
+        server.close(event.code, event.reason);
+      });
+      server.send(
+        JSON.stringify({
+          ok: true,
+          type: "open",
+          runtime: env.RUNTIME_META.runtime,
+        }),
+      );
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+      });
+    }
+
     if (request.method === "GET" && url.pathname === "/") {
       return json({
         ok: true,
