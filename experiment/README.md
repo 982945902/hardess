@@ -12,6 +12,7 @@ Use it for:
 Current experiments:
 
 - [Pingora + Rust + TS runtime / Workers-style host](./pingora-worker-runtime/README.md)
+- [workerd minimal runtime validation](./workerd-runtime-minimal/README.md)
 
 Rules for this directory:
 
