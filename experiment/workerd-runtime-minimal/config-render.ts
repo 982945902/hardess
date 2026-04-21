@@ -1,5 +1,5 @@
 import type { Assignment, PlanningFragment, ProtocolPackage, RuntimeAdapter } from "./config-model";
-import { resolveRoutes } from "./config-validation";
+import { resolveRuntimeModel } from "./resolved-runtime-model";
 
 function renderCapnpString(value: string): string {
   return JSON.stringify(value);
@@ -20,7 +20,7 @@ function collectBindings(
   protocolPackage: ProtocolPackage
 ): Array<[string, unknown]> {
   const deployment = assignment.httpWorker.deployment;
-  const resolvedRoutes = resolveRoutes(assignment, runtimeAdapter, planningFragment, protocolPackage);
+  const resolvedModel = resolveRuntimeModel(assignment, runtimeAdapter, planningFragment, protocolPackage);
   return [
     ...Object.entries(deployment.bindings),
     ...Object.entries(deployment.secrets),
@@ -36,7 +36,8 @@ function collectBindings(
       }
     ],
     ["HARDESS_CONFIG", deployment.config],
-    ["HARDESS_ROUTE_TABLE", resolvedRoutes],
+    ["HARDESS_ROUTE_TABLE", resolvedModel.routes],
+    ["HARDESS_RESOLVED_RUNTIME_MODEL", resolvedModel],
     ["HARDESS_PROTOCOL_PACKAGE", protocolPackage]
   ];
 }

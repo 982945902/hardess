@@ -27,6 +27,12 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - routeRefs can be resolved against a planning fragment and enforced at runtime
 - protocol-package actions can drive worker dispatch and negative method checks
 - a minimal WebSocket echo path works through the same local runtime
+- the runtime can consume a single resolved-model binding in addition to compatibility-oriented bindings
+- the resolved model carries ingress diagnostics that are directly usable for inspection and debugging
+- the resolved model now emits non-blocking advisories for risky but still valid ingress shapes
+- advisories are severity-ranked so callers can distinguish informational signals from warnings
+- runtime dispatch now reads protocol metadata from the resolved model; `HARDESS_ROUTE_TABLE` and `HARDESS_PROTOCOL_PACKAGE` remain only as compatibility bindings
+- the resolved model now carries an explicit binding contract describing the primary runtime binding and retained compatibility/metadata bindings
 
 ## What this does not prove
 
@@ -43,9 +49,11 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `protocol-package.json`: minimal protocol-package input for ingress actions
 - `bad-fixtures/`: intentionally invalid inputs used by generator negative checks
 - `config-model.ts`: typed input schemas plus JSON loading
-- `config-validation.ts`: structural validation and route resolution
+- `resolved-runtime-model.ts`: validation plus resolved runtime model construction
 - `config-render.ts`: renders runnable `workerd` config from validated inputs
 - `generate-config.ts`: thin CLI entry that loads inputs and writes the generated config
+- `print-resolved-model.ts`: prints the resolved runtime model as JSON for inspection
+- `print-runtime-summary.ts`: prints a compact admin/debug summary derived from the resolved runtime model
 - `config.capnp`: hand-written baseline config for comparison
 - `worker.ts`: TypeScript worker entry
 - `ws-smoke.ts`: local WebSocket validation client
@@ -83,6 +91,28 @@ bun run ./experiment/workerd-runtime-minimal/generate-config.ts \
   --output ./experiment/workerd-runtime-minimal/.generated.config.capnp
 ```
 
+To inspect the resolved runtime model directly:
+
+```bash
+bun run ./experiment/workerd-runtime-minimal/print-resolved-model.ts
+```
+
+To inspect a shorter admin/debug summary:
+
+```bash
+bun run ./experiment/workerd-runtime-minimal/print-runtime-summary.ts
+```
+
+The resolved-model printer accepts the same input overrides as the generator:
+
+```bash
+bun run ./experiment/workerd-runtime-minimal/print-resolved-model.ts \
+  --assignment ./experiment/workerd-runtime-minimal/assignment.json \
+  --runtime-adapter ./experiment/workerd-runtime-minimal/runtime-adapter.json \
+  --planning-fragment ./experiment/workerd-runtime-minimal/planning-fragment.json \
+  --protocol-package ./experiment/workerd-runtime-minimal/protocol-package.json
+```
+
 ## Verify
 
 ```bash
@@ -103,10 +133,15 @@ The script checks:
 ./experiment/workerd-runtime-minimal/verify-negative.sh
 ```
 
-The script currently locks in two generator failures:
+The script currently locks in two core failures:
 
 - assignment references a `routeRef` that planning does not contain
 - planning resolves to an `actionId` that the protocol package does not contain
+
+For those shared validation paths, the negative script checks both:
+
+- `generate-config.ts`
+- `print-resolved-model.ts`
 
 It also locks in a few structural validation failures:
 
