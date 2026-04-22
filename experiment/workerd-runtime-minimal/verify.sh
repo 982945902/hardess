@@ -4,10 +4,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SCRIPT="$ROOT_DIR/run.sh"
+cd "$ROOT_DIR"
 source "$ROOT_DIR/verify-lib.sh"
 LOG_FILE="$(mktemp -t workerd-minimal-log.XXXXXX)"
 GENERATED_CONFIG="$ROOT_DIR/.generated.config.capnp"
 GENERATED_CONFIG_NO_COMPAT="$(mktemp -t workerd-minimal-no-compat.XXXXXX)"
+RUNTIME_INVALID_METHOD_BODY="$(mktemp -t workerd-runtime-invalid-method.XXXXXX)"
+RUNTIME_NOT_FOUND_BODY="$(mktemp -t workerd-runtime-not-found.XXXXXX)"
 
 PORT="${PORT:-$(pick_port)}"
 LISTEN_ADDRESS="127.0.0.1:${PORT}"
@@ -21,6 +24,8 @@ cleanup() {
   cleanup_server "${SERVER_PID:-}"
   rm -f "$LOG_FILE"
   rm -f "$GENERATED_CONFIG_NO_COMPAT"
+  rm -f "$RUNTIME_INVALID_METHOD_BODY"
+  rm -f "$RUNTIME_NOT_FOUND_BODY"
 }
 trap cleanup EXIT
 
@@ -33,6 +38,13 @@ GET_RESPONSE="$(curl -fsS "$BASE_URL/")"
 POST_RESPONSE="$(curl -fsS -X POST "$BASE_URL/echo" --data 'hardess-workerd')"
 INVALID_METHOD_RESPONSE="$(curl -sS -X GET "$BASE_URL/echo")"
 WS_RESPONSE="$(cd "$ROOT_DIR" && rtk bun run ./ws-smoke.ts --url "$WS_URL")"
+RUNTIME_RESPONSE="$(curl -fsS "$BASE_URL/_hardess/runtime")"
+RUNTIME_STATS_RESPONSE="$(curl -fsS "$BASE_URL/_hardess/runtime/stats")"
+RUNTIME_ROUTES_RESPONSE="$(curl -fsS "$BASE_URL/_hardess/runtime/routes")"
+RUNTIME_INVALID_METHOD_STATUS="$(curl -sS -o "$RUNTIME_INVALID_METHOD_BODY" -w '%{http_code}' -X POST "$BASE_URL/_hardess/runtime")"
+RUNTIME_INVALID_METHOD_RESPONSE="$(cat "$RUNTIME_INVALID_METHOD_BODY")"
+RUNTIME_NOT_FOUND_STATUS="$(curl -sS -o "$RUNTIME_NOT_FOUND_BODY" -w '%{http_code}' "$BASE_URL/_hardess/runtime/unknown")"
+RUNTIME_NOT_FOUND_RESPONSE="$(cat "$RUNTIME_NOT_FOUND_BODY")"
 
 (
   cd "$ROOT_DIR"
@@ -54,6 +66,13 @@ grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$GENERATED_CONFIG"
 grep -q 'route.demo.workerd.ws' "$GENERATED_CONFIG"
 grep -q 'HARDESS_PROTOCOL_PACKAGE' "$GENERATED_CONFIG"
 grep -q 'workerd-http-ingress@v1' "$GENERATED_CONFIG"
+grep -q 'name = "worker.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-runtime.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-admin.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-admin-contract.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-actions.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-response.ts"' "$GENERATED_CONFIG"
+grep -q 'name = "worker-types.ts"' "$GENERATED_CONFIG"
 grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$GENERATED_CONFIG_NO_COMPAT"
 if grep -q 'HARDESS_ROUTE_TABLE' "$GENERATED_CONFIG_NO_COMPAT"; then
   echo 'unexpected HARDESS_ROUTE_TABLE in no-compat generated config' >&2
@@ -63,91 +82,164 @@ if grep -q 'HARDESS_PROTOCOL_PACKAGE' "$GENERATED_CONFIG_NO_COMPAT"; then
   echo 'unexpected HARDESS_PROTOCOL_PACKAGE in no-compat generated config' >&2
   exit 1
 fi
-echo "$RESOLVED_MODEL" | grep -q '"schemaVersion": "hardess.workerd.resolved-runtime-model.v1"'
-echo "$RESOLVED_MODEL" | grep -q "\"listenAddress\": \"$LISTEN_ADDRESS\""
-echo "$RESOLVED_MODEL" | grep -q '"actionCount": 3'
-echo "$RESOLVED_MODEL" | grep -q '"actionIds": \['
-echo "$RESOLVED_MODEL" | grep -q '"http.info"'
-echo "$RESOLVED_MODEL" | grep -q '"primaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
-echo "$RESOLVED_MODEL" | grep -q '"compatibilityBindings": \['
-echo "$RESOLVED_MODEL" | grep -q '"metadataBindings": \['
-echo "$RESOLVED_MODEL_NO_COMPAT" | grep -q '"compatibilityBindings": \[\]'
-echo "$RUNTIME_SUMMARY" | grep -q '"schemaVersion": "hardess.workerd.runtime-summary.v1"'
-echo "$RUNTIME_SUMMARY" | grep -q '"primaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
-echo "$RUNTIME_SUMMARY" | grep -q '"routeCount": 3'
-echo "$RUNTIME_SUMMARY" | grep -q '"highestAdvisorySeverity": "warning"'
-echo "$RUNTIME_SUMMARY" | grep -q '"routeId": "route.demo.workerd.ws"'
-echo "$RUNTIME_SUMMARY" | grep -q '"code": "non_tls_websocket_upstream"'
-echo "$RESOLVED_MODEL" | grep -q '"routeCount": 3'
-echo "$RESOLVED_MODEL" | grep -q '"httpRouteCount": 2'
-echo "$RESOLVED_MODEL" | grep -q '"websocketRouteCount": 1'
-echo "$RESOLVED_MODEL" | grep -q '"rootRouteId": "route.demo.workerd.root"'
-echo "$RESOLVED_MODEL" | grep -q '"bindingNames": \['
-echo "$RESOLVED_MODEL" | grep -q '"DEMO_SECRET"'
-echo "$RESOLVED_MODEL" | grep -q '"advisoryCount": 4'
-echo "$RESOLVED_MODEL" | grep -q '"info": 1'
-echo "$RESOLVED_MODEL" | grep -q '"warning": 3'
-echo "$RESOLVED_MODEL" | grep -q '"highestAdvisorySeverity": "warning"'
-echo "$RESOLVED_MODEL" | grep -q '"severity": "info"'
-echo "$RESOLVED_MODEL" | grep -q '"severity": "warning"'
-echo "$RESOLVED_MODEL" | grep -q '"code": "root_catch_all_route"'
-echo "$RESOLVED_MODEL" | grep -q '"code": "non_tls_http_upstream"'
-echo "$RESOLVED_MODEL" | grep -q '"code": "non_tls_websocket_upstream"'
-echo "$RESOLVED_MODEL" | grep -q '"routeId": "route.demo.workerd.echo"'
-echo "$RESOLVED_MODEL" | grep -q '"upstreamBaseUrl": "ws://workerd.local/ws"'
-echo "$RESOLVED_MODEL" | grep -q '"secrets": \['
-echo "$RESOLVED_MODEL" | grep -q '"DEMO_TOKEN"'
-echo "$GET_RESPONSE" | grep -q '"runtime": "workerd"'
-echo "$GET_RESPONSE" | grep -q '"secret": "hardess-workerd-secret"'
-echo "$GET_RESPONSE" | grep -q '"tokenPresent": true'
-echo "$GET_RESPONSE" | grep -q '"assignmentId": "exp-workerd-minimal-http-worker-v2"'
-echo "$GET_RESPONSE" | grep -q '"deploymentId": "demo-workerd-http-worker"'
-echo "$GET_RESPONSE" | grep -q '"routeId": "route.demo.workerd.root"'
-echo "$GET_RESPONSE" | grep -q '"actionId": "http.info"'
-echo "$GET_RESPONSE" | grep -q '"protocolPackageId": "workerd-http-ingress@v1"'
-echo "$GET_RESPONSE" | grep -q '"dispatchSource": "resolved_runtime_model"'
-echo "$GET_RESPONSE" | grep -q '"resolvedRouteCount": 3'
-echo "$GET_RESPONSE" | grep -q "\"resolvedListenAddress\": \"$LISTEN_ADDRESS\""
-echo "$GET_RESPONSE" | grep -q '"resolvedProtocolActionCount": 3'
-echo "$GET_RESPONSE" | grep -q '"resolvedProtocolActionIds": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedPrimaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"'
-echo "$GET_RESPONSE" | grep -q '"resolvedCompatibilityBindings": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedMetadataBindings": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedHttpRouteCount": 2'
-echo "$GET_RESPONSE" | grep -q '"resolvedWebsocketRouteCount": 1'
-echo "$GET_RESPONSE" | grep -q '"resolvedRootRouteId": "route.demo.workerd.root"'
-echo "$GET_RESPONSE" | grep -q '"resolvedBindingNames": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedSecretNames": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedAdvisoryCount": 4'
-echo "$GET_RESPONSE" | grep -q '"resolvedAdvisorySeverityCounts": {'
-echo "$GET_RESPONSE" | grep -q '"resolvedHighestAdvisorySeverity": "warning"'
-echo "$GET_RESPONSE" | grep -q '"resolvedAdvisoryCodes": \['
-echo "$GET_RESPONSE" | grep -q '"resolvedAdvisorySeverities": \['
-echo "$GET_RESPONSE" | grep -q '"HARDESS_ROUTE_TABLE"'
-echo "$GET_RESPONSE" | grep -q '"HARDESS_PROTOCOL_PACKAGE"'
-echo "$GET_RESPONSE" | grep -q '"HARDESS_ASSIGNMENT_META"'
-echo "$GET_RESPONSE" | grep -q '"HARDESS_CONFIG"'
-echo "$GET_RESPONSE" | grep -q '"root_catch_all_route"'
-echo "$GET_RESPONSE" | grep -q '"warning"'
-echo "$GET_RESPONSE" | grep -q '"allowedMethods": \['
-echo "$GET_RESPONSE" | grep -q '"GET"'
-echo "$POST_RESPONSE" | grep -q '"echo": "hardess-workerd"'
-echo "$POST_RESPONSE" | grep -q '"length": 15'
-echo "$POST_RESPONSE" | grep -q '"assignmentId": "exp-workerd-minimal-http-worker-v2"'
-echo "$POST_RESPONSE" | grep -q '"routeId": "route.demo.workerd.echo"'
-echo "$POST_RESPONSE" | grep -q '"actionId": "http.echo"'
-echo "$POST_RESPONSE" | grep -q '"dispatchSource": "resolved_runtime_model"'
-echo "$INVALID_METHOD_RESPONSE" | grep -q '"error": "method_not_allowed"'
-echo "$INVALID_METHOD_RESPONSE" | grep -q '"routeId": "route.demo.workerd.echo"'
-echo "$INVALID_METHOD_RESPONSE" | grep -q '"actionId": "http.echo"'
-echo "$INVALID_METHOD_RESPONSE" | grep -q '"allowedMethods": \['
-echo "$INVALID_METHOD_RESPONSE" | grep -q '"POST"'
-echo "$WS_RESPONSE" | grep -q '"type":"echo"'
-echo "$WS_RESPONSE" | grep -q '"runtime":"workerd"'
-echo "$WS_RESPONSE" | grep -q '"assignmentId":"exp-workerd-minimal-http-worker-v2"'
-echo "$WS_RESPONSE" | grep -q '"routeId":"route.demo.workerd.ws"'
-echo "$WS_RESPONSE" | grep -q '"actionId":"ws.echo"'
-echo "$WS_RESPONSE" | grep -q '"echo":"hardess-workerd-ws"'
+assert_json_field "$RESOLVED_MODEL" --path schemaVersion --equals "hardess.workerd.resolved-runtime-model.v1"
+assert_json_field "$RESOLVED_MODEL" --path runtime.listenAddress --equals "$LISTEN_ADDRESS"
+assert_json_field "$RESOLVED_MODEL" --path protocolPackage.actionCount --equals-json "3"
+assert_json_field "$RESOLVED_MODEL" --path protocolPackage.actionIds --includes "http.info"
+assert_json_field "$RESOLVED_MODEL" --path bindingContract.primaryRuntimeBinding --equals "HARDESS_RESOLVED_RUNTIME_MODEL"
+assert_json_field "$RESOLVED_MODEL" --path bindingContract.compatibilityBindings --includes "HARDESS_ROUTE_TABLE"
+assert_json_field "$RESOLVED_MODEL" --path bindingContract.compatibilityBindings --includes "HARDESS_PROTOCOL_PACKAGE"
+assert_json_field "$RESOLVED_MODEL" --path bindingContract.metadataBindings --includes "HARDESS_ASSIGNMENT_META"
+assert_json_field "$RESOLVED_MODEL" --path bindingContract.metadataBindings --includes "HARDESS_CONFIG"
+assert_json_field "$RESOLVED_MODEL_NO_COMPAT" --path bindingContract.compatibilityBindings --equals-json "[]"
+assert_json_field "$RUNTIME_SUMMARY" --path schemaVersion --equals "hardess.workerd.runtime-summary.v1"
+assert_json_field "$RUNTIME_SUMMARY" --path primaryRuntimeBinding --equals "HARDESS_RESOLVED_RUNTIME_MODEL"
+assert_json_field "$RUNTIME_SUMMARY" --path routeCount --equals-json "3"
+assert_json_field "$RUNTIME_SUMMARY" --path highestAdvisorySeverity --equals "warning"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.2.routeId --equals "route.demo.workerd.ws"
+assert_json_field "$RUNTIME_SUMMARY" --path advisories.3.code --equals "non_tls_websocket_upstream"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.routeCount --equals-json "3"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.httpRouteCount --equals-json "2"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.websocketRouteCount --equals-json "1"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.rootRouteId --equals "route.demo.workerd.root"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.bindingNames --includes "DEMO_SECRET"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.secretNames --includes "DEMO_TOKEN"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.advisoryCount --equals-json "4"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.advisorySeverityCounts.info --equals-json "1"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.advisorySeverityCounts.warning --equals-json "3"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.highestAdvisorySeverity --equals "warning"
+assert_json_field "$RESOLVED_MODEL" --path advisories.0.severity --equals "info"
+assert_json_field "$RESOLVED_MODEL" --path advisories.1.severity --equals "warning"
+assert_json_field "$RESOLVED_MODEL" --path advisories.0.code --equals "root_catch_all_route"
+assert_json_field "$RESOLVED_MODEL" --path advisories.1.code --equals "non_tls_http_upstream"
+assert_json_field "$RESOLVED_MODEL" --path advisories.3.code --equals "non_tls_websocket_upstream"
+assert_json_field "$RESOLVED_MODEL" --path routes.1.routeId --equals "route.demo.workerd.echo"
+assert_json_field "$RESOLVED_MODEL" --path routes.2.upstreamBaseUrl --equals "ws://workerd.local/ws"
+assert_json_field "$GET_RESPONSE" --path runtime --equals "workerd"
+assert_json_field "$GET_RESPONSE" --path secret --equals "hardess-workerd-secret"
+assert_json_field "$GET_RESPONSE" --path tokenPresent --equals-json "true"
+assert_json_field "$GET_RESPONSE" --path assignmentId --equals "exp-workerd-minimal-http-worker-v2"
+assert_json_field "$GET_RESPONSE" --path deploymentId --equals "demo-workerd-http-worker"
+assert_json_field "$GET_RESPONSE" --path routeId --equals "route.demo.workerd.root"
+assert_json_field "$GET_RESPONSE" --path actionId --equals "http.info"
+assert_json_field "$GET_RESPONSE" --path protocolPackageId --equals "workerd-http-ingress@v1"
+assert_json_field "$GET_RESPONSE" --path dispatchSource --equals "resolved_runtime_model"
+assert_json_field "$GET_RESPONSE" --path resolvedRouteCount --equals-json "3"
+assert_json_field "$GET_RESPONSE" --path resolvedListenAddress --equals "$LISTEN_ADDRESS"
+assert_json_field "$GET_RESPONSE" --path resolvedProtocolActionCount --equals-json "3"
+assert_json_field "$GET_RESPONSE" --path resolvedProtocolActionIds --includes "http.info"
+assert_json_field "$GET_RESPONSE" --path resolvedPrimaryRuntimeBinding --equals "HARDESS_RESOLVED_RUNTIME_MODEL"
+assert_json_field "$GET_RESPONSE" --path resolvedCompatibilityBindings --includes "HARDESS_ROUTE_TABLE"
+assert_json_field "$GET_RESPONSE" --path resolvedCompatibilityBindings --includes "HARDESS_PROTOCOL_PACKAGE"
+assert_json_field "$GET_RESPONSE" --path resolvedMetadataBindings --includes "HARDESS_ASSIGNMENT_META"
+assert_json_field "$GET_RESPONSE" --path resolvedMetadataBindings --includes "HARDESS_CONFIG"
+assert_json_field "$GET_RESPONSE" --path resolvedHttpRouteCount --equals-json "2"
+assert_json_field "$GET_RESPONSE" --path resolvedWebsocketRouteCount --equals-json "1"
+assert_json_field "$GET_RESPONSE" --path resolvedRootRouteId --equals "route.demo.workerd.root"
+assert_json_field "$GET_RESPONSE" --path resolvedBindingNames --includes "DEMO_SECRET"
+assert_json_field "$GET_RESPONSE" --path resolvedSecretNames --includes "DEMO_TOKEN"
+assert_json_field "$GET_RESPONSE" --path resolvedAdvisoryCount --equals-json "4"
+assert_json_field "$GET_RESPONSE" --path resolvedAdvisorySeverityCounts.info --equals-json "1"
+assert_json_field "$GET_RESPONSE" --path resolvedAdvisorySeverityCounts.warning --equals-json "3"
+assert_json_field "$GET_RESPONSE" --path resolvedHighestAdvisorySeverity --equals "warning"
+assert_json_field "$GET_RESPONSE" --path resolvedAdvisoryCodes --includes "root_catch_all_route"
+assert_json_field "$GET_RESPONSE" --path resolvedAdvisorySeverities --includes "warning"
+assert_json_field "$GET_RESPONSE" --path allowedMethods --includes "GET"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.requestSequence --equals-json "2"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.totalRequests --equals-json "2"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.routeHitCount --equals-json "2"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.routeHits.0.routeId --equals "route.demo.workerd.root"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.routeHits.0.count --equals-json "2"
+assert_json_field "$GET_RESPONSE" --path workerRuntime.websocketSessionCount --equals-json "0"
+assert_json_field "$POST_RESPONSE" --path echo --equals "hardess-workerd"
+assert_json_field "$POST_RESPONSE" --path length --equals-json "15"
+assert_json_field "$POST_RESPONSE" --path assignmentId --equals "exp-workerd-minimal-http-worker-v2"
+assert_json_field "$POST_RESPONSE" --path routeId --equals "route.demo.workerd.echo"
+assert_json_field "$POST_RESPONSE" --path actionId --equals "http.echo"
+assert_json_field "$POST_RESPONSE" --path dispatchSource --equals "resolved_runtime_model"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.requestSequence --equals-json "3"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.totalRequests --equals-json "3"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.routeHitCount --equals-json "1"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.routeHits.0.routeId --equals "route.demo.workerd.root"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.routeHits.0.count --equals-json "2"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.routeHits.1.routeId --equals "route.demo.workerd.echo"
+assert_json_field "$POST_RESPONSE" --path workerRuntime.routeHits.1.count --equals-json "1"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path error --equals "method_not_allowed"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path routeId --equals "route.demo.workerd.echo"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path actionId --equals "http.echo"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path allowedMethods --includes "POST"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.requestSequence --equals-json "4"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.totalRequests --equals-json "4"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.routeHitCount --equals-json "2"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.routeHits.1.routeId --equals "route.demo.workerd.echo"
+assert_json_field "$INVALID_METHOD_RESPONSE" --path workerRuntime.routeHits.1.count --equals-json "2"
+assert_json_field "$WS_RESPONSE" --path type --equals "echo"
+assert_json_field "$WS_RESPONSE" --path runtime --equals "workerd"
+assert_json_field "$WS_RESPONSE" --path assignmentId --equals "exp-workerd-minimal-http-worker-v2"
+assert_json_field "$WS_RESPONSE" --path routeId --equals "route.demo.workerd.ws"
+assert_json_field "$WS_RESPONSE" --path actionId --equals "ws.echo"
+assert_json_field "$WS_RESPONSE" --path echo --equals "hardess-workerd-ws"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.requestSequence --equals-json "5"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.totalRequests --equals-json "5"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.routeHitCount --equals-json "1"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.routeHits.2.routeId --equals "route.demo.workerd.ws"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.routeHits.2.count --equals-json "1"
+assert_json_field "$WS_RESPONSE" --path workerRuntime.websocketSessionCount --equals-json "1"
+assert_json_field "$RUNTIME_RESPONSE" --path ok --equals-json "true"
+assert_json_field "$RUNTIME_RESPONSE" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
+assert_json_field "$RUNTIME_RESPONSE" --path endpoint --equals "/_hardess/runtime"
+assert_json_field "$RUNTIME_RESPONSE" --path dispatchSource --equals "worker_runtime_admin"
+assert_json_field "$RUNTIME_RESPONSE" --path assignmentId --equals "exp-workerd-minimal-http-worker-v2"
+assert_json_field "$RUNTIME_RESPONSE" --path deploymentId --equals "demo-workerd-http-worker"
+assert_json_field "$RUNTIME_RESPONSE" --path protocolPackageId --equals "workerd-http-ingress@v1"
+assert_json_field "$RUNTIME_RESPONSE" --path resolvedListenAddress --equals "$LISTEN_ADDRESS"
+assert_json_field "$RUNTIME_RESPONSE" --path registeredActionIds --includes "http.info"
+assert_json_field "$RUNTIME_RESPONSE" --path registeredActionIds --includes "http.echo"
+assert_json_field "$RUNTIME_RESPONSE" --path routes.2.routeId --equals "route.demo.workerd.ws"
+assert_json_field "$RUNTIME_RESPONSE" --path routes.2.websocketEnabled --equals-json "true"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.requestSequence --equals-json "6"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.totalRequests --equals-json "6"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHitCount --equals-json "0"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.websocketSessionCount --equals-json "1"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.0.routeId --equals "route.demo.workerd.root"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.0.count --equals-json "2"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.1.routeId --equals "route.demo.workerd.echo"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.1.count --equals-json "2"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.2.routeId --equals "route.demo.workerd.ws"
+assert_json_field "$RUNTIME_RESPONSE" --path workerRuntime.routeHits.2.count --equals-json "1"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path view --equals "stats"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path endpoint --equals "/_hardess/runtime/stats"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path workerRuntime.requestSequence --equals-json "7"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path workerRuntime.totalRequests --equals-json "7"
+assert_json_field "$RUNTIME_STATS_RESPONSE" --path workerRuntime.websocketSessionCount --equals-json "1"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path view --equals "routes"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path endpoint --equals "/_hardess/runtime/routes"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path routeCount --equals-json "3"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path registeredActionIds --includes "http.info"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path routes.2.routeId --equals "route.demo.workerd.ws"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path workerRuntime.requestSequence --equals-json "8"
+assert_json_field "$RUNTIME_ROUTES_RESPONSE" --path workerRuntime.totalRequests --equals-json "8"
+test "$RUNTIME_INVALID_METHOD_STATUS" = "405"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path error --equals "method_not_allowed"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path endpoint --equals "/_hardess/runtime"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path allowedMethods --includes "GET"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path workerRuntime.requestSequence --equals-json "9"
+assert_json_field "$RUNTIME_INVALID_METHOD_RESPONSE" --path workerRuntime.totalRequests --equals-json "9"
+test "$RUNTIME_NOT_FOUND_STATUS" = "404"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path error --equals "runtime_admin_endpoint_not_found"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path endpoint --equals "/_hardess/runtime/unknown"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path allowedEndpoints --includes "/_hardess/runtime/routes"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path workerRuntime.requestSequence --equals-json "10"
+assert_json_field "$RUNTIME_NOT_FOUND_RESPONSE" --path workerRuntime.totalRequests --equals-json "10"
 
 printf '%s\n' 'GET / response:'
 printf '%s\n' "$GET_RESPONSE"
@@ -163,4 +255,14 @@ printf '\n%s\n' 'GET /echo invalid method response:'
 printf '%s\n' "$INVALID_METHOD_RESPONSE"
 printf '\n%s\n' 'GET /ws websocket response:'
 printf '%s\n' "$WS_RESPONSE"
+printf '\n%s\n' 'GET /_hardess/runtime response:'
+printf '%s\n' "$RUNTIME_RESPONSE"
+printf '\n%s\n' 'GET /_hardess/runtime/stats response:'
+printf '%s\n' "$RUNTIME_STATS_RESPONSE"
+printf '\n%s\n' 'GET /_hardess/runtime/routes response:'
+printf '%s\n' "$RUNTIME_ROUTES_RESPONSE"
+printf '\n%s\n' 'POST /_hardess/runtime response:'
+printf '%s\n' "$RUNTIME_INVALID_METHOD_RESPONSE"
+printf '\n%s\n' 'GET /_hardess/runtime/unknown response:'
+printf '%s\n' "$RUNTIME_NOT_FOUND_RESPONSE"
 printf '\n%s\n' 'Verification passed.'

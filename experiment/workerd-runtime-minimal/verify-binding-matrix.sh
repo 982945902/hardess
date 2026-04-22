@@ -3,13 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
 source "$ROOT_DIR/verify-lib.sh"
-
-assert_json_field() {
-  local payload="$1"
-  shift
-  printf '%s\n' "$payload" | rtk bun run "$ROOT_DIR/assert-json-field.ts" "$@"
-}
 
 run_case() {
   local label="$1"
@@ -69,6 +64,13 @@ run_case() {
 
   grep -q "address = \"$listen_address\"" "$generated_config"
   grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$generated_config"
+  grep -q 'name = "worker.ts"' "$generated_config"
+  grep -q 'name = "worker-runtime.ts"' "$generated_config"
+  grep -q 'name = "worker-admin.ts"' "$generated_config"
+  grep -q 'name = "worker-admin-contract.ts"' "$generated_config"
+  grep -q 'name = "worker-actions.ts"' "$generated_config"
+  grep -q 'name = "worker-response.ts"' "$generated_config"
+  grep -q 'name = "worker-types.ts"' "$generated_config"
 
   if [[ "$expect_route_table" == "true" ]]; then
     grep -q 'HARDESS_ROUTE_TABLE' "$generated_config"

@@ -34,13 +34,16 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - runtime dispatch now reads protocol metadata from the resolved model; `HARDESS_ROUTE_TABLE` and `HARDESS_PROTOCOL_PACKAGE` remain only as compatibility bindings
 - the resolved model now carries an explicit binding contract describing the primary runtime binding and retained compatibility/metadata bindings
 - resolved model and summary now carry explicit schema versions, and compatibility bindings can be disabled from the runtime adapter
+- the worker side now has an explicit singleton runtime layer with instance state, request sequencing, route-hit tracking, and websocket session tracking
+- the worker runtime exposes local inspection endpoints under `/_hardess/runtime` for overview, stats, and resolved route views
+- the runtime admin surface now carries an explicit schema version so overview/stats/routes and admin error responses can evolve as a versioned contract
 
 ## What this does not prove
 
 - no Hardess control-plane integration
 - no dynamic artifact loading
 - no multi-service planning or placement
-- no singleton serve semantics
+- no multi-instance serve semantics
 
 ## Files
 
@@ -60,7 +63,13 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `print-resolved-model.ts`: prints the resolved runtime model as JSON for inspection
 - `print-runtime-summary.ts`: prints a compact admin/debug summary derived from the resolved runtime model
 - `config.capnp`: hand-written baseline config for comparison
-- `worker.ts`: TypeScript worker entry
+- `worker.ts`: small TypeScript worker entry that owns the singleton runtime instance
+- `worker-runtime.ts`: runtime core for route matching, request sequencing, dispatch, and WebSocket handling
+- `worker-admin.ts`: local runtime inspection handlers under `/_hardess/runtime`
+- `worker-admin-contract.ts`: shared admin contract constants such as schema version and stable endpoint names
+- `worker-actions.ts`: protocol action handlers for the demo HTTP actions
+- `worker-response.ts`: shared JSON response helper
+- `worker-types.ts`: worker-side runtime and environment types
 - `ws-smoke.ts`: local WebSocket validation client
 - `run.sh`: starts the local server
 - `verify-lib.sh`: shared helpers for runtime smoke verification
@@ -128,6 +137,18 @@ To inspect a shorter admin/debug summary:
 bun run ./experiment/workerd-runtime-minimal/print-runtime-summary.ts
 ```
 
+Once the worker is running, inspect the in-process worker runtime directly:
+
+```bash
+curl http://127.0.0.1:6285/_hardess/runtime
+curl http://127.0.0.1:6285/_hardess/runtime/stats
+curl http://127.0.0.1:6285/_hardess/runtime/routes
+```
+
+Those endpoints are intentionally local to this experiment. They do not expose secrets; they report singleton runtime identity, request counters, registered action IDs, and the resolved route shape currently held by the worker.
+Non-`GET` requests return `405`, and unknown `/_hardess/runtime/*` paths return `404`, so the admin surface does not fall through into the normal business route table.
+Admin responses currently use schema version `hardess.workerd.worker-runtime-admin.v1`.
+
 The resolved-model printer accepts the same input overrides as the generator:
 
 ```bash
@@ -151,6 +172,11 @@ The script checks:
 - `POST /echo`
 - `GET /echo` negative method check
 - `GET /ws` websocket upgrade and echo
+- `GET /_hardess/runtime` worker runtime overview
+- `GET /_hardess/runtime/stats` worker runtime counters
+- `GET /_hardess/runtime/routes` worker runtime route view
+- non-`GET` admin requests fail with `405`
+- unknown `/_hardess/runtime/*` paths fail with `404`
 - assignment-plus-adapter-plus-planning-plus-protocol-package to config generation
 - compatibility-binding disablement at config-generation time
 
@@ -203,6 +229,17 @@ To run the whole local verification matrix in one command:
 ```
 
 `verify-all.sh` prints per-suite durations and reports the failed suite name before exiting non-zero.
+
+The runtime responses now also expose a small `workerRuntime` snapshot so the singleton worker instance can be observed directly during verification.
+
+## Verification Matrix
+
+- `verify.sh`: default adapter end-to-end HTTP, WebSocket, admin overview/stats/routes, admin 405/404 guards, generated config content, resolved-model inspection, and admin response schema version
+- `verify-binding-matrix.sh`: all four compatibility-binding adapter variants at model/config level, including explicit checks that all split worker modules are embedded into generated `workerd` config
+- `verify-binding-runtime-matrix.sh`: the same four compatibility-binding variants at live runtime level, including admin surface and admin negative paths
+- `verify-no-compat-runtime.sh`: no-compat runtime boot path proving dispatch still works from `HARDESS_RESOLVED_RUNTIME_MODEL` alone
+- `verify-negative.sh`: invalid input and CLI failure paths across config generation, resolved model printing, and runtime summary printing
+- `verify-all.sh`: full local matrix runner with per-suite timing and failed-suite labeling
 
 The script currently locks in two core failures:
 
