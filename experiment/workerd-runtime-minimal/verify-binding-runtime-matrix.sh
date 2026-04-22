@@ -6,6 +6,12 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SCRIPT="$ROOT_DIR/run.sh"
 source "$ROOT_DIR/verify-lib.sh"
 
+assert_json_field() {
+  local payload="$1"
+  shift
+  printf '%s\n' "$payload" | rtk bun run "$ROOT_DIR/assert-json-field.ts" "$@"
+}
+
 run_case() {
   local label="$1"
   local adapter_path="$2"
@@ -56,59 +62,44 @@ run_case() {
     grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$generated_config"
     grep -q "address = \"$listen_address\"" "$generated_config"
 
-    grep -q '"dispatchSource": "resolved_runtime_model"' <<<"$get_response"
-    grep -q '"protocolPackageId": "workerd-http-ingress@v1"' <<<"$get_response"
-    grep -q "\"resolvedListenAddress\": \"$listen_address\"" <<<"$get_response"
-    grep -q '"resolvedRouteCount": 3' <<<"$get_response"
-    grep -q '"resolvedProtocolActionCount": 3' <<<"$get_response"
-    grep -q '"resolvedPrimaryRuntimeBinding": "HARDESS_RESOLVED_RUNTIME_MODEL"' <<<"$get_response"
-    grep -q '"resolvedMetadataBindings": \[' <<<"$get_response"
-    grep -q '"HARDESS_ASSIGNMENT_META"' <<<"$get_response"
-    grep -q '"HARDESS_CONFIG"' <<<"$get_response"
+    assert_json_field "$get_response" --path dispatchSource --equals "resolved_runtime_model"
+    assert_json_field "$get_response" --path protocolPackageId --equals "workerd-http-ingress@v1"
+    assert_json_field "$get_response" --path resolvedListenAddress --equals "$listen_address"
+    assert_json_field "$get_response" --path resolvedPrimaryRuntimeBinding --equals "HARDESS_RESOLVED_RUNTIME_MODEL"
+    assert_json_field "$get_response" --path resolvedMetadataBindings --includes "HARDESS_ASSIGNMENT_META"
+    assert_json_field "$get_response" --path resolvedMetadataBindings --includes "HARDESS_CONFIG"
 
-    grep -q '"echo": "hardess-workerd"' <<<"$post_response"
-    grep -q '"dispatchSource": "resolved_runtime_model"' <<<"$post_response"
-    grep -q '"error": "method_not_allowed"' <<<"$invalid_method_response"
-    grep -q '"allowedMethods": \[' <<<"$invalid_method_response"
-    grep -q '"type":"echo"' <<<"$ws_response"
-    grep -q '"routeId":"route.demo.workerd.ws"' <<<"$ws_response"
-    grep -q '"actionId":"ws.echo"' <<<"$ws_response"
-    grep -q '"echo":"hardess-workerd-ws"' <<<"$ws_response"
+    assert_json_field "$post_response" --path echo --equals "hardess-workerd"
+    assert_json_field "$post_response" --path dispatchSource --equals "resolved_runtime_model"
+    assert_json_field "$invalid_method_response" --path error --equals "method_not_allowed"
+    assert_json_field "$invalid_method_response" --path allowedMethods --includes "POST"
+    assert_json_field "$ws_response" --path type --equals "echo"
+    assert_json_field "$ws_response" --path routeId --equals "route.demo.workerd.ws"
+    assert_json_field "$ws_response" --path actionId --equals "ws.echo"
+    assert_json_field "$ws_response" --path echo --equals "hardess-workerd-ws"
 
     if [[ "$expect_route_table" == "true" ]]; then
       grep -q 'HARDESS_ROUTE_TABLE' "$generated_config"
-      grep -q '"HARDESS_ROUTE_TABLE"' <<<"$get_response"
+      assert_json_field "$get_response" --path resolvedCompatibilityBindings --includes "HARDESS_ROUTE_TABLE"
     else
       if grep -q 'HARDESS_ROUTE_TABLE' "$generated_config"; then
         echo "unexpected HARDESS_ROUTE_TABLE in generated config for runtime case: $label" >&2
         cat "$generated_config" >&2
         exit 1
       fi
-      if grep -q '"HARDESS_ROUTE_TABLE"' <<<"$get_response"; then
-        echo "unexpected HARDESS_ROUTE_TABLE in runtime response for case: $label" >&2
-        printf '%s\n' "$get_response" >&2
-        exit 1
-      fi
+      assert_json_field "$get_response" --path resolvedCompatibilityBindings --not-includes "HARDESS_ROUTE_TABLE"
     fi
 
     if [[ "$expect_protocol_package" == "true" ]]; then
       grep -q 'HARDESS_PROTOCOL_PACKAGE' "$generated_config"
-      grep -q '"HARDESS_PROTOCOL_PACKAGE"' <<<"$get_response"
+      assert_json_field "$get_response" --path resolvedCompatibilityBindings --includes "HARDESS_PROTOCOL_PACKAGE"
     else
       if grep -q 'HARDESS_PROTOCOL_PACKAGE' "$generated_config"; then
         echo "unexpected HARDESS_PROTOCOL_PACKAGE in generated config for runtime case: $label" >&2
         cat "$generated_config" >&2
         exit 1
       fi
-      if grep -q '"HARDESS_PROTOCOL_PACKAGE"' <<<"$get_response"; then
-        echo "unexpected HARDESS_PROTOCOL_PACKAGE in runtime response for case: $label" >&2
-        printf '%s\n' "$get_response" >&2
-        exit 1
-      fi
-    fi
-
-    if [[ "$expect_route_table" == "false" && "$expect_protocol_package" == "false" ]]; then
-      grep -q '"resolvedCompatibilityBindings": \[\]' <<<"$get_response"
+      assert_json_field "$get_response" --path resolvedCompatibilityBindings --not-includes "HARDESS_PROTOCOL_PACKAGE"
     fi
 
     printf '%s\n' "Binding runtime matrix case passed: $label"

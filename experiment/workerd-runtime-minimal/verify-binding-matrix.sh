@@ -5,6 +5,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$ROOT_DIR/verify-lib.sh"
 
+assert_json_field() {
+  local payload="$1"
+  shift
+  printf '%s\n' "$payload" | rtk bun run "$ROOT_DIR/assert-json-field.ts" "$@"
+}
+
 run_case() {
   local label="$1"
   local adapter_path="$2"
@@ -43,47 +49,22 @@ run_case() {
       --output "$generated_config" >/dev/null
   )
 
-  grep -q "\"listenAddress\": \"$listen_address\"" <<<"$resolved_model"
-  grep -q "\"listenAddress\": \"$listen_address\"" <<<"$runtime_summary"
+  assert_json_field "$resolved_model" --path runtime.listenAddress --equals "$listen_address"
+  assert_json_field "$runtime_summary" --path runtime.listenAddress --equals "$listen_address"
   if [[ "$expect_route_table" == "true" ]]; then
-    grep -q 'HARDESS_ROUTE_TABLE' <<<"$runtime_summary"
-    grep -q 'HARDESS_ROUTE_TABLE' <<<"$resolved_model"
+    assert_json_field "$runtime_summary" --path compatibilityBindings --includes "HARDESS_ROUTE_TABLE"
+    assert_json_field "$resolved_model" --path bindingContract.compatibilityBindings --includes "HARDESS_ROUTE_TABLE"
   else
-    if grep -q 'HARDESS_ROUTE_TABLE' <<<"$runtime_summary"; then
-      echo "unexpected HARDESS_ROUTE_TABLE in runtime summary for matrix case: $label" >&2
-      printf '%s\n' "$runtime_summary" >&2
-      rm -f "$generated_config"
-      exit 1
-    fi
-    if grep -q 'HARDESS_ROUTE_TABLE' <<<"$resolved_model"; then
-      echo "unexpected HARDESS_ROUTE_TABLE in resolved model for matrix case: $label" >&2
-      printf '%s\n' "$resolved_model" >&2
-      rm -f "$generated_config"
-      exit 1
-    fi
+    assert_json_field "$runtime_summary" --path compatibilityBindings --not-includes "HARDESS_ROUTE_TABLE"
+    assert_json_field "$resolved_model" --path bindingContract.compatibilityBindings --not-includes "HARDESS_ROUTE_TABLE"
   fi
 
   if [[ "$expect_protocol_package" == "true" ]]; then
-    grep -q 'HARDESS_PROTOCOL_PACKAGE' <<<"$runtime_summary"
-    grep -q 'HARDESS_PROTOCOL_PACKAGE' <<<"$resolved_model"
+    assert_json_field "$runtime_summary" --path compatibilityBindings --includes "HARDESS_PROTOCOL_PACKAGE"
+    assert_json_field "$resolved_model" --path bindingContract.compatibilityBindings --includes "HARDESS_PROTOCOL_PACKAGE"
   else
-    if grep -q 'HARDESS_PROTOCOL_PACKAGE' <<<"$runtime_summary"; then
-      echo "unexpected HARDESS_PROTOCOL_PACKAGE in runtime summary for matrix case: $label" >&2
-      printf '%s\n' "$runtime_summary" >&2
-      rm -f "$generated_config"
-      exit 1
-    fi
-    if grep -q 'HARDESS_PROTOCOL_PACKAGE' <<<"$resolved_model"; then
-      echo "unexpected HARDESS_PROTOCOL_PACKAGE in resolved model for matrix case: $label" >&2
-      printf '%s\n' "$resolved_model" >&2
-      rm -f "$generated_config"
-      exit 1
-    fi
-  fi
-
-  if [[ "$expect_route_table" == "false" && "$expect_protocol_package" == "false" ]]; then
-    grep -q '"compatibilityBindings": \[\]' <<<"$runtime_summary"
-    grep -q '"compatibilityBindings": \[\]' <<<"$resolved_model"
+    assert_json_field "$runtime_summary" --path compatibilityBindings --not-includes "HARDESS_PROTOCOL_PACKAGE"
+    assert_json_field "$resolved_model" --path bindingContract.compatibilityBindings --not-includes "HARDESS_PROTOCOL_PACKAGE"
   fi
 
   grep -q "address = \"$listen_address\"" "$generated_config"

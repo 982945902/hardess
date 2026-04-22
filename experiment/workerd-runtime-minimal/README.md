@@ -56,6 +56,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `resolved-runtime-model.ts`: validation plus resolved runtime model construction
 - `config-render.ts`: renders runnable `workerd` config from validated inputs
 - `generate-config.ts`: thin CLI entry that loads inputs and writes the generated config
+- `assert-json-field.ts`: small JSON assertion helper used by verification scripts
 - `print-resolved-model.ts`: prints the resolved runtime model as JSON for inspection
 - `print-runtime-summary.ts`: prints a compact admin/debug summary derived from the resolved runtime model
 - `config.capnp`: hand-written baseline config for comparison
@@ -201,15 +202,18 @@ To run the whole local verification matrix in one command:
 ./experiment/workerd-runtime-minimal/verify-all.sh
 ```
 
+`verify-all.sh` prints per-suite durations and reports the failed suite name before exiting non-zero.
+
 The script currently locks in two core failures:
 
 - assignment references a `routeRef` that planning does not contain
 - planning resolves to an `actionId` that the protocol package does not contain
 
-For those shared validation paths, the negative script checks both:
+For those shared validation paths, the negative script checks all three entry points:
 
 - `generate-config.ts`
 - `print-resolved-model.ts`
+- `print-runtime-summary.ts`
 
 It also locks in a few structural validation failures:
 
