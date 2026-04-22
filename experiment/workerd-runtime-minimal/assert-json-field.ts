@@ -1,6 +1,7 @@
 interface CliArgs {
   path: string;
   equals?: string;
+  equalsJson?: string;
   includes?: string;
   notIncludes?: string;
 }
@@ -8,6 +9,7 @@ interface CliArgs {
 function readArgs(argv: string[]): CliArgs {
   let path: string | undefined;
   let equals: string | undefined;
+  let equalsJson: string | undefined;
   let includes: string | undefined;
   let notIncludes: string | undefined;
 
@@ -26,6 +28,8 @@ function readArgs(argv: string[]): CliArgs {
       path = value;
     } else if (arg === "--equals") {
       equals = value;
+    } else if (arg === "--equals-json") {
+      equalsJson = value;
     } else if (arg === "--includes") {
       includes = value;
     } else if (arg === "--not-includes") {
@@ -41,12 +45,12 @@ function readArgs(argv: string[]): CliArgs {
     throw new Error("missing required --path");
   }
 
-  const operationCount = [equals, includes, notIncludes].filter((value) => value !== undefined).length;
+  const operationCount = [equals, equalsJson, includes, notIncludes].filter((value) => value !== undefined).length;
   if (operationCount !== 1) {
-    throw new Error("exactly one of --equals, --includes, or --not-includes is required");
+    throw new Error("exactly one of --equals, --equals-json, --includes, or --not-includes is required");
   }
 
-  return { path, equals, includes, notIncludes };
+  return { path, equals, equalsJson, includes, notIncludes };
 }
 
 function getPathSegments(path: string): string[] {
@@ -82,6 +86,13 @@ function assertEquals(actual: unknown, expected: string, path: string): void {
   }
 }
 
+function assertEqualsJson(actual: unknown, expectedJson: string, path: string): void {
+  const expected = JSON.parse(expectedJson) as unknown;
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`expected ${path} to equal ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
 function assertIncludes(actual: unknown, expected: string, path: string): void {
   if (!Array.isArray(actual)) {
     throw new Error(`expected ${path} to be an array, got ${JSON.stringify(actual)}`);
@@ -107,6 +118,8 @@ const value = readPath(data, args.path);
 
 if (args.equals !== undefined) {
   assertEquals(value, args.equals, args.path);
+} else if (args.equalsJson !== undefined) {
+  assertEqualsJson(value, args.equalsJson, args.path);
 } else if (args.includes !== undefined) {
   assertIncludes(value, args.includes, args.path);
 } else if (args.notIncludes !== undefined) {

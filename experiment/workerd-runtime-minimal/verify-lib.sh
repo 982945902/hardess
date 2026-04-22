@@ -49,3 +49,9 @@ wait_for_http_ready() {
   cat "$log_file" >&2
   return 1
 }
+
+assert_json_field() {
+  local payload="$1"
+  shift
+  printf '%s\n' "$payload" | rtk bun run "$PWD/assert-json-field.ts" "$@"
+}

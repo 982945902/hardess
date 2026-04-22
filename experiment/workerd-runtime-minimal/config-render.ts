@@ -14,6 +14,27 @@ function renderBinding(name: string, value: unknown): string {
   return `    (name = ${renderCapnpString(name)}, json = ${renderCapnpString(JSON.stringify(value))}),`;
 }
 
+function renderModule(name: string, path: string): string {
+  return `    (name = ${renderCapnpString(name)}, esModule = embed ${renderCapnpString(path)}),`;
+}
+
+function collectWorkerModules(outputPath: string, entryPath: string): Array<{ name: string; path: string }> {
+  const workerModules = [
+    entryPath,
+    "worker-runtime.ts",
+    "worker-admin.ts",
+    "worker-admin-contract.ts",
+    "worker-actions.ts",
+    "worker-response.ts",
+    "worker-types.ts",
+  ];
+
+  return workerModules.map((modulePath) => ({
+    name: modulePath,
+    path: relative(dirname(outputPath), resolve(import.meta.dir, modulePath)),
+  }));
+}
+
 function collectBindings(
   assignment: Assignment,
   runtimeAdapter: RuntimeAdapter,
@@ -80,7 +101,8 @@ export function renderConfig(
   protocolPackage: ProtocolPackage,
   outputPath: string
 ): string {
-  const workerEntryPath = relative(dirname(outputPath), resolve(import.meta.dir, assignment.httpWorker.entry));
+  const workerModules = collectWorkerModules(outputPath, assignment.httpWorker.entry);
+  const renderedModules = workerModules.map((module) => renderModule(module.name, module.path)).join("\n");
 
   return `using Workerd = import "/workerd/workerd.capnp";
 
@@ -99,7 +121,7 @@ const config :Workerd.Config = (
 
 const demoWorker :Workerd.Worker = (
   modules = [
-    (name = "worker", esModule = embed ${renderCapnpString(workerEntryPath)}),
+${renderedModules}
   ],
 
 ${renderBindings(assignment, runtimeAdapter, planningFragment, protocolPackage)}
