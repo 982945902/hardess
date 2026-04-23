@@ -1,14 +1,13 @@
 import type { RuntimeStateSnapshot } from "./worker-types.ts";
+import type { WorkerRuntimeRouteExplain } from "./worker-route-contract.ts";
 
 export const WORKER_RUNTIME_ACTION_SCHEMA_VERSION = "hardess.workerd.worker-action.v1";
 
-export interface WorkerRuntimeActionBaseResponse {
+export interface WorkerRuntimeActionBaseResponse extends WorkerRuntimeRouteExplain {
   ok: true;
   schemaVersion: typeof WORKER_RUNTIME_ACTION_SCHEMA_VERSION;
   runtime: string;
   assignmentId: string;
-  routeId: string;
-  actionId: string;
   workerRuntime: RuntimeStateSnapshot;
 }
 
@@ -27,6 +26,8 @@ export interface WorkerRuntimeInfoResponse extends WorkerRuntimeActionBaseRespon
   resolvedListenAddress: string;
   resolvedProtocolActionCount: number;
   resolvedProtocolActionIds: string[];
+  resolvedBoundActionIds: string[];
+  resolvedUnboundProtocolActionIds: string[];
   resolvedPrimaryRuntimeBinding: string;
   resolvedCompatibilityBindings: string[];
   resolvedMetadataBindings: string[];

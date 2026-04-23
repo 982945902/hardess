@@ -1,0 +1,97 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUN_SCRIPT="$ROOT_DIR/run.sh"
+cd "$ROOT_DIR"
+source "$ROOT_DIR/verify-lib.sh"
+
+LOG_FILE="$(mktemp -t workerd-protocol-action-coverage-log.XXXXXX)"
+GENERATED_CONFIG="$(mktemp -t workerd-protocol-action-coverage-config.XXXXXX)"
+PROTOCOL_PACKAGE="./protocol-action-fixtures/protocol-package-unused-action.json"
+
+LISTEN_ADDRESS=""
+BASE_URL=""
+RESOLVED_MODEL=""
+RUNTIME_SUMMARY=""
+
+cleanup() {
+  cleanup_server "${SERVER_PID:-}"
+  rm -f "$LOG_FILE" "$GENERATED_CONFIG"
+}
+trap cleanup EXIT
+
+start_server_with_retry "protocol action coverage" "$LOG_FILE" env GENERATED_CONFIG="$GENERATED_CONFIG" "$RUN_SCRIPT" --protocol-package "$PROTOCOL_PACKAGE"
+SERVER_PID="$START_SERVER_PID"
+LISTEN_ADDRESS="$START_SERVER_LISTEN_ADDRESS"
+BASE_URL="$START_SERVER_BASE_URL"
+RESOLVED_MODEL="$(cd "$ROOT_DIR" && rtk bun run ./print-resolved-model.ts --protocol-package "$PROTOCOL_PACKAGE" --listen-address "$LISTEN_ADDRESS")"
+RUNTIME_SUMMARY="$(cd "$ROOT_DIR" && rtk bun run ./print-runtime-summary.ts --protocol-package "$PROTOCOL_PACKAGE" --listen-address "$LISTEN_ADDRESS")"
+GET_RESPONSE="$(curl -fsS "$BASE_URL/")"
+RUNTIME_RESPONSE="$(curl -fsS "$BASE_URL/_hardess/runtime")"
+
+test -f "$GENERATED_CONFIG"
+grep -q 'workerd-http-ingress-unused-action@v1' "$GENERATED_CONFIG"
+grep -q 'name = "runtime-dispatch-model.ts"' "$GENERATED_CONFIG"
+
+assert_json_field "$RESOLVED_MODEL" --path protocolPackage.actionCount --equals-json "4"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.boundActionIds --includes "http.info"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.boundActionIds --includes "http.echo"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.boundActionIds --includes "ws.echo"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.unboundProtocolActionIds --includes "http.idle"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.advisoryCount --equals-json "5"
+assert_json_field "$RESOLVED_MODEL" --path diagnostics.advisorySeverityCounts.info --equals-json "2"
+assert_json_field "$RESOLVED_MODEL" --path advisories.4.code --equals "unbound_protocol_action"
+assert_json_field "$RESOLVED_MODEL" --path advisories.4.actionId --equals "http.idle"
+assert_json_field "$RESOLVED_MODEL" --path routes.0.dispatchMode --equals "http_handler"
+assert_json_field "$RESOLVED_MODEL" --path routes.2.dispatchMode --equals "websocket_builtin"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.0.routeDispatchMode --equals "http_handler"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.2.routeDispatchMode --equals "websocket_builtin"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.2.websocketEnabled --equals-json "true"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.0.pathPrefix --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.0.actionKind --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path routeViews.0.dispatchMode --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.0.dispatchMode --equals "http_handler"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.2.dispatchMode --equals "websocket_builtin"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.2.websocketEnabled --equals-json "true"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.0.routePathPrefix --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.0.routeActionKind --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityRouteTable.0.routeDispatchMode --missing "true"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityProtocolPackage.packageId --equals "workerd-http-ingress-unused-action@v1"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityProtocolPackage.actions.3.actionId --equals "http.idle"
+assert_json_field "$RESOLVED_MODEL" --path compatibilityProtocolPackage.actions.2.kind --equals "websocket"
+
+assert_json_field "$RUNTIME_SUMMARY" --path boundActionIds --includes "ws.echo"
+assert_json_field "$RUNTIME_SUMMARY" --path unboundProtocolActionIds --includes "http.idle"
+assert_json_field "$RUNTIME_SUMMARY" --path advisoryCount --equals-json "5"
+assert_json_field "$RUNTIME_SUMMARY" --path advisories.4.code --equals "unbound_protocol_action"
+assert_json_field "$RUNTIME_SUMMARY" --path advisories.4.actionId --equals "http.idle"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.0.routeDispatchMode --equals "http_handler"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.2.routeDispatchMode --equals "websocket_builtin"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.0.pathPrefix --missing "true"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.0.actionKind --missing "true"
+assert_json_field "$RUNTIME_SUMMARY" --path routes.0.dispatchMode --missing "true"
+
+assert_json_field "$GET_RESPONSE" --path protocolPackageId --equals "workerd-http-ingress-unused-action@v1"
+assert_json_field "$GET_RESPONSE" --path routePathPrefix --equals "/"
+assert_json_field "$GET_RESPONSE" --path routeActionKind --equals "http"
+assert_json_field "$GET_RESPONSE" --path resolvedProtocolActionCount --equals-json "4"
+assert_json_field "$GET_RESPONSE" --path resolvedProtocolActionIds --includes "http.idle"
+assert_json_field "$GET_RESPONSE" --path resolvedBoundActionIds --includes "ws.echo"
+assert_json_field "$GET_RESPONSE" --path resolvedUnboundProtocolActionIds --includes "http.idle"
+assert_json_field "$GET_RESPONSE" --path runtimeDispatchableActionIds --includes "ws.echo"
+assert_json_field "$GET_RESPONSE" --path runtimeUnhandledActionIds --equals-json "[]"
+assert_json_field "$GET_RESPONSE" --path runtimeUnhandledRouteIds --equals-json "[]"
+
+assert_json_field "$RUNTIME_RESPONSE" --path protocolPackageId --equals "workerd-http-ingress-unused-action@v1"
+assert_json_field "$RUNTIME_RESPONSE" --path resolvedBoundActionIds --includes "ws.echo"
+assert_json_field "$RUNTIME_RESPONSE" --path resolvedUnboundProtocolActionIds --includes "http.idle"
+assert_json_field "$RUNTIME_RESPONSE" --path dispatchableActionIds --includes "ws.echo"
+assert_json_field "$RUNTIME_RESPONSE" --path unhandledActionIds --equals-json "[]"
+assert_json_field "$RUNTIME_RESPONSE" --path unhandledRouteIds --equals-json "[]"
+assert_json_field "$RUNTIME_RESPONSE" --path routes.0.pathPrefix --missing "true"
+assert_json_field "$RUNTIME_RESPONSE" --path routes.0.actionKind --missing "true"
+assert_json_field "$RUNTIME_RESPONSE" --path routes.0.dispatchMode --missing "true"
+
+printf '%s\n' 'Protocol action coverage verification passed.'
