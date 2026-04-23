@@ -29,6 +29,7 @@ run_suite() {
 }
 
 run_suite "standard runtime verification" "$ROOT_DIR/verify.sh"
+run_suite "protocol action coverage verification" "$ROOT_DIR/verify-protocol-action-coverage.sh"
 run_suite "runtime error contract verification" "$ROOT_DIR/verify-runtime-error-contracts.sh"
 run_suite "binding matrix verification" "$ROOT_DIR/verify-binding-matrix.sh"
 run_suite "binding runtime matrix verification" "$ROOT_DIR/verify-binding-runtime-matrix.sh"

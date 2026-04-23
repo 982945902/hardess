@@ -5,6 +5,7 @@ import {
   WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
   WORKER_RUNTIME_ADMIN_STATS_ENDPOINT,
 } from "./worker-admin-contract.ts";
+import { toWorkerRuntimeRouteExplain } from "./worker-route-contract.ts";
 import { json } from "./worker-response.ts";
 import type { Env, ResolvedRouteEntry, RuntimeDispatchDiagnostics, RuntimeStateSnapshot } from "./worker-types.ts";
 import type {
@@ -27,12 +28,15 @@ export interface RuntimeAdminContext {
   snapshot: (requestSequence: number) => RuntimeStateSnapshot;
 }
 
-function runtimeRoutes(routes: ResolvedRouteEntry[]): WorkerRuntimeAdminRoute[] {
+function runtimeRoutes(
+  routes: ResolvedRouteEntry[],
+  dispatchDiagnostics: RuntimeDispatchDiagnostics,
+): WorkerRuntimeAdminRoute[] {
   return routes.map((route) => ({
-    routeId: route.routeId,
-    pathPrefix: route.pathPrefix,
-    actionId: route.actionId,
-    actionKind: route.actionKind,
+    ...toWorkerRuntimeRouteExplain({
+      ...route,
+      dispatchMode: dispatchDiagnostics.routeDispatchModes[route.routeId],
+    }),
     methods: route.methods,
     websocketEnabled: route.websocketEnabled,
   }));
@@ -54,6 +58,8 @@ function runtimeAdminBase(
     manifestId: env.HARDESS_ASSIGNMENT_META.manifestId,
     protocolPackageId: env.HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage.packageId,
     resolvedListenAddress: env.HARDESS_RESOLVED_RUNTIME_MODEL.runtime.listenAddress,
+    resolvedBoundActionIds: env.HARDESS_RESOLVED_RUNTIME_MODEL.diagnostics.boundActionIds,
+    resolvedUnboundProtocolActionIds: env.HARDESS_RESOLVED_RUNTIME_MODEL.diagnostics.unboundProtocolActionIds,
     registeredActionIds: dispatchDiagnostics.registeredActionIds,
     dispatchableActionIds: dispatchDiagnostics.dispatchableActionIds,
     unhandledActionIds: dispatchDiagnostics.unhandledActionIds,
@@ -99,7 +105,7 @@ export function handleRuntimeAdmin({
       endpoint: WORKER_RUNTIME_ADMIN_ROUTES_ENDPOINT,
       view: "routes",
       routeCount: routes.length,
-      routes: runtimeRoutes(routes),
+      routes: runtimeRoutes(routes, dispatchDiagnostics),
       workerRuntime: snapshot(requestSequence),
     };
     return json(payload);
@@ -123,7 +129,7 @@ export function handleRuntimeAdmin({
     view: "overview",
     availableEndpoints: WORKER_RUNTIME_ADMIN_ENDPOINTS,
     routeCount: routes.length,
-    routes: runtimeRoutes(routes),
+    routes: runtimeRoutes(routes, dispatchDiagnostics),
     workerRuntime: snapshot(requestSequence),
   };
   return json(payload satisfies WorkerRuntimeAdminResponse);

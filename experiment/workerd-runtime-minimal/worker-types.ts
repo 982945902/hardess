@@ -1,3 +1,5 @@
+import type { RuntimeDispatchDiagnostics, RuntimeRouteDispatchMode } from "./runtime-dispatch-model.ts";
+
 export interface ResolvedRouteEntry {
   routeId: string;
   pathPrefix: string;
@@ -6,6 +8,7 @@ export interface ResolvedRouteEntry {
   websocketEnabled: boolean;
   actionKind: "http" | "websocket";
   upstreamBaseUrl: string;
+  dispatchMode: RuntimeRouteDispatchMode;
 }
 
 export interface Env {
@@ -26,6 +29,8 @@ export interface Env {
   HARDESS_CONFIG: {
     experiment: string;
   };
+  // Legacy compatibility binding. Runtime code should prefer
+  // `HARDESS_RESOLVED_RUNTIME_MODEL.routes`.
   HARDESS_ROUTE_TABLE?: ResolvedRouteEntry[];
   HARDESS_RESOLVED_RUNTIME_MODEL: {
     runtime: {
@@ -49,6 +54,8 @@ export interface Env {
       httpRouteCount: number;
       websocketRouteCount: number;
       rootRouteId: string | null;
+      boundActionIds: string[];
+      unboundProtocolActionIds: string[];
       methods: string[];
       bindingNames: string[];
       secretNames: string[];
@@ -65,10 +72,21 @@ export interface Env {
       message: string;
       routeId?: string;
     }>;
+    // Primary internal route model for the runtime singleton.
     routes: ResolvedRouteEntry[];
   };
+  // Legacy compatibility binding. Runtime code should prefer
+  // `HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage`.
   HARDESS_PROTOCOL_PACKAGE?: {
     packageId: string;
+    protocol: string;
+    version: string;
+    actions: Array<{
+      actionId: string;
+      kind: "http" | "websocket";
+      methods: string[];
+      websocket?: boolean;
+    }>;
   };
 }
 
@@ -88,12 +106,7 @@ export interface RuntimeStateSnapshot {
   websocketSessionCount: number;
 }
 
-export interface RuntimeDispatchDiagnostics {
-  registeredActionIds: string[];
-  dispatchableActionIds: string[];
-  unhandledActionIds: string[];
-  unhandledRouteIds: string[];
-}
+export type { RuntimeDispatchDiagnostics, RuntimeRouteDispatchMode } from "./runtime-dispatch-model.ts";
 
 export interface RuntimeRequestContext {
   request: Request;

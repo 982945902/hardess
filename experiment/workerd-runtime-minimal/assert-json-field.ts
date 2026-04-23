@@ -4,6 +4,7 @@ interface CliArgs {
   equalsJson?: string;
   includes?: string;
   notIncludes?: string;
+  missing?: string;
 }
 
 function readArgs(argv: string[]): CliArgs {
@@ -12,6 +13,7 @@ function readArgs(argv: string[]): CliArgs {
   let equalsJson: string | undefined;
   let includes: string | undefined;
   let notIncludes: string | undefined;
+  let missing: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -34,6 +36,8 @@ function readArgs(argv: string[]): CliArgs {
       includes = value;
     } else if (arg === "--not-includes") {
       notIncludes = value;
+    } else if (arg === "--missing") {
+      missing = value;
     } else {
       throw new Error(`unknown option: ${arg}`);
     }
@@ -45,12 +49,16 @@ function readArgs(argv: string[]): CliArgs {
     throw new Error("missing required --path");
   }
 
-  const operationCount = [equals, equalsJson, includes, notIncludes].filter((value) => value !== undefined).length;
+  const operationCount = [equals, equalsJson, includes, notIncludes, missing]
+    .filter((value) => value !== undefined)
+    .length;
   if (operationCount !== 1) {
-    throw new Error("exactly one of --equals, --equals-json, --includes, or --not-includes is required");
+    throw new Error(
+      "exactly one of --equals, --equals-json, --includes, --not-includes, or --missing is required",
+    );
   }
 
-  return { path, equals, equalsJson, includes, notIncludes };
+  return { path, equals, equalsJson, includes, notIncludes, missing };
 }
 
 function getPathSegments(path: string): string[] {
@@ -111,17 +119,34 @@ function assertNotIncludes(actual: unknown, expected: string, path: string): voi
   }
 }
 
+function assertMissing(root: unknown, path: string): void {
+  try {
+    readPath(root, path);
+  } catch (error) {
+    if (error instanceof Error && error.message === `path not found: ${path}`) {
+      return;
+    }
+    throw error;
+  }
+
+  throw new Error(`expected ${path} to be missing`);
+}
+
 const args = readArgs(process.argv.slice(2));
 const input = await new Response(Bun.stdin.stream()).text();
 const data = JSON.parse(input) as unknown;
-const value = readPath(data, args.path);
+if (args.missing !== undefined) {
+  assertMissing(data, args.path);
+} else {
+  const value = readPath(data, args.path);
 
-if (args.equals !== undefined) {
-  assertEquals(value, args.equals, args.path);
-} else if (args.equalsJson !== undefined) {
-  assertEqualsJson(value, args.equalsJson, args.path);
-} else if (args.includes !== undefined) {
-  assertIncludes(value, args.includes, args.path);
-} else if (args.notIncludes !== undefined) {
-  assertNotIncludes(value, args.notIncludes, args.path);
+  if (args.equals !== undefined) {
+    assertEquals(value, args.equals, args.path);
+  } else if (args.equalsJson !== undefined) {
+    assertEqualsJson(value, args.equalsJson, args.path);
+  } else if (args.includes !== undefined) {
+    assertIncludes(value, args.includes, args.path);
+  } else if (args.notIncludes !== undefined) {
+    assertNotIncludes(value, args.notIncludes, args.path);
+  }
 }

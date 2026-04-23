@@ -1,5 +1,11 @@
 import type { Assignment, PlanningFragment, ProtocolAction, ProtocolPackage, Route, RuntimeAdapter } from "./config-model";
 import { isIP } from "node:net";
+import {
+  buildRuntimeDispatchDiagnostics,
+  EXPERIMENT_HTTP_HANDLER_ACTION_IDS,
+  type RuntimeRouteDispatchMode,
+} from "./runtime-dispatch-model.ts";
+import type { WorkerRuntimeRouteWithMethods, WorkerRuntimeRouteWithPolicy } from "./worker-route-contract.ts";
 
 export const RESOLVED_RUNTIME_MODEL_SCHEMA_VERSION = "hardess.workerd.resolved-runtime-model.v1";
 export const RESOLVED_RUNTIME_SUMMARY_SCHEMA_VERSION = "hardess.workerd.runtime-summary.v1";
@@ -8,6 +14,8 @@ export type CompatibilityBindingName = "HARDESS_ROUTE_TABLE" | "HARDESS_PROTOCOL
 export type MetadataBindingName = "HARDESS_ASSIGNMENT_META" | "HARDESS_CONFIG";
 
 export interface ResolvedRoute {
+  // Internal resolved route model used by the primary runtime binding.
+  // This is intentionally richer than the stable runtime-facing route views.
   routeId: string;
   pathPrefix: string;
   actionId: string;
@@ -15,6 +23,23 @@ export interface ResolvedRoute {
   websocketEnabled: boolean;
   actionKind: "http" | "websocket";
   upstreamBaseUrl: string;
+  dispatchMode: RuntimeRouteDispatchMode;
+}
+
+export interface CompatibilityRouteTableEntry extends ResolvedRoute {}
+
+export interface CompatibilityProtocolActionEntry {
+  actionId: string;
+  kind: "http" | "websocket";
+  methods: string[];
+  websocket?: boolean;
+}
+
+export interface CompatibilityProtocolPackage {
+  packageId: string;
+  protocol: string;
+  version: string;
+  actions: CompatibilityProtocolActionEntry[];
 }
 
 export interface ResolvedRuntimeAdvisory {
@@ -22,12 +47,17 @@ export interface ResolvedRuntimeAdvisory {
   code:
     | "root_catch_all_route"
     | "non_tls_http_upstream"
-    | "non_tls_websocket_upstream";
+    | "non_tls_websocket_upstream"
+    | "unbound_protocol_action";
   message: string;
   routeId?: string;
+  actionId?: string;
 }
 
 export interface ResolvedRuntimeSummary {
+  // Compact runtime-facing summary intended for inspection, assertions, and
+  // stable human-readable/debug tooling. Prefer this over `routes` when callers
+  // only need runtime semantics rather than internal resolved-model detail.
   schemaVersion: typeof RESOLVED_RUNTIME_SUMMARY_SCHEMA_VERSION;
   assignmentId: string;
   deploymentId: string;
@@ -41,19 +71,16 @@ export interface ResolvedRuntimeSummary {
   routeCount: number;
   httpRouteCount: number;
   websocketRouteCount: number;
+  boundActionIds: string[];
+  unboundProtocolActionIds: string[];
   highestAdvisorySeverity: "none" | "info" | "warning";
   advisoryCount: number;
-  routes: Array<{
-    routeId: string;
-    pathPrefix: string;
-    actionId: string;
-    actionKind: "http" | "websocket";
-    methods: string[];
-  }>;
+  routes: WorkerRuntimeRouteWithMethods[];
   advisories: Array<{
     severity: "info" | "warning";
     code: ResolvedRuntimeAdvisory["code"];
     routeId?: string;
+    actionId?: string;
   }>;
 }
 
@@ -81,6 +108,9 @@ export interface ResolvedRuntimeModel {
     config: Record<string, unknown>;
   };
   protocolPackage: {
+    // Primary runtime-facing protocol package summary. This is intentionally
+    // reduced to the fields the runtime currently needs for diagnostics and
+    // success payloads, not a clone of the compatibility package projection.
     packageId: string;
     protocol: string;
     version: string;
@@ -98,7 +128,8 @@ export interface ResolvedRuntimeModel {
     websocketRouteCount: number;
     rootRouteId: string | null;
     routeIds: string[];
-    actionIds: string[];
+    boundActionIds: string[];
+    unboundProtocolActionIds: string[];
     methods: string[];
     bindingNames: string[];
     secretNames: string[];
@@ -109,8 +140,71 @@ export interface ResolvedRuntimeModel {
     };
     highestAdvisorySeverity: "none" | "info" | "warning";
   };
+  // Stable compact inspection view. Prefer this for summary/debug consumers.
+  summary: ResolvedRuntimeSummary;
+  // Stable runtime-facing per-route view with the unified route explain naming.
+  // Prefer this over `routes` for new external consumers.
+  routeViews: WorkerRuntimeRouteWithPolicy[];
+  // Legacy compatibility payload for `HARDESS_ROUTE_TABLE`.
+  // Keep this decoupled from `routes` so internal route-model evolution does not
+  // implicitly change compatibility consumers.
+  compatibilityRouteTable: CompatibilityRouteTableEntry[];
+  // Legacy compatibility payload for `HARDESS_PROTOCOL_PACKAGE`.
+  // Keep this decoupled from input loading and primary runtime summaries.
+  compatibilityProtocolPackage: CompatibilityProtocolPackage;
   advisories: ResolvedRuntimeAdvisory[];
+  // Internal rich resolved route model owned by the primary runtime binding.
+  // New external callers should usually prefer `routeViews` or `summary.routes`.
   routes: ResolvedRoute[];
+}
+
+function toResolvedRuntimeSummaryRoute(route: ResolvedRoute): WorkerRuntimeRouteWithMethods {
+  return {
+    routeId: route.routeId,
+    routePathPrefix: route.pathPrefix,
+    actionId: route.actionId,
+    routeActionKind: route.actionKind,
+    routeDispatchMode: route.dispatchMode,
+    methods: route.methods,
+  };
+}
+
+function toResolvedRuntimeRouteView(route: ResolvedRoute): WorkerRuntimeRouteWithPolicy {
+  return {
+    ...toResolvedRuntimeSummaryRoute(route),
+    websocketEnabled: route.websocketEnabled,
+  };
+}
+
+function toCompatibilityRouteTableEntry(route: ResolvedRoute): CompatibilityRouteTableEntry {
+  return {
+    routeId: route.routeId,
+    pathPrefix: route.pathPrefix,
+    actionId: route.actionId,
+    methods: route.methods,
+    websocketEnabled: route.websocketEnabled,
+    actionKind: route.actionKind,
+    upstreamBaseUrl: route.upstreamBaseUrl,
+    dispatchMode: route.dispatchMode,
+  };
+}
+
+function toCompatibilityProtocolActionEntry(action: ProtocolAction): CompatibilityProtocolActionEntry {
+  return {
+    actionId: action.actionId,
+    kind: action.kind,
+    methods: [...action.methods],
+    ...(action.websocket !== undefined ? { websocket: action.websocket } : {}),
+  };
+}
+
+function toCompatibilityProtocolPackage(protocolPackage: ProtocolPackage): CompatibilityProtocolPackage {
+  return {
+    packageId: protocolPackage.packageId,
+    protocol: protocolPackage.protocol,
+    version: protocolPackage.version,
+    actions: protocolPackage.actions.map(toCompatibilityProtocolActionEntry),
+  };
 }
 
 function assertUniqueValues(values: string[], label: string): void {
@@ -140,7 +234,10 @@ function orderedUniqueValues(values: string[]): string[] {
   return result;
 }
 
-function computeAdvisories(routes: ResolvedRoute[]): ResolvedRuntimeAdvisory[] {
+function computeAdvisories(
+  routes: ResolvedRoute[],
+  unboundProtocolActionIds: string[],
+): ResolvedRuntimeAdvisory[] {
   const advisories: ResolvedRuntimeAdvisory[] = [];
   const rootRoute = routes.find((route) => route.pathPrefix === "/") ?? null;
 
@@ -173,6 +270,15 @@ function computeAdvisories(routes: ResolvedRoute[]): ResolvedRuntimeAdvisory[] {
         message: `route uses non-TLS WebSocket upstream: ${route.upstreamBaseUrl}`
       });
     }
+  }
+
+  for (const actionId of unboundProtocolActionIds) {
+    advisories.push({
+      severity: "info",
+      code: "unbound_protocol_action",
+      actionId,
+      message: `protocol package declares action not currently bound by any resolved route: ${actionId}`
+    });
   }
 
   return advisories;
@@ -350,7 +456,7 @@ function resolveRoutes(
   assignment: Assignment,
   planningFragment: PlanningFragment,
   protocolPackage: ProtocolPackage
-): ResolvedRoute[] {
+): Omit<ResolvedRoute, "dispatchMode">[] {
   const routesById = buildRouteIndex(planningFragment);
   const actionsById = buildActionIndex(protocolPackage);
 
@@ -401,12 +507,24 @@ export function resolveRuntimeModel(
 ): ResolvedRuntimeModel {
   validateAssignment(assignment);
   validateRuntimeAdapter(runtimeAdapter);
-  const routes = resolveRoutes(assignment, planningFragment, protocolPackage);
+  const resolvedRoutes = resolveRoutes(assignment, planningFragment, protocolPackage);
+  const dispatchDiagnostics = buildRuntimeDispatchDiagnostics(resolvedRoutes, EXPERIMENT_HTTP_HANDLER_ACTION_IDS);
+  const routes: ResolvedRoute[] = resolvedRoutes.map((route) => ({
+    ...route,
+    dispatchMode: dispatchDiagnostics.routeDispatchModes[route.routeId],
+  }));
+  const boundActionIds = orderedUniqueValues(routes.map((route) => route.actionId));
+  const unboundProtocolActionIds = protocolPackage.actions
+    .map((action) => action.actionId)
+    .filter((actionId) => !boundActionIds.includes(actionId));
   const httpRouteCount = routes.filter((route) => route.actionKind === "http").length;
   const websocketRouteCount = routes.filter((route) => route.actionKind === "websocket").length;
   const rootRoute = routes.find((route) => route.pathPrefix === "/") ?? null;
-  const advisories = computeAdvisories(routes);
+  const advisories = computeAdvisories(routes, unboundProtocolActionIds);
   const compatibilityBindings = resolveCompatibilityBindings(runtimeAdapter);
+  const routeViews = routes.map(toResolvedRuntimeRouteView);
+  const compatibilityRouteTable = routes.map(toCompatibilityRouteTableEntry);
+  const compatibilityProtocolPackage = toCompatibilityProtocolPackage(protocolPackage);
   const advisorySeverityCounts = {
     info: advisories.filter((advisory) => advisory.severity === "info").length,
     warning: advisories.filter((advisory) => advisory.severity === "warning").length
@@ -455,7 +573,8 @@ export function resolveRuntimeModel(
       websocketRouteCount,
       rootRouteId: rootRoute?.routeId ?? null,
       routeIds: routes.map((route) => route.routeId),
-      actionIds: orderedUniqueValues(routes.map((route) => route.actionId)),
+      boundActionIds,
+      unboundProtocolActionIds,
       methods: orderedUniqueValues(routes.flatMap((route) => route.methods)),
       bindingNames: Object.keys(assignment.httpWorker.deployment.bindings),
       secretNames: Object.keys(assignment.httpWorker.deployment.secrets),
@@ -477,21 +596,21 @@ export function resolveRuntimeModel(
       routeCount: routes.length,
       httpRouteCount,
       websocketRouteCount,
+      boundActionIds,
+      unboundProtocolActionIds,
       highestAdvisorySeverity,
       advisoryCount: advisories.length,
-      routes: routes.map((route) => ({
-        routeId: route.routeId,
-        pathPrefix: route.pathPrefix,
-        actionId: route.actionId,
-        actionKind: route.actionKind,
-        methods: route.methods
-      })),
+      routes: routeViews.map(({ websocketEnabled: _websocketEnabled, ...route }) => route),
       advisories: advisories.map((advisory) => ({
         severity: advisory.severity,
         code: advisory.code,
-        routeId: advisory.routeId
+        routeId: advisory.routeId,
+        actionId: advisory.actionId
       }))
     },
+    routeViews,
+    compatibilityRouteTable,
+    compatibilityProtocolPackage,
     advisories,
     routes
   };

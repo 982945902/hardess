@@ -40,6 +40,18 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - the demo action side now also carries an explicit schema version so HTTP and WebSocket success payloads are versioned as a small runtime contract
 - the worker runtime business-error side now also carries an explicit schema version so route and upgrade failures are versioned as a stable contract
 - the runtime now exposes dispatch diagnostics that separate implemented HTTP action handlers, dispatchable routes including built-in WebSocket handling, and protocol actions that would currently fail as `unhandled_action`
+- the admin route view now also reuses the same route explain shape as runtime errors, so per-route runtime handling shape is visible without a second naming scheme
+- the resolved model now also surfaces protocol actions that exist in the package but are not bound by any resolved route, so planning gaps are visible before traffic arrives
+- resolved model and runtime summary now also label each resolved route with its expected runtime dispatch mode, so static inspection and live admin views use the same route-level vocabulary
+- `method_not_allowed` now reports the matched route prefix, action kind, and dispatch mode, so path matches rejected by method policy are easier to explain during debugging
+- `upgrade_required` now reports the matched websocket route prefix and dispatch shape too, so missing upgrade headers are explained with the same route context as other runtime rejections
+- route-scoped runtime errors now share one common route explain envelope, so `method_not_allowed`, `unhandled_action`, and `upgrade_required` expose the same core route context
+- the compact runtime summary now reuses that same route naming too, so static summary output and live admin/error payloads no longer drift on route field vocabulary
+- the full resolved model now also exposes a stable `routeViews` projection with the same route naming, so static consumers can avoid depending on the richer internal `routes` shape when they only need runtime-facing route semantics
+- success payloads now also carry that same route explain envelope, so normal HTTP action responses and websocket echoes can be correlated with admin/error route views without field translation
+- the legacy `HARDESS_ROUTE_TABLE` binding is now sourced from an explicit `compatibilityRouteTable` projection instead of aliasing internal `routes`, so future internal route-model changes can stay decoupled from compatibility consumers
+- the legacy `HARDESS_PROTOCOL_PACKAGE` binding is now sourced from an explicit `compatibilityProtocolPackage` projection instead of aliasing raw input, so compatibility consumers stay decoupled from future protocol-package input/model changes too
+- verification now explicitly asserts that legacy compact-summary/admin route field names stay absent, so contract drift is caught as a regression instead of surfacing silently
 
 ## What this does not prove
 
@@ -59,8 +71,11 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `protocol-package.json`: minimal protocol-package input for ingress actions
 - `bad-fixtures/`: intentionally invalid inputs used by generator negative checks
 - `runtime-error-fixtures/`: valid alternate inputs used to trigger reachable runtime error contracts such as `no_route` and `unhandled_action`
+- `protocol-action-fixtures/`: valid alternate inputs used to prove protocol-package action coverage diagnostics such as unbound declared actions
 - `config-model.ts`: typed input schemas plus JSON loading
 - `resolved-runtime-model.ts`: validation plus resolved runtime model construction
+- `runtime-dispatch-model.ts`: shared route-dispatch classifier used by both static resolved output and live runtime diagnostics
+- `worker-route-contract.ts`: shared route explain contract reused by runtime errors and live admin route views
 - `config-render.ts`: renders runnable `workerd` config from validated inputs
 - `generate-config.ts`: thin CLI entry that loads inputs and writes the generated config
 - `assert-json-field.ts`: small JSON assertion helper used by verification scripts
@@ -84,6 +99,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `verify-binding-runtime-matrix.sh`: boots all compatibility-binding variants and checks runtime behavior
 - `verify-no-compat-runtime.sh`: boots the server with compatibility bindings disabled and proves runtime dispatch still works
 - `verify-runtime-error-contracts.sh`: boots valid alternate inputs and proves reachable runtime error responses stay on the versioned error contract
+- `verify-protocol-action-coverage.sh`: proves the resolved model and live runtime surface protocol actions that are declared but not bound by any resolved route
 - `verify-all.sh`: runs standard, no-compat, and negative verification as one local matrix
 - `verify-negative.sh`: checks that invalid inputs fail during config generation
 
@@ -153,6 +169,7 @@ curl http://127.0.0.1:6285/_hardess/runtime/routes
 ```
 
 Those endpoints are intentionally local to this experiment. They do not expose secrets; they report singleton runtime identity, request counters, registered HTTP action handler IDs, dispatchable action IDs, unhandled action/route IDs, and the resolved route shape currently held by the worker.
+They also expose the resolved bound action set and any protocol actions that are declared but currently unbound by routing.
 Non-`GET` requests return `405`, and unknown `/_hardess/runtime/*` paths return `404`, so the admin surface does not fall through into the normal business route table.
 Admin responses currently use schema version `hardess.workerd.worker-runtime-admin.v1`.
 Action success responses currently use schema version `hardess.workerd.worker-action.v1`.
@@ -239,6 +256,19 @@ That script currently verifies two valid alternate runtime shapes:
 
 The unhandled-action case also verifies the admin diagnostics: the action is absent from `registeredActionIds`, absent from `dispatchableActionIds`, and present in both `unhandledActionIds` and `unhandledRouteIds`.
 
+To lock in protocol-package coverage diagnostics for declared-but-unbound actions:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-protocol-action-coverage.sh
+```
+
+That script boots a valid protocol package variant with one extra unused action and verifies:
+
+- resolved model diagnostics expose `boundActionIds` and `unboundProtocolActionIds`
+- the extra action emits an `unbound_protocol_action` advisory
+- resolved model and runtime summary still classify bound routes with explicit dispatch modes
+- live `GET /` and `GET /_hardess/runtime` responses surface the same unbound action information
+
 ## Verify Negative Cases
 
 ```bash
@@ -258,6 +288,7 @@ The runtime responses now also expose a small `workerRuntime` snapshot so the si
 ## Verification Matrix
 
 - `verify.sh`: default adapter end-to-end HTTP, WebSocket, business-error/admin contracts, admin overview/stats/routes, admin 405/404 guards, generated config content, and resolved-model inspection
+- `verify-protocol-action-coverage.sh`: valid protocol-package variant that proves declared-but-unbound actions are visible in resolved-model and live runtime diagnostics
 - `verify-runtime-error-contracts.sh`: alternate valid runtime shapes that prove `no_route` and `unhandled_action` stay on the versioned runtime error contract
 - `verify-binding-matrix.sh`: all four compatibility-binding adapter variants at model/config level, including explicit checks that all split worker modules are embedded into generated `workerd` config
 - `verify-binding-runtime-matrix.sh`: the same four compatibility-binding variants at live runtime level, including admin surface and admin negative paths

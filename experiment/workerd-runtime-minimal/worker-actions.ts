@@ -1,5 +1,7 @@
 import { WORKER_RUNTIME_ACTION_SCHEMA_VERSION } from "./worker-action-contract.ts";
 import { json } from "./worker-response.ts";
+import { assertExpectedHttpHandlerActionIds } from "./runtime-dispatch-model.ts";
+import { toWorkerRuntimeRouteExplain } from "./worker-route-contract.ts";
 import type { RuntimeActionHandler, RuntimeRequestContext } from "./worker-types.ts";
 import type { WorkerRuntimeEchoResponse, WorkerRuntimeInfoResponse } from "./worker-action-contract.ts";
 
@@ -23,8 +25,7 @@ async function handleInfo({
     deploymentId: env.HARDESS_ASSIGNMENT_META.deploymentId,
     declaredVersion: env.HARDESS_ASSIGNMENT_META.declaredVersion,
     manifestId: env.HARDESS_ASSIGNMENT_META.manifestId,
-    routeId: route.routeId,
-    actionId: route.actionId,
+    ...toWorkerRuntimeRouteExplain(route),
     dispatchSource: "resolved_runtime_model",
     protocolPackageId: env.HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage.packageId,
     routeRefCount: env.HARDESS_ASSIGNMENT_META.routeRefs.length,
@@ -32,6 +33,8 @@ async function handleInfo({
     resolvedListenAddress: env.HARDESS_RESOLVED_RUNTIME_MODEL.runtime.listenAddress,
     resolvedProtocolActionCount: env.HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage.actionCount,
     resolvedProtocolActionIds: env.HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage.actionIds,
+    resolvedBoundActionIds: env.HARDESS_RESOLVED_RUNTIME_MODEL.diagnostics.boundActionIds,
+    resolvedUnboundProtocolActionIds: env.HARDESS_RESOLVED_RUNTIME_MODEL.diagnostics.unboundProtocolActionIds,
     resolvedPrimaryRuntimeBinding: env.HARDESS_RESOLVED_RUNTIME_MODEL.bindingContract.primaryRuntimeBinding,
     resolvedCompatibilityBindings: env.HARDESS_RESOLVED_RUNTIME_MODEL.bindingContract.compatibilityBindings,
     resolvedMetadataBindings: env.HARDESS_RESOLVED_RUNTIME_MODEL.bindingContract.metadataBindings,
@@ -66,8 +69,7 @@ async function handleEcho({ env, route, request, url, workerRuntime }: RuntimeRe
     schemaVersion: WORKER_RUNTIME_ACTION_SCHEMA_VERSION,
     runtime: env.RUNTIME_META.runtime,
     assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
-    routeId: route.routeId,
-    actionId: route.actionId,
+    ...toWorkerRuntimeRouteExplain(route),
     dispatchSource: "resolved_runtime_model",
     path: url.pathname,
     echo: body,
@@ -78,8 +80,11 @@ async function handleEcho({ env, route, request, url, workerRuntime }: RuntimeRe
 }
 
 export function createActionHandlers(): Map<string, RuntimeActionHandler> {
-  return new Map<string, RuntimeActionHandler>([
+  const handlers = new Map<string, RuntimeActionHandler>([
     ["http.info", handleInfo],
     ["http.echo", handleEcho],
   ]);
+
+  assertExpectedHttpHandlerActionIds(handlers.keys());
+  return handlers;
 }

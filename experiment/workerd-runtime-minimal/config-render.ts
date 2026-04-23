@@ -21,6 +21,8 @@ function renderModule(name: string, path: string): string {
 function collectWorkerModules(outputPath: string, entryPath: string): Array<{ name: string; path: string }> {
   const workerModules = [
     entryPath,
+    "worker-route-contract.ts",
+    "runtime-dispatch-model.ts",
     "worker-runtime.ts",
     "worker-action-contract.ts",
     "worker-error-contract.ts",
@@ -64,11 +66,11 @@ function collectBindings(
   ];
 
   if (resolvedModel.bindingContract.compatibilityBindings.includes("HARDESS_ROUTE_TABLE")) {
-    bindings.push(["HARDESS_ROUTE_TABLE", resolvedModel.routes]);
+    bindings.push(["HARDESS_ROUTE_TABLE", resolvedModel.compatibilityRouteTable]);
   }
 
   if (resolvedModel.bindingContract.compatibilityBindings.includes("HARDESS_PROTOCOL_PACKAGE")) {
-    bindings.push(["HARDESS_PROTOCOL_PACKAGE", protocolPackage]);
+    bindings.push(["HARDESS_PROTOCOL_PACKAGE", resolvedModel.compatibilityProtocolPackage]);
   }
 
   return bindings;

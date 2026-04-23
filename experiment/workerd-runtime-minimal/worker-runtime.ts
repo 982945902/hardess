@@ -3,6 +3,8 @@ import { createActionHandlers } from "./worker-actions.ts";
 import { isWorkerRuntimeAdminPath } from "./worker-admin-contract.ts";
 import { WORKER_RUNTIME_ERROR_SCHEMA_VERSION } from "./worker-error-contract.ts";
 import { handleRuntimeAdmin } from "./worker-admin.ts";
+import { toWorkerRuntimeRouteExplain } from "./worker-route-contract.ts";
+import { buildRuntimeDispatchDiagnostics } from "./runtime-dispatch-model.ts";
 import { json } from "./worker-response.ts";
 import type {
   Env,
@@ -39,42 +41,6 @@ function buildInstanceId(env: Env): string {
   return `${env.HARDESS_ASSIGNMENT_META.assignmentId}:${shortManifestId}:${Date.now().toString(36)}`;
 }
 
-function orderedUniqueValues(values: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const value of values) {
-    if (seen.has(value)) {
-      continue;
-    }
-
-    seen.add(value);
-    result.push(value);
-  }
-
-  return result;
-}
-
-function buildDispatchDiagnostics(
-  routes: ResolvedRouteEntry[],
-  actionHandlers: Map<string, RuntimeActionHandler>,
-): RuntimeDispatchDiagnostics {
-  const registeredActionIds = Array.from(actionHandlers.keys());
-  const dispatchableActionIds = orderedUniqueValues(
-    routes
-      .filter((route) => route.actionKind === "websocket" || actionHandlers.has(route.actionId))
-      .map((route) => route.actionId),
-  );
-  const unhandledRoutes = routes.filter((route) => route.actionKind === "http" && !actionHandlers.has(route.actionId));
-
-  return {
-    registeredActionIds,
-    dispatchableActionIds,
-    unhandledActionIds: orderedUniqueValues(unhandledRoutes.map((route) => route.actionId)),
-    unhandledRouteIds: unhandledRoutes.map((route) => route.routeId),
-  };
-}
-
 function runtimeErrorBase(
   env: Env,
   url: URL,
@@ -109,7 +75,7 @@ export class HardessWorkerRuntime {
     this.runtimeKey = buildRuntimeKey(env);
     this.routes = [...env.HARDESS_RESOLVED_RUNTIME_MODEL.routes];
     this.actionHandlers = createActionHandlers();
-    this.dispatchDiagnostics = buildDispatchDiagnostics(this.routes, this.actionHandlers);
+    this.dispatchDiagnostics = buildRuntimeDispatchDiagnostics(this.routes, this.actionHandlers.keys());
   }
 
   canServe(env: Env): boolean {
@@ -150,8 +116,7 @@ export class HardessWorkerRuntime {
       const payload: WorkerRuntimeMethodNotAllowedResponse = {
         ...runtimeErrorBase(env, url, workerRuntime()),
         error: "method_not_allowed",
-        routeId: route.routeId,
-        actionId: route.actionId,
+        ...toWorkerRuntimeRouteExplain(route),
         method: request.method,
         allowedMethods: route.methods,
       };
@@ -167,8 +132,7 @@ export class HardessWorkerRuntime {
       const payload: WorkerRuntimeUnhandledActionResponse = {
         ...runtimeErrorBase(env, url, workerRuntime()),
         error: "unhandled_action",
-        routeId: route.routeId,
-        actionId: route.actionId,
+        ...toWorkerRuntimeRouteExplain(route),
       };
       return json(payload, { status: 500 });
     }
@@ -246,8 +210,7 @@ export class HardessWorkerRuntime {
       const payload: WorkerRuntimeUpgradeRequiredResponse = {
         ...runtimeErrorBase(env, url, workerRuntime()),
         error: "upgrade_required",
-        routeId: route.routeId,
-        actionId: route.actionId,
+        ...toWorkerRuntimeRouteExplain(route),
         upgrade: "websocket",
         receivedUpgradeHeader: upgradeHeader,
       };
@@ -269,8 +232,7 @@ export class HardessWorkerRuntime {
         type: "echo",
         runtime: env.RUNTIME_META.runtime,
         assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
-        routeId: route.routeId,
-        actionId: route.actionId,
+        ...toWorkerRuntimeRouteExplain(route),
         echo: text,
         workerRuntime: snapshot,
       };
@@ -285,8 +247,7 @@ export class HardessWorkerRuntime {
       type: "open",
       runtime: env.RUNTIME_META.runtime,
       assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
-      routeId: route.routeId,
-      actionId: route.actionId,
+      ...toWorkerRuntimeRouteExplain(route),
       workerRuntime: snapshot,
     };
     server.send(JSON.stringify(openPayload));

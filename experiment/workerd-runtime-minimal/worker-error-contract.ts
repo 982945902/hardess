@@ -1,4 +1,5 @@
 import type { RuntimeStateSnapshot } from "./worker-types.ts";
+import type { WorkerRuntimeRouteExplain } from "./worker-route-contract.ts";
 
 export const WORKER_RUNTIME_ERROR_SCHEMA_VERSION = "hardess.workerd.worker-error.v1";
 
@@ -23,24 +24,26 @@ export interface WorkerRuntimeNoRouteResponse extends WorkerRuntimeErrorBaseResp
   method: string;
 }
 
-export interface WorkerRuntimeMethodNotAllowedResponse extends WorkerRuntimeErrorBaseResponse {
+export interface WorkerRuntimeMethodNotAllowedResponse
+  extends WorkerRuntimeErrorBaseResponse, WorkerRuntimeRouteExplain
+{
   error: "method_not_allowed";
-  routeId: string;
-  actionId: string;
   method: string;
   allowedMethods: string[];
 }
 
-export interface WorkerRuntimeUnhandledActionResponse extends WorkerRuntimeErrorBaseResponse {
+export interface WorkerRuntimeUnhandledActionResponse
+  extends WorkerRuntimeErrorBaseResponse, WorkerRuntimeRouteExplain
+{
   error: "unhandled_action";
-  routeId: string;
-  actionId: string;
 }
 
-export interface WorkerRuntimeUpgradeRequiredResponse extends WorkerRuntimeErrorBaseResponse {
+export interface WorkerRuntimeUpgradeRequiredResponse
+  extends WorkerRuntimeErrorBaseResponse, WorkerRuntimeRouteExplain
+{
   error: "upgrade_required";
-  routeId: string;
-  actionId: string;
+  routeActionKind: "websocket";
+  routeDispatchMode: "websocket_builtin";
   upgrade: "websocket";
   receivedUpgradeHeader: string | null;
 }
