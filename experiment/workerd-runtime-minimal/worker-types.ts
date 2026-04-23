@@ -88,6 +88,13 @@ export interface RuntimeStateSnapshot {
   websocketSessionCount: number;
 }
 
+export interface RuntimeDispatchDiagnostics {
+  registeredActionIds: string[];
+  dispatchableActionIds: string[];
+  unhandledActionIds: string[];
+  unhandledRouteIds: string[];
+}
+
 export interface RuntimeRequestContext {
   request: Request;
   env: Env;
@@ -96,6 +103,7 @@ export interface RuntimeRequestContext {
   requestSequence: number;
   routeHitCount: number;
   workerRuntime: () => RuntimeStateSnapshot;
+  dispatchDiagnostics: RuntimeDispatchDiagnostics;
 }
 
 export type RuntimeActionHandler = (context: RuntimeRequestContext) => Promise<Response>;

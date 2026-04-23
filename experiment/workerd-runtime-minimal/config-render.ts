@@ -22,6 +22,8 @@ function collectWorkerModules(outputPath: string, entryPath: string): Array<{ na
   const workerModules = [
     entryPath,
     "worker-runtime.ts",
+    "worker-action-contract.ts",
+    "worker-error-contract.ts",
     "worker-admin.ts",
     "worker-admin-contract.ts",
     "worker-actions.ts",

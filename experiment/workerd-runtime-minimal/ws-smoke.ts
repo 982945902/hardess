@@ -26,6 +26,7 @@ const result = await new Promise<string>((resolve, reject) => {
       type?: string;
       runtime?: string;
       echo?: string;
+      schemaVersion?: string;
     };
 
     if (payload.type === "open") {
@@ -66,6 +67,12 @@ const result = await new Promise<string>((resolve, reject) => {
     if (payload.echo !== "hardess-workerd-ws") {
       clearTimeout(timer);
       reject(new Error(`unexpected websocket echo payload: ${payload.echo}`));
+      return;
+    }
+
+    if (payload.schemaVersion !== "hardess.workerd.worker-action.v1") {
+      clearTimeout(timer);
+      reject(new Error(`unexpected websocket schemaVersion: ${payload.schemaVersion}`));
       return;
     }
 

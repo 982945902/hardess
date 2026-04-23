@@ -1,0 +1,16 @@
+{
+  "sharedHttpForwardConfig": {
+    "routes": [
+      {
+        "routeId": "route.demo.workerd.unhandled",
+        "match": {
+          "pathPrefix": "/unhandled"
+        },
+        "actionId": "http.unhandled",
+        "upstream": {
+          "baseUrl": "http://workerd.local/unhandled"
+        }
+      }
+    ]
+  }
+}

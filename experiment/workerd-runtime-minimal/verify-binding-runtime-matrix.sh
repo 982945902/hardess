@@ -16,7 +16,6 @@ run_case() {
   (
     set -euo pipefail
 
-    local port
     local listen_address
     local base_url
     local ws_url
@@ -36,34 +35,36 @@ run_case() {
     local runtime_not_found_response
     local runtime_invalid_method_body
     local runtime_not_found_body
+    local ws_upgrade_required_status
+    local ws_upgrade_required_response
+    local ws_upgrade_required_body
 
-    port="$(pick_port)"
-    listen_address="127.0.0.1:${port}"
-    base_url="http://${listen_address}"
-    ws_url="ws://${listen_address}/ws"
     log_file="$(mktemp -t workerd-binding-runtime-matrix-log.XXXXXX)"
     generated_config="$(mktemp -t workerd-binding-runtime-matrix-config.XXXXXX)"
     runtime_invalid_method_body="$(mktemp -t workerd-binding-runtime-invalid-method.XXXXXX)"
     runtime_not_found_body="$(mktemp -t workerd-binding-runtime-not-found.XXXXXX)"
+    ws_upgrade_required_body="$(mktemp -t workerd-binding-runtime-ws-upgrade.XXXXXX)"
 
     cleanup() {
       cleanup_server "${server_pid:-}"
       rm -f "$log_file" "$generated_config"
       rm -f "$runtime_invalid_method_body"
       rm -f "$runtime_not_found_body"
+      rm -f "$ws_upgrade_required_body"
     }
     trap cleanup EXIT
 
-    GENERATED_CONFIG="$generated_config" "$RUN_SCRIPT" \
-      --runtime-adapter "$adapter_path" \
-      --listen-address "$listen_address" >"$log_file" 2>&1 &
-    server_pid=$!
-
-    wait_for_http_ready "$base_url" "$log_file" "$server_pid" "$label runtime"
+    start_server_with_retry "$label runtime" "$log_file" env GENERATED_CONFIG="$generated_config" "$RUN_SCRIPT" --runtime-adapter "$adapter_path"
+    server_pid="$START_SERVER_PID"
+    listen_address="$START_SERVER_LISTEN_ADDRESS"
+    base_url="$START_SERVER_BASE_URL"
+    ws_url="$START_SERVER_WS_URL"
 
     get_response="$(curl -fsS "$base_url/")"
     post_response="$(curl -fsS -X POST "$base_url/echo" --data 'hardess-workerd')"
     invalid_method_response="$(curl -sS -X GET "$base_url/echo")"
+    ws_upgrade_required_status="$(curl -sS -o "$ws_upgrade_required_body" -w '%{http_code}' "$base_url/ws")"
+    ws_upgrade_required_response="$(cat "$ws_upgrade_required_body")"
     ws_response="$(cd "$ROOT_DIR" && rtk bun run ./ws-smoke.ts --url "$ws_url")"
     runtime_response="$(curl -fsS "$base_url/_hardess/runtime")"
     runtime_stats_response="$(curl -fsS "$base_url/_hardess/runtime/stats")"
@@ -76,56 +77,79 @@ run_case() {
     test -f "$generated_config"
     grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$generated_config"
     grep -q "address = \"$listen_address\"" "$generated_config"
+    grep -q 'name = "worker-error-contract.ts"' "$generated_config"
 
     assert_json_field "$get_response" --path dispatchSource --equals "resolved_runtime_model"
+    assert_json_field "$get_response" --path schemaVersion --equals "hardess.workerd.worker-action.v1"
     assert_json_field "$get_response" --path protocolPackageId --equals "workerd-http-ingress@v1"
     assert_json_field "$get_response" --path resolvedListenAddress --equals "$listen_address"
     assert_json_field "$get_response" --path resolvedPrimaryRuntimeBinding --equals "HARDESS_RESOLVED_RUNTIME_MODEL"
     assert_json_field "$get_response" --path resolvedMetadataBindings --includes "HARDESS_ASSIGNMENT_META"
     assert_json_field "$get_response" --path resolvedMetadataBindings --includes "HARDESS_CONFIG"
+    assert_json_field "$get_response" --path runtimeRegisteredActionIds --includes "http.info"
+    assert_json_field "$get_response" --path runtimeDispatchableActionIds --includes "ws.echo"
+    assert_json_field "$get_response" --path runtimeUnhandledActionIds --equals-json "[]"
+    assert_json_field "$get_response" --path runtimeUnhandledRouteIds --equals-json "[]"
     assert_json_field "$get_response" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
     assert_json_field "$get_response" --path workerRuntime.requestSequence --equals-json "2"
     assert_json_field "$get_response" --path workerRuntime.totalRequests --equals-json "2"
 
     assert_json_field "$post_response" --path echo --equals "hardess-workerd"
+    assert_json_field "$post_response" --path schemaVersion --equals "hardess.workerd.worker-action.v1"
     assert_json_field "$post_response" --path dispatchSource --equals "resolved_runtime_model"
     assert_json_field "$post_response" --path workerRuntime.runtimeName --equals "hardess.workerd.worker-runtime.v1"
     assert_json_field "$post_response" --path workerRuntime.requestSequence --equals-json "3"
     assert_json_field "$post_response" --path workerRuntime.totalRequests --equals-json "3"
     assert_json_field "$invalid_method_response" --path error --equals "method_not_allowed"
+    assert_json_field "$invalid_method_response" --path schemaVersion --equals "hardess.workerd.worker-error.v1"
+    assert_json_field "$invalid_method_response" --path dispatchSource --equals "worker_runtime"
     assert_json_field "$invalid_method_response" --path allowedMethods --includes "POST"
     assert_json_field "$invalid_method_response" --path workerRuntime.requestSequence --equals-json "4"
     assert_json_field "$invalid_method_response" --path workerRuntime.routeHitCount --equals-json "2"
+    test "$ws_upgrade_required_status" = "426"
+    assert_json_field "$ws_upgrade_required_response" --path error --equals "upgrade_required"
+    assert_json_field "$ws_upgrade_required_response" --path schemaVersion --equals "hardess.workerd.worker-error.v1"
+    assert_json_field "$ws_upgrade_required_response" --path dispatchSource --equals "worker_runtime"
+    assert_json_field "$ws_upgrade_required_response" --path routeId --equals "route.demo.workerd.ws"
+    assert_json_field "$ws_upgrade_required_response" --path actionId --equals "ws.echo"
+    assert_json_field "$ws_upgrade_required_response" --path upgrade --equals "websocket"
+    assert_json_field "$ws_upgrade_required_response" --path receivedUpgradeHeader --equals-json "null"
+    assert_json_field "$ws_upgrade_required_response" --path workerRuntime.requestSequence --equals-json "5"
+    assert_json_field "$ws_upgrade_required_response" --path workerRuntime.totalRequests --equals-json "5"
     assert_json_field "$ws_response" --path type --equals "echo"
+    assert_json_field "$ws_response" --path schemaVersion --equals "hardess.workerd.worker-action.v1"
     assert_json_field "$ws_response" --path routeId --equals "route.demo.workerd.ws"
     assert_json_field "$ws_response" --path actionId --equals "ws.echo"
     assert_json_field "$ws_response" --path echo --equals "hardess-workerd-ws"
-    assert_json_field "$ws_response" --path workerRuntime.requestSequence --equals-json "5"
+    assert_json_field "$ws_response" --path workerRuntime.requestSequence --equals-json "6"
     assert_json_field "$ws_response" --path workerRuntime.websocketSessionCount --equals-json "1"
     assert_json_field "$runtime_response" --path endpoint --equals "/_hardess/runtime"
     assert_json_field "$runtime_response" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
     assert_json_field "$runtime_response" --path dispatchSource --equals "worker_runtime_admin"
     assert_json_field "$runtime_response" --path registeredActionIds --includes "http.info"
     assert_json_field "$runtime_response" --path registeredActionIds --includes "http.echo"
-    assert_json_field "$runtime_response" --path workerRuntime.requestSequence --equals-json "6"
-    assert_json_field "$runtime_response" --path workerRuntime.totalRequests --equals-json "6"
+    assert_json_field "$runtime_response" --path dispatchableActionIds --includes "ws.echo"
+    assert_json_field "$runtime_response" --path unhandledActionIds --equals-json "[]"
+    assert_json_field "$runtime_response" --path unhandledRouteIds --equals-json "[]"
+    assert_json_field "$runtime_response" --path workerRuntime.requestSequence --equals-json "7"
+    assert_json_field "$runtime_response" --path workerRuntime.totalRequests --equals-json "7"
     assert_json_field "$runtime_stats_response" --path view --equals "stats"
     assert_json_field "$runtime_stats_response" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
-    assert_json_field "$runtime_stats_response" --path workerRuntime.requestSequence --equals-json "7"
+    assert_json_field "$runtime_stats_response" --path workerRuntime.requestSequence --equals-json "8"
     assert_json_field "$runtime_routes_response" --path view --equals "routes"
     assert_json_field "$runtime_routes_response" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
     assert_json_field "$runtime_routes_response" --path routeCount --equals-json "3"
-    assert_json_field "$runtime_routes_response" --path workerRuntime.requestSequence --equals-json "8"
+    assert_json_field "$runtime_routes_response" --path workerRuntime.requestSequence --equals-json "9"
     test "$runtime_invalid_method_status" = "405"
     assert_json_field "$runtime_invalid_method_response" --path error --equals "method_not_allowed"
     assert_json_field "$runtime_invalid_method_response" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
     assert_json_field "$runtime_invalid_method_response" --path endpoint --equals "/_hardess/runtime"
-    assert_json_field "$runtime_invalid_method_response" --path workerRuntime.requestSequence --equals-json "9"
+    assert_json_field "$runtime_invalid_method_response" --path workerRuntime.requestSequence --equals-json "10"
     test "$runtime_not_found_status" = "404"
     assert_json_field "$runtime_not_found_response" --path error --equals "runtime_admin_endpoint_not_found"
     assert_json_field "$runtime_not_found_response" --path schemaVersion --equals "hardess.workerd.worker-runtime-admin.v1"
     assert_json_field "$runtime_not_found_response" --path endpoint --equals "/_hardess/runtime/unknown"
-    assert_json_field "$runtime_not_found_response" --path workerRuntime.requestSequence --equals-json "10"
+    assert_json_field "$runtime_not_found_response" --path workerRuntime.requestSequence --equals-json "11"
 
     if [[ "$expect_route_table" == "true" ]]; then
       grep -q 'HARDESS_ROUTE_TABLE' "$generated_config"
