@@ -1,0 +1,33 @@
+{
+  "assignmentId": "exp-workerd-minimal-http-worker-no-root",
+  "hostId": "exp-workerd-host-a",
+  "deploymentId": "demo-workerd-http-worker-no-root",
+  "deploymentKind": "http_worker",
+  "declaredVersion": "v1",
+  "artifact": {
+    "manifestId": "manifest_demo-workerd-minimal_no_root_v1",
+    "sourceUri": "hardess://artifacts/demo-workerd-http-worker-no-root"
+  },
+  "httpWorker": {
+    "name": "minimal-http-worker-no-root",
+    "entry": "worker.ts",
+    "routeRefs": [
+      "route.demo.workerd.echo"
+    ],
+    "deployment": {
+      "config": {
+        "experiment": "minimal-validation-no-root"
+      },
+      "bindings": {
+        "DEMO_SECRET": "hardess-workerd-secret",
+        "RUNTIME_META": {
+          "runtime": "workerd",
+          "experiment": "minimal-validation-no-root"
+        }
+      },
+      "secrets": {
+        "DEMO_TOKEN": "hardess-workerd-token"
+      }
+    }
+  }
+}

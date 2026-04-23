@@ -1,0 +1,33 @@
+{
+  "assignmentId": "exp-workerd-minimal-http-worker-unhandled-action",
+  "hostId": "exp-workerd-host-a",
+  "deploymentId": "demo-workerd-http-worker-unhandled-action",
+  "deploymentKind": "http_worker",
+  "declaredVersion": "v1",
+  "artifact": {
+    "manifestId": "manifest_demo-workerd-minimal_unhandled_action_v1",
+    "sourceUri": "hardess://artifacts/demo-workerd-http-worker-unhandled-action"
+  },
+  "httpWorker": {
+    "name": "minimal-http-worker-unhandled-action",
+    "entry": "worker.ts",
+    "routeRefs": [
+      "route.demo.workerd.unhandled"
+    ],
+    "deployment": {
+      "config": {
+        "experiment": "minimal-validation-unhandled-action"
+      },
+      "bindings": {
+        "DEMO_SECRET": "hardess-workerd-secret",
+        "RUNTIME_META": {
+          "runtime": "workerd",
+          "experiment": "minimal-validation-unhandled-action"
+        }
+      },
+      "secrets": {
+        "DEMO_TOKEN": "hardess-workerd-token"
+      }
+    }
+  }
+}

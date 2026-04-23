@@ -1,5 +1,7 @@
+import { WORKER_RUNTIME_ACTION_SCHEMA_VERSION } from "./worker-action-contract.ts";
 import { json } from "./worker-response.ts";
 import type { RuntimeActionHandler, RuntimeRequestContext } from "./worker-types.ts";
+import type { WorkerRuntimeEchoResponse, WorkerRuntimeInfoResponse } from "./worker-action-contract.ts";
 
 async function handleInfo({
   env,
@@ -7,9 +9,11 @@ async function handleInfo({
   request,
   url,
   workerRuntime,
+  dispatchDiagnostics,
 }: RuntimeRequestContext): Promise<Response> {
-  return json({
+  const payload: WorkerRuntimeInfoResponse = {
     ok: true,
+    schemaVersion: WORKER_RUNTIME_ACTION_SCHEMA_VERSION,
     runtime: env.RUNTIME_META.runtime,
     experiment: env.RUNTIME_META.experiment,
     configExperiment: env.HARDESS_CONFIG.experiment,
@@ -43,17 +47,23 @@ async function handleInfo({
     resolvedAdvisorySeverities: env.HARDESS_RESOLVED_RUNTIME_MODEL.advisories.map(
       (advisory) => advisory.severity,
     ),
+    runtimeRegisteredActionIds: dispatchDiagnostics.registeredActionIds,
+    runtimeDispatchableActionIds: dispatchDiagnostics.dispatchableActionIds,
+    runtimeUnhandledActionIds: dispatchDiagnostics.unhandledActionIds,
+    runtimeUnhandledRouteIds: dispatchDiagnostics.unhandledRouteIds,
     allowedMethods: route.methods,
     method: request.method,
     path: url.pathname,
     workerRuntime: workerRuntime(),
-  });
+  };
+  return json(payload);
 }
 
 async function handleEcho({ env, route, request, url, workerRuntime }: RuntimeRequestContext): Promise<Response> {
   const body = await request.text();
-  return json({
+  const payload: WorkerRuntimeEchoResponse = {
     ok: true,
+    schemaVersion: WORKER_RUNTIME_ACTION_SCHEMA_VERSION,
     runtime: env.RUNTIME_META.runtime,
     assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
     routeId: route.routeId,
@@ -63,7 +73,8 @@ async function handleEcho({ env, route, request, url, workerRuntime }: RuntimeRe
     echo: body,
     length: body.length,
     workerRuntime: workerRuntime(),
-  });
+  };
+  return json(payload);
 }
 
 export function createActionHandlers(): Map<string, RuntimeActionHandler> {

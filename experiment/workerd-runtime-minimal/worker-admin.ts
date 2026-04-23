@@ -6,7 +6,16 @@ import {
   WORKER_RUNTIME_ADMIN_STATS_ENDPOINT,
 } from "./worker-admin-contract.ts";
 import { json } from "./worker-response.ts";
-import type { Env, ResolvedRouteEntry, RuntimeStateSnapshot } from "./worker-types.ts";
+import type { Env, ResolvedRouteEntry, RuntimeDispatchDiagnostics, RuntimeStateSnapshot } from "./worker-types.ts";
+import type {
+  WorkerRuntimeAdminBaseResponse,
+  WorkerRuntimeAdminErrorResponse,
+  WorkerRuntimeAdminResponse,
+  WorkerRuntimeAdminRoute,
+  WorkerRuntimeAdminRoutesResponse,
+  WorkerRuntimeAdminStatsResponse,
+  WorkerRuntimeAdminSuccessResponse,
+} from "./worker-admin-contract.ts";
 
 export interface RuntimeAdminContext {
   request: Request;
@@ -14,11 +23,11 @@ export interface RuntimeAdminContext {
   url: URL;
   requestSequence: number;
   routes: ResolvedRouteEntry[];
-  registeredActionIds: string[];
+  dispatchDiagnostics: RuntimeDispatchDiagnostics;
   snapshot: (requestSequence: number) => RuntimeStateSnapshot;
 }
 
-function runtimeRoutes(routes: ResolvedRouteEntry[]) {
+function runtimeRoutes(routes: ResolvedRouteEntry[]): WorkerRuntimeAdminRoute[] {
   return routes.map((route) => ({
     routeId: route.routeId,
     pathPrefix: route.pathPrefix,
@@ -29,7 +38,11 @@ function runtimeRoutes(routes: ResolvedRouteEntry[]) {
   }));
 }
 
-function runtimeAdminBase(env: Env, url: URL) {
+function runtimeAdminBase(
+  env: Env,
+  url: URL,
+  dispatchDiagnostics: RuntimeDispatchDiagnostics,
+): WorkerRuntimeAdminBaseResponse {
   return {
     ok: true,
     schemaVersion: WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
@@ -41,6 +54,10 @@ function runtimeAdminBase(env: Env, url: URL) {
     manifestId: env.HARDESS_ASSIGNMENT_META.manifestId,
     protocolPackageId: env.HARDESS_RESOLVED_RUNTIME_MODEL.protocolPackage.packageId,
     resolvedListenAddress: env.HARDESS_RESOLVED_RUNTIME_MODEL.runtime.listenAddress,
+    registeredActionIds: dispatchDiagnostics.registeredActionIds,
+    dispatchableActionIds: dispatchDiagnostics.dispatchableActionIds,
+    unhandledActionIds: dispatchDiagnostics.unhandledActionIds,
+    unhandledRouteIds: dispatchDiagnostics.unhandledRouteIds,
   };
 }
 
@@ -50,67 +67,64 @@ export function handleRuntimeAdmin({
   url,
   requestSequence,
   routes,
-  registeredActionIds,
+  dispatchDiagnostics,
   snapshot,
 }: RuntimeAdminContext): Response {
   if (request.method !== "GET") {
-    return json(
-      {
-        ok: false,
-        schemaVersion: WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
-        error: "method_not_allowed",
-        endpoint: url.pathname,
-        method: request.method,
-        allowedMethods: ["GET"],
-        workerRuntime: snapshot(requestSequence),
-      },
-      { status: 405 },
-    );
+    const payload: WorkerRuntimeAdminErrorResponse = {
+      ok: false,
+      schemaVersion: WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
+      error: "method_not_allowed",
+      endpoint: url.pathname,
+      method: request.method,
+      allowedMethods: ["GET"],
+      workerRuntime: snapshot(requestSequence),
+    };
+    return json(payload, { status: 405 });
   }
 
   if (url.pathname === "/_hardess/runtime/stats") {
-    return json({
-      ...runtimeAdminBase(env, url),
+    const payload: WorkerRuntimeAdminStatsResponse = {
+      ...runtimeAdminBase(env, url, dispatchDiagnostics),
       endpoint: WORKER_RUNTIME_ADMIN_STATS_ENDPOINT,
       view: "stats",
       workerRuntime: snapshot(requestSequence),
-    });
+    };
+    return json(payload);
   }
 
   if (url.pathname === "/_hardess/runtime/routes") {
-    return json({
-      ...runtimeAdminBase(env, url),
+    const payload: WorkerRuntimeAdminRoutesResponse = {
+      ...runtimeAdminBase(env, url, dispatchDiagnostics),
       endpoint: WORKER_RUNTIME_ADMIN_ROUTES_ENDPOINT,
       view: "routes",
-      registeredActionIds,
       routeCount: routes.length,
       routes: runtimeRoutes(routes),
       workerRuntime: snapshot(requestSequence),
-    });
+    };
+    return json(payload);
   }
 
   if (url.pathname !== "/_hardess/runtime") {
-    return json(
-      {
-        ok: false,
-        schemaVersion: WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
-        error: "runtime_admin_endpoint_not_found",
-        endpoint: url.pathname,
-        allowedEndpoints: WORKER_RUNTIME_ADMIN_ENDPOINTS,
-        workerRuntime: snapshot(requestSequence),
-      },
-      { status: 404 },
-    );
+    const payload: WorkerRuntimeAdminErrorResponse = {
+      ok: false,
+      schemaVersion: WORKER_RUNTIME_ADMIN_SCHEMA_VERSION,
+      error: "runtime_admin_endpoint_not_found",
+      endpoint: url.pathname,
+      allowedEndpoints: WORKER_RUNTIME_ADMIN_ENDPOINTS,
+      workerRuntime: snapshot(requestSequence),
+    };
+    return json(payload, { status: 404 });
   }
 
-  return json({
-    ...runtimeAdminBase(env, url),
+  const payload: WorkerRuntimeAdminSuccessResponse = {
+    ...runtimeAdminBase(env, url, dispatchDiagnostics),
     endpoint: WORKER_RUNTIME_ADMIN_OVERVIEW_ENDPOINT,
     view: "overview",
     availableEndpoints: WORKER_RUNTIME_ADMIN_ENDPOINTS,
-    registeredActionIds,
     routeCount: routes.length,
     routes: runtimeRoutes(routes),
     workerRuntime: snapshot(requestSequence),
-  });
+  };
+  return json(payload satisfies WorkerRuntimeAdminResponse);
 }

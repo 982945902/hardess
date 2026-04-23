@@ -36,7 +36,10 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - resolved model and summary now carry explicit schema versions, and compatibility bindings can be disabled from the runtime adapter
 - the worker side now has an explicit singleton runtime layer with instance state, request sequencing, route-hit tracking, and websocket session tracking
 - the worker runtime exposes local inspection endpoints under `/_hardess/runtime` for overview, stats, and resolved route views
-- the runtime admin surface now carries an explicit schema version so overview/stats/routes and admin error responses can evolve as a versioned contract
+- the runtime admin surface now carries explicit response types and a schema version so overview/stats/routes and admin error responses can evolve as a versioned contract
+- the demo action side now also carries an explicit schema version so HTTP and WebSocket success payloads are versioned as a small runtime contract
+- the worker runtime business-error side now also carries an explicit schema version so route and upgrade failures are versioned as a stable contract
+- the runtime now exposes dispatch diagnostics that separate implemented HTTP action handlers, dispatchable routes including built-in WebSocket handling, and protocol actions that would currently fail as `unhandled_action`
 
 ## What this does not prove
 
@@ -55,6 +58,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `planning-fragment.json`: minimal route planning input
 - `protocol-package.json`: minimal protocol-package input for ingress actions
 - `bad-fixtures/`: intentionally invalid inputs used by generator negative checks
+- `runtime-error-fixtures/`: valid alternate inputs used to trigger reachable runtime error contracts such as `no_route` and `unhandled_action`
 - `config-model.ts`: typed input schemas plus JSON loading
 - `resolved-runtime-model.ts`: validation plus resolved runtime model construction
 - `config-render.ts`: renders runnable `workerd` config from validated inputs
@@ -66,7 +70,9 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `worker.ts`: small TypeScript worker entry that owns the singleton runtime instance
 - `worker-runtime.ts`: runtime core for route matching, request sequencing, dispatch, and WebSocket handling
 - `worker-admin.ts`: local runtime inspection handlers under `/_hardess/runtime`
-- `worker-admin-contract.ts`: shared admin contract constants such as schema version and stable endpoint names
+- `worker-admin-contract.ts`: shared admin contract constants, response types, schema version, and stable endpoint names
+- `worker-action-contract.ts`: shared action response types and schema version for HTTP and WebSocket demo actions
+- `worker-error-contract.ts`: shared runtime business-error response types and schema version for route/method/websocket failures
 - `worker-actions.ts`: protocol action handlers for the demo HTTP actions
 - `worker-response.ts`: shared JSON response helper
 - `worker-types.ts`: worker-side runtime and environment types
@@ -77,6 +83,7 @@ This is intentionally not a Hardess runtime integration. It is only a feasibilit
 - `verify-binding-matrix.sh`: checks all compatibility-binding combinations at model and config level
 - `verify-binding-runtime-matrix.sh`: boots all compatibility-binding variants and checks runtime behavior
 - `verify-no-compat-runtime.sh`: boots the server with compatibility bindings disabled and proves runtime dispatch still works
+- `verify-runtime-error-contracts.sh`: boots valid alternate inputs and proves reachable runtime error responses stay on the versioned error contract
 - `verify-all.sh`: runs standard, no-compat, and negative verification as one local matrix
 - `verify-negative.sh`: checks that invalid inputs fail during config generation
 
@@ -145,9 +152,11 @@ curl http://127.0.0.1:6285/_hardess/runtime/stats
 curl http://127.0.0.1:6285/_hardess/runtime/routes
 ```
 
-Those endpoints are intentionally local to this experiment. They do not expose secrets; they report singleton runtime identity, request counters, registered action IDs, and the resolved route shape currently held by the worker.
+Those endpoints are intentionally local to this experiment. They do not expose secrets; they report singleton runtime identity, request counters, registered HTTP action handler IDs, dispatchable action IDs, unhandled action/route IDs, and the resolved route shape currently held by the worker.
 Non-`GET` requests return `405`, and unknown `/_hardess/runtime/*` paths return `404`, so the admin surface does not fall through into the normal business route table.
 Admin responses currently use schema version `hardess.workerd.worker-runtime-admin.v1`.
+Action success responses currently use schema version `hardess.workerd.worker-action.v1`.
+Runtime business-error responses currently use schema version `hardess.workerd.worker-error.v1`.
 
 The resolved-model printer accepts the same input overrides as the generator:
 
@@ -171,6 +180,7 @@ The script checks:
 - `GET /`
 - `POST /echo`
 - `GET /echo` negative method check
+- `GET /ws` without upgrade header returns `426`
 - `GET /ws` websocket upgrade and echo
 - `GET /_hardess/runtime` worker runtime overview
 - `GET /_hardess/runtime/stats` worker runtime counters
@@ -216,6 +226,19 @@ That script boots `workerd` with `runtime-adapter-no-compatibility-bindings.json
 
 Both verification scripts now pick an ephemeral local port automatically, so they do not depend on `127.0.0.1:6285` being free.
 
+To lock in reachable runtime business-error contracts that are not exercised by the default root catch-all shape:
+
+```bash
+./experiment/workerd-runtime-minimal/verify-runtime-error-contracts.sh
+```
+
+That script currently verifies two valid alternate runtime shapes:
+
+- no-root assignment: unmatched path returns `404 no_route`
+- unhandled-action assignment: resolved route reaches an action declared in the protocol package but not implemented by the worker, so runtime returns `500 unhandled_action`
+
+The unhandled-action case also verifies the admin diagnostics: the action is absent from `registeredActionIds`, absent from `dispatchableActionIds`, and present in both `unhandledActionIds` and `unhandledRouteIds`.
+
 ## Verify Negative Cases
 
 ```bash
@@ -234,7 +257,8 @@ The runtime responses now also expose a small `workerRuntime` snapshot so the si
 
 ## Verification Matrix
 
-- `verify.sh`: default adapter end-to-end HTTP, WebSocket, admin overview/stats/routes, admin 405/404 guards, generated config content, resolved-model inspection, and admin response schema version
+- `verify.sh`: default adapter end-to-end HTTP, WebSocket, business-error/admin contracts, admin overview/stats/routes, admin 405/404 guards, generated config content, and resolved-model inspection
+- `verify-runtime-error-contracts.sh`: alternate valid runtime shapes that prove `no_route` and `unhandled_action` stay on the versioned runtime error contract
 - `verify-binding-matrix.sh`: all four compatibility-binding adapter variants at model/config level, including explicit checks that all split worker modules are embedded into generated `workerd` config
 - `verify-binding-runtime-matrix.sh`: the same four compatibility-binding variants at live runtime level, including admin surface and admin negative paths
 - `verify-no-compat-runtime.sh`: no-compat runtime boot path proving dispatch still works from `HARDESS_RESOLVED_RUNTIME_MODEL` alone

@@ -1,7 +1,27 @@
+import { WORKER_RUNTIME_ACTION_SCHEMA_VERSION } from "./worker-action-contract.ts";
 import { createActionHandlers } from "./worker-actions.ts";
+import { isWorkerRuntimeAdminPath } from "./worker-admin-contract.ts";
+import { WORKER_RUNTIME_ERROR_SCHEMA_VERSION } from "./worker-error-contract.ts";
 import { handleRuntimeAdmin } from "./worker-admin.ts";
 import { json } from "./worker-response.ts";
-import type { Env, ResolvedRouteEntry, RuntimeActionHandler, RuntimeStateSnapshot } from "./worker-types.ts";
+import type {
+  Env,
+  ResolvedRouteEntry,
+  RuntimeActionHandler,
+  RuntimeDispatchDiagnostics,
+  RuntimeStateSnapshot,
+} from "./worker-types.ts";
+import type {
+  WorkerRuntimeWebSocketEchoResponse,
+  WorkerRuntimeWebSocketOpenResponse,
+} from "./worker-action-contract.ts";
+import type {
+  WorkerRuntimeErrorBaseResponse,
+  WorkerRuntimeMethodNotAllowedResponse,
+  WorkerRuntimeNoRouteResponse,
+  WorkerRuntimeUnhandledActionResponse,
+  WorkerRuntimeUpgradeRequiredResponse,
+} from "./worker-error-contract.ts";
 
 function buildRuntimeKey(env: Env): string {
   return [
@@ -19,6 +39,58 @@ function buildInstanceId(env: Env): string {
   return `${env.HARDESS_ASSIGNMENT_META.assignmentId}:${shortManifestId}:${Date.now().toString(36)}`;
 }
 
+function orderedUniqueValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    if (seen.has(value)) {
+      continue;
+    }
+
+    seen.add(value);
+    result.push(value);
+  }
+
+  return result;
+}
+
+function buildDispatchDiagnostics(
+  routes: ResolvedRouteEntry[],
+  actionHandlers: Map<string, RuntimeActionHandler>,
+): RuntimeDispatchDiagnostics {
+  const registeredActionIds = Array.from(actionHandlers.keys());
+  const dispatchableActionIds = orderedUniqueValues(
+    routes
+      .filter((route) => route.actionKind === "websocket" || actionHandlers.has(route.actionId))
+      .map((route) => route.actionId),
+  );
+  const unhandledRoutes = routes.filter((route) => route.actionKind === "http" && !actionHandlers.has(route.actionId));
+
+  return {
+    registeredActionIds,
+    dispatchableActionIds,
+    unhandledActionIds: orderedUniqueValues(unhandledRoutes.map((route) => route.actionId)),
+    unhandledRouteIds: unhandledRoutes.map((route) => route.routeId),
+  };
+}
+
+function runtimeErrorBase(
+  env: Env,
+  url: URL,
+  workerRuntime: RuntimeStateSnapshot,
+): WorkerRuntimeErrorBaseResponse {
+  return {
+    ok: false,
+    schemaVersion: WORKER_RUNTIME_ERROR_SCHEMA_VERSION,
+    dispatchSource: "worker_runtime",
+    runtime: env.RUNTIME_META.runtime,
+    assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
+    path: url.pathname,
+    workerRuntime,
+  };
+}
+
 export class HardessWorkerRuntime {
   readonly runtimeName = "hardess.workerd.worker-runtime.v1" as const;
   readonly instanceId: string;
@@ -27,6 +99,7 @@ export class HardessWorkerRuntime {
 
   private readonly routes: ResolvedRouteEntry[];
   private readonly actionHandlers: Map<string, RuntimeActionHandler>;
+  private readonly dispatchDiagnostics: RuntimeDispatchDiagnostics;
   private totalRequests = 0;
   private websocketSessionCount = 0;
   private readonly routeRequestCounts = new Map<string, number>();
@@ -36,6 +109,7 @@ export class HardessWorkerRuntime {
     this.runtimeKey = buildRuntimeKey(env);
     this.routes = [...env.HARDESS_RESOLVED_RUNTIME_MODEL.routes];
     this.actionHandlers = createActionHandlers();
+    this.dispatchDiagnostics = buildDispatchDiagnostics(this.routes, this.actionHandlers);
   }
 
   canServe(env: Env): boolean {
@@ -46,14 +120,14 @@ export class HardessWorkerRuntime {
     const requestSequence = this.nextRequestSequence();
     const url = new URL(request.url);
 
-    if (url.pathname === "/_hardess/runtime" || url.pathname.startsWith("/_hardess/runtime/")) {
+    if (isWorkerRuntimeAdminPath(url.pathname)) {
       return handleRuntimeAdmin({
         request,
         env,
         url,
         requestSequence,
         routes: this.routes,
-        registeredActionIds: Array.from(this.actionHandlers.keys()),
+        dispatchDiagnostics: this.dispatchDiagnostics,
         snapshot: (sequence) => this.snapshot(sequence),
       });
     }
@@ -61,34 +135,27 @@ export class HardessWorkerRuntime {
     const route = this.matchRoute(url.pathname);
 
     if (!route) {
-      return json(
-        {
-          ok: false,
-          error: "no_route",
-          method: request.method,
-          path: url.pathname,
-          workerRuntime: this.snapshot(requestSequence),
-        },
-        { status: 404 },
-      );
+      const payload: WorkerRuntimeNoRouteResponse = {
+        ...runtimeErrorBase(env, url, this.snapshot(requestSequence)),
+        error: "no_route",
+        method: request.method,
+      };
+      return json(payload, { status: 404 });
     }
 
     const routeHitCount = this.recordRouteHit(route.routeId);
     const workerRuntime = () => this.snapshot(requestSequence, routeHitCount);
 
     if (!route.methods.includes(request.method)) {
-      return json(
-        {
-          ok: false,
-          error: "method_not_allowed",
-          routeId: route.routeId,
-          actionId: route.actionId,
-          method: request.method,
-          allowedMethods: route.methods,
-          workerRuntime: workerRuntime(),
-        },
-        { status: 405 },
-      );
+      const payload: WorkerRuntimeMethodNotAllowedResponse = {
+        ...runtimeErrorBase(env, url, workerRuntime()),
+        error: "method_not_allowed",
+        routeId: route.routeId,
+        actionId: route.actionId,
+        method: request.method,
+        allowedMethods: route.methods,
+      };
+      return json(payload, { status: 405 });
     }
 
     if (route.actionKind === "websocket") {
@@ -97,16 +164,13 @@ export class HardessWorkerRuntime {
 
     const handler = this.actionHandlers.get(route.actionId);
     if (!handler) {
-      return json(
-        {
-          ok: false,
-          error: "unhandled_action",
-          routeId: route.routeId,
-          actionId: route.actionId,
-          workerRuntime: workerRuntime(),
-        },
-        { status: 500 },
-      );
+      const payload: WorkerRuntimeUnhandledActionResponse = {
+        ...runtimeErrorBase(env, url, workerRuntime()),
+        error: "unhandled_action",
+        routeId: route.routeId,
+        actionId: route.actionId,
+      };
+      return json(payload, { status: 500 });
     }
 
     return handler({
@@ -117,6 +181,7 @@ export class HardessWorkerRuntime {
       requestSequence,
       routeHitCount,
       workerRuntime,
+      dispatchDiagnostics: this.dispatchDiagnostics,
     });
   }
 
@@ -176,47 +241,17 @@ export class HardessWorkerRuntime {
   ): Response {
     const workerRuntime = () => this.snapshot(requestSequence, routeHitCount);
 
-    if (route.actionKind !== "websocket") {
-      return json(
-        {
-          ok: false,
-          error: "websocket_action_expected",
-          routeId: route.routeId,
-          actionId: route.actionId,
-          path: url.pathname,
-          workerRuntime: workerRuntime(),
-        },
-        { status: 500 },
-      );
-    }
-
-    if (!route.websocketEnabled) {
-      return json(
-        {
-          ok: false,
-          error: "websocket_not_enabled",
-          routeId: route.routeId,
-          actionId: route.actionId,
-          path: url.pathname,
-          workerRuntime: workerRuntime(),
-        },
-        { status: 404 },
-      );
-    }
-
     const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader !== "websocket") {
-      return json(
-        {
-          ok: false,
-          error: "upgrade_required",
-          routeId: route.routeId,
-          actionId: route.actionId,
-          path: url.pathname,
-          workerRuntime: workerRuntime(),
-        },
-        { status: 426 },
-      );
+    if (upgradeHeader?.toLowerCase() !== "websocket") {
+      const payload: WorkerRuntimeUpgradeRequiredResponse = {
+        ...runtimeErrorBase(env, url, workerRuntime()),
+        error: "upgrade_required",
+        routeId: route.routeId,
+        actionId: route.actionId,
+        upgrade: "websocket",
+        receivedUpgradeHeader: upgradeHeader,
+      };
+      return json(payload, { status: 426 });
     }
 
     this.websocketSessionCount += 1;
@@ -228,33 +263,33 @@ export class HardessWorkerRuntime {
     server.accept();
     server.addEventListener("message", (event) => {
       const text = typeof event.data === "string" ? event.data : String(event.data);
-      server.send(
-        JSON.stringify({
-          ok: true,
-          type: "echo",
-          runtime: env.RUNTIME_META.runtime,
-          assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
-          routeId: route.routeId,
-          actionId: route.actionId,
-          echo: text,
-          workerRuntime: snapshot,
-        }),
-      );
-    });
-    server.addEventListener("close", (event) => {
-      server.close(event.code, event.reason);
-    });
-    server.send(
-      JSON.stringify({
+      const payload: WorkerRuntimeWebSocketEchoResponse = {
         ok: true,
-        type: "open",
+        schemaVersion: WORKER_RUNTIME_ACTION_SCHEMA_VERSION,
+        type: "echo",
         runtime: env.RUNTIME_META.runtime,
         assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
         routeId: route.routeId,
         actionId: route.actionId,
+        echo: text,
         workerRuntime: snapshot,
-      }),
-    );
+      };
+      server.send(JSON.stringify(payload));
+    });
+    server.addEventListener("close", (event) => {
+      server.close(event.code, event.reason);
+    });
+    const openPayload: WorkerRuntimeWebSocketOpenResponse = {
+      ok: true,
+      schemaVersion: WORKER_RUNTIME_ACTION_SCHEMA_VERSION,
+      type: "open",
+      runtime: env.RUNTIME_META.runtime,
+      assignmentId: env.HARDESS_ASSIGNMENT_META.assignmentId,
+      routeId: route.routeId,
+      actionId: route.actionId,
+      workerRuntime: snapshot,
+    };
+    server.send(JSON.stringify(openPayload));
 
     return new Response(null, {
       status: 101,

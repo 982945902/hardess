@@ -1,0 +1,14 @@
+{
+  "packageId": "workerd-http-ingress-unhandled@v1",
+  "protocol": "workerd-http-ingress",
+  "version": "v1",
+  "actions": [
+    {
+      "actionId": "http.unhandled",
+      "kind": "http",
+      "methods": [
+        "GET"
+      ]
+    }
+  ]
+}

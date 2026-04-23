@@ -66,6 +66,8 @@ run_case() {
   grep -q 'HARDESS_RESOLVED_RUNTIME_MODEL' "$generated_config"
   grep -q 'name = "worker.ts"' "$generated_config"
   grep -q 'name = "worker-runtime.ts"' "$generated_config"
+  grep -q 'name = "worker-action-contract.ts"' "$generated_config"
+  grep -q 'name = "worker-error-contract.ts"' "$generated_config"
   grep -q 'name = "worker-admin.ts"' "$generated_config"
   grep -q 'name = "worker-admin-contract.ts"' "$generated_config"
   grep -q 'name = "worker-actions.ts"' "$generated_config"
