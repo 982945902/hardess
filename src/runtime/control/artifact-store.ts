@@ -11,7 +11,7 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 type PrepareRunner = (command: string, args: string[], options: { cwd: string }) => Promise<void>;
 
 interface PreparedArtifactInputMetadata {
-  kind: "worker" | "workerDirectory" | "projectFile";
+  kind: "worker" | "workerDirectory" | "workerArchive" | "projectFile";
   logicalName?: string;
   sourceRef: string;
   targetPath: string;
@@ -86,6 +86,10 @@ export class ArtifactStore {
       if (input.kind === "workerDirectory") {
         await rm(input.targetPath, { recursive: true, force: true });
         await cp(resolveLocalSourcePath(input.sourceRef), input.targetPath, { recursive: true });
+        continue;
+      }
+      if (input.kind === "workerArchive") {
+        await this.extractArchiveSource(input.sourceRef, input.targetPath, digest);
         continue;
       }
       const source = await this.readSource(input.sourceRef);
@@ -168,6 +172,10 @@ export class ArtifactStore {
         await cp(resolveLocalSourcePath(input.sourceRef), input.targetPath, { recursive: true });
         continue;
       }
+      if (input.kind === "workerArchive") {
+        await this.extractArchiveSource(input.sourceRef, input.targetPath, digest);
+        continue;
+      }
       const source = await this.readSource(input.sourceRef);
       if (input.kind === "worker") {
         verifyDigest(source, digest);
@@ -226,7 +234,17 @@ export class ArtifactStore {
     inputs: Array<PreparedArtifactInputMetadata>;
   }> {
     const sourceIsDirectory = await isDirectorySourceRef(input.sourceUri);
-    const inputs: PreparedArtifactInputMetadata[] = sourceIsDirectory
+    const sourceIsArchive = isArchiveSourceRef(input.sourceUri);
+    const inputs: PreparedArtifactInputMetadata[] = sourceIsArchive
+      ? [
+          {
+            kind: "workerArchive",
+            sourceRef: input.sourceUri,
+            targetPath: input.artifactDir,
+            fingerprint: await computeSourceFingerprint(input.sourceUri)
+          }
+        ]
+      : sourceIsDirectory
       ? [
           {
             kind: "workerDirectory",
@@ -244,7 +262,7 @@ export class ArtifactStore {
           }
         ];
 
-    if (!sourceIsDirectory) {
+    if (!sourceIsDirectory && !sourceIsArchive) {
       for (const projectFile of listProjectFiles(input.packageManager, input.artifactDir, input.sourceUri)) {
         inputs.push({
           kind: "projectFile",
@@ -415,6 +433,37 @@ export class ArtifactStore {
     }
 
     return await readFile(resolve(sourceUri), "utf8");
+  }
+
+  private async readSourceBytes(sourceUri: string): Promise<Buffer> {
+    if (sourceUri.startsWith("http://") || sourceUri.startsWith("https://")) {
+      const response = await this.fetchFn(sourceUri);
+      if (!response.ok) {
+        throw new Error(
+          `Artifact fetch failed: ${response.status} ${response.statusText}`.trim()
+        );
+      }
+      return Buffer.from(await response.arrayBuffer());
+    }
+
+    if (sourceUri.startsWith("file://")) {
+      return await readFile(new URL(sourceUri));
+    }
+
+    return await readFile(resolve(sourceUri));
+  }
+
+  private async extractArchiveSource(sourceUri: string, artifactDir: string, digest?: string): Promise<void> {
+    const archive = await this.readSourceBytes(sourceUri);
+    verifyDigest(archive, digest);
+    await rm(artifactDir, { recursive: true, force: true });
+    await mkdir(artifactDir, { recursive: true });
+    const archivePath = join(artifactDir, ".artifact-source.tgz");
+    await writeFile(archivePath, archive);
+    await this.prepareRunner("tar", ["-xzf", archivePath, "-C", artifactDir], {
+      cwd: artifactDir
+    });
+    await rm(archivePath, { force: true });
   }
 }
 
@@ -603,7 +652,7 @@ function canReusePreparedInput(
   workerDigest?: string
 ): boolean {
   if (isRemoteSourceRef(stagedInput.sourceRef)) {
-    return stagedInput.kind === "worker" && Boolean(workerDigest);
+    return (stagedInput.kind === "worker" && Boolean(workerDigest)) || stagedInput.kind === "workerArchive";
   }
 
   return stagedInput.fingerprint !== undefined && stagedInput.fingerprint === cachedInput.fingerprint;
@@ -614,12 +663,24 @@ async function computeSourceFingerprint(sourceRef: string): Promise<string | und
     return undefined;
   }
 
+  if (isArchiveSourceRef(sourceRef)) {
+    const source = await readFile(resolveLocalSourcePath(sourceRef));
+    return createHash("sha256").update(source).digest("hex");
+  }
+
   const sourceStat = await stat(resolveLocalSourcePath(sourceRef));
   return `${sourceStat.size}:${sourceStat.mtimeMs}`;
 }
 
 function isRemoteSourceRef(sourceRef: string): boolean {
   return sourceRef.startsWith("http://") || sourceRef.startsWith("https://");
+}
+
+function isArchiveSourceRef(sourceRef: string): boolean {
+  const pathname = sourceRef.startsWith("http://") || sourceRef.startsWith("https://") || sourceRef.startsWith("file://")
+    ? new URL(sourceRef).pathname
+    : sourceRef;
+  return pathname.endsWith(".tgz") || pathname.endsWith(".tar.gz");
 }
 
 async function isDirectorySourceRef(sourceRef: string): Promise<boolean> {
@@ -643,7 +704,7 @@ function sanitizePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
-function verifyDigest(source: string, digest?: string): void {
+function verifyDigest(source: string | Uint8Array, digest?: string): void {
   if (!digest) {
     return;
   }

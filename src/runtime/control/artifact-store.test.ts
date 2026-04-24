@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -102,6 +103,27 @@ function createServiceModuleManifest(sourceUri: string): ArtifactManifest {
   };
 }
 
+async function runCommand(command: string, args: string[], cwd: string): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", rejectPromise);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolvePromise();
+        return;
+      }
+      rejectPromise(new Error(stderr.trim() || `${command} exited with ${code}`));
+    });
+  });
+}
+
 describe("ArtifactStore", () => {
   it("stages a file-backed worker artifact into the local cache", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-"));
@@ -162,6 +184,49 @@ describe("ArtifactStore", () => {
     expect(result.localEntry.endsWith("src/main.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain("./message");
     expect(await readFile(join(result.localEntry, "../message.ts"), "utf8")).toContain("from-dir");
+  });
+
+  it("stages a packaged serve archive into the local cache", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-archive-"));
+    cleanupPaths.push(dir);
+
+    const sourceDir = join(dir, "serve");
+    await mkdir(join(sourceDir, "src"), { recursive: true });
+    await writeFile(
+      join(sourceDir, "src/main.ts"),
+      `import { message } from "./message"; export default { fetch() { return new Response(message); } };`,
+      "utf8"
+    );
+    await writeFile(join(sourceDir, "src/message.ts"), `export const message = "from-archive";`, "utf8");
+    const archivePath = join(dir, "serve.tgz");
+    await runCommand("tar", ["-czf", archivePath, "-C", sourceDir, "."], dir);
+
+    const store = new ArtifactStore({
+      rootDir: join(dir, "cache")
+    });
+    const assignment: Assignment = {
+      ...createAssignment(archivePath),
+      deploymentKind: "serve",
+      serveApp: {
+        name: "personnel-serve",
+        entry: "src/main.ts",
+        routeRefs: ["route-a"]
+      },
+      httpWorker: undefined
+    };
+
+    const result = await store.stageHttpWorker(assignment, {
+      ...createManifest(`file://${archivePath}`),
+      artifactKind: "serve",
+      source: {
+        uri: `file://${archivePath}`
+      },
+      entry: "src/main.ts"
+    });
+
+    expect(result.localEntry.endsWith("src/main.ts")).toBe(true);
+    expect(await readFile(result.localEntry, "utf8")).toContain("./message");
+    expect(await readFile(join(result.localEntry, "../message.ts"), "utf8")).toContain("from-archive");
   });
 
   it("stages a file-backed service module artifact into the local cache", async () => {
