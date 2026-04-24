@@ -8,7 +8,7 @@ import {
   buildPlacementCandidateHosts,
   buildMembershipSnapshot,
   buildPlacementSnapshot,
-  buildDeploymentRolloutSummary,
+  buildRuntimeSummaryReadModel,
   buildHttpWorkerArtifactManifest,
   normalizeReplicaCount,
   planHttpWorkerDeploymentOwners,
@@ -24,7 +24,8 @@ import {
   type DesiredHostState,
   type HostRegistration,
   type HttpWorkerDeploymentPlan,
-  type PlacementCandidateHost
+  type PlacementCandidateHost,
+  type RuntimeSummaryCheck
 } from "../sdk/index.ts";
 
 declare const Bun: {
@@ -147,6 +148,10 @@ export async function createDemoAdminApp(
         if (url.pathname === "/__admin/mock/state") {
           return jsonResponse(buildMockStateSnapshot(transport, manifests, rolloutState));
         }
+
+        if (url.pathname === "/__admin/mock/runtime-summary") {
+          return jsonResponse(buildMockRuntimeSummarySnapshot(transport));
+        }
       }
 
       if (request.method !== "POST") {
@@ -267,6 +272,11 @@ export async function createDemoAdminApp(
           }
           return jsonResponse(
             await transport.request(ADMIN_TRANSPORT_OPERATIONS.FETCH_ARTIFACT_MANIFEST, payload)
+          );
+        }
+        case "/v1/admin/read/runtime-summary": {
+          return jsonResponse(
+            await transport.request(ADMIN_TRANSPORT_OPERATIONS.GET_RUNTIME_SUMMARY_READ_MODEL, payload)
           );
         }
         default:
@@ -552,6 +562,18 @@ function buildMockStateSnapshot(
   registeredHosts: ReturnType<MockAdminTransport["listRegisteredHosts"]>;
   desiredHostStates: DesiredHostState[];
   observedHostStates: Exclude<ReturnType<MockAdminTransport["getObservedHostState"]>, undefined>[];
+  runtimeSummaries: Array<{
+    hostId: string;
+    runtimeSummary: unknown;
+  }>;
+  runtimeSummaryChecks: RuntimeSummaryCheck[];
+  runtimeSummaryRollup: {
+    totalHosts: number;
+    reportedHosts: number;
+    matchingHosts: number;
+    driftedHosts: number;
+    notReportedHosts: number;
+  };
   artifactManifests: ArtifactManifest[];
   topology: DesiredTopology;
   rolloutState: DemoRolloutState;
@@ -564,6 +586,19 @@ function buildMockStateSnapshot(
   const observedHostStates = registeredHosts
     .map((host) => transport.getObservedHostState(host.hostId))
     .filter((value): value is Exclude<typeof value, undefined> => value !== undefined);
+  const runtimeSummaries = observedHostStates.flatMap((observed) => {
+    const runtimeSummary =
+      observed.dynamicState.runtimeSummary ?? observed.dynamicState.dynamicFields?.runtimeSummary;
+    if (runtimeSummary === undefined) {
+      return [];
+    }
+    return [
+      {
+        hostId: observed.hostId,
+        runtimeSummary
+      }
+    ];
+  });
   const topology = desiredHostStates[0]?.topology ?? {
     membership: buildMembershipSnapshot({
       revision: `topology:${rolloutState.revisionToken}:membership`,
@@ -575,16 +610,30 @@ function buildMockStateSnapshot(
       desiredHostStates
     })
   };
+  const runtimeSummaryReadModel = buildRuntimeSummaryReadModel(desiredHostStates, observedHostStates);
 
   return {
     registeredHosts,
     desiredHostStates,
     observedHostStates,
+    runtimeSummaries,
+    runtimeSummaryChecks: runtimeSummaryReadModel.checks,
+    runtimeSummaryRollup: runtimeSummaryReadModel.rollup,
     artifactManifests: manifests,
     topology,
     rolloutState: { ...rolloutState },
-    rolloutSummary: buildDeploymentRolloutSummary(desiredHostStates, observedHostStates)
+    rolloutSummary: runtimeSummaryReadModel.rolloutSummary
   };
+}
+
+function buildMockRuntimeSummarySnapshot(transport: MockAdminTransport) {
+  const desiredHostStates = transport.listRegisteredHosts().map((host) =>
+    transport.getDesiredHostStateSnapshot(host.hostId)
+  );
+  const observedHostStates = transport.listRegisteredHosts()
+    .map((host) => transport.getObservedHostState(host.hostId))
+    .filter((value): value is Exclude<typeof value, undefined> => value !== undefined);
+  return buildRuntimeSummaryReadModel(desiredHostStates, observedHostStates);
 }
 
 interface DemoDeploymentRolloutSummary extends DeploymentRolloutSummary {
@@ -593,6 +642,10 @@ interface DemoDeploymentRolloutSummary extends DeploymentRolloutSummary {
 
 interface DemoDeploymentRolloutHostStatus extends DeploymentRolloutHostStatus {
   observedState?: "pending" | "preparing" | "ready" | "active" | "draining" | "failed" | "missing";
+  runtimeSummaryReported?: boolean;
+  runtimeSummaryStatus?: "match" | "drift" | "not_reported";
+  runtimeSummaryMissingIds?: string[];
+  runtimeSummaryUnexpectedIds?: string[];
 }
 
 function reseedAllDesiredHostStates(

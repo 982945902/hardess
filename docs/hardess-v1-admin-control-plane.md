@@ -511,6 +511,7 @@ Better direction:
 - `getDesiredHostState(hostId)`
 - `reportObservedHostState(...)`
 - `fetchArtifact(...)`
+- `getRuntimeSummaryReadModel({ hostId?, deploymentId? })`
 
 That keeps the runtime in a reconcile loop:
 
@@ -519,6 +520,8 @@ That keeps the runtime in a reconcile loop:
 3. prepare next local generation
 4. activate and drain
 5. report observed host state
+6. inspect read models for drift and rollout convergence, optionally scoped to
+   one host, one deployment, or both
 
 This is important because one host may eventually run:
 

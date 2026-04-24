@@ -297,6 +297,7 @@ Purpose:
 - let admin know whether assignments are healthy
 - support scheduling decisions
 - support rollout progress and rollback decisions
+- optionally carry compact runtime-native summaries in `dynamic_fields`, for example metrics rollups or a pipeline/protocol-package summary of the currently applied runtime state
 
 Recommended shape:
 
@@ -324,6 +325,17 @@ type ObservedHostState = {
       placement_revision?: string;
     };
     resource_hints?: Record<string, number>;
+    runtime_summary?: {
+      pipeline_count: number;
+      pipelines: Array<{
+        pipeline_id: string;
+        match_prefix: string;
+      }>;
+      active_protocol_packages: Array<{
+        package_id: string;
+        digest: string;
+      }>;
+    };
     dynamic_fields?: Record<string, unknown>;
   };
   assignment_statuses: Array<{
@@ -469,6 +481,36 @@ fetchArtifactManifest(input: {
 }): ArtifactManifest
 ```
 
+### 10.6 Get runtime summary read model
+
+```ts
+getRuntimeSummaryReadModel(input: {
+  host_id?: string;
+  deployment_id?: string;
+}): {
+  checks: RuntimeSummaryCheck[];
+  rollup: RuntimeSummaryRollup;
+  rollout_summary: DeploymentRolloutSummary[];
+}
+```
+
+This is a read-side admin API. It compares desired host state with observed
+runtime summaries and separates three states:
+
+- `match`: runtime reported and all expected runtime ids matched
+- `drift`: runtime reported but missing or unexpected runtime ids exist
+- `not_reported`: runtime did not report a summary for expected runtime ids
+
+When `host_id` is provided, the read model is scoped to that host. When
+`deployment_id` is provided, desired assignments, observed assignment statuses,
+and runtime pipeline ids are scoped to that deployment before checks and rollout
+summaries are computed. The two filters can be combined. Hosts without expected
+runtime ids can still be `match` even if they did not report a runtime summary.
+Runtime-produced service-module protocol package summaries should include
+`assignment_id`, `deployment_id`, and `declared_version` when available so
+deployment-scoped checks can attribute protocol readiness without guessing from
+`package_id` alone.
+
 ## 11. Baseline HTTP Binding
 
 The first concrete transport can be a simple JSON-over-HTTP binding.
@@ -480,6 +522,7 @@ Recommended `v1` paths:
 - `POST /v1/admin/hosts/desired`
 - `POST /v1/admin/hosts/observed`
 - `POST /v1/admin/artifacts/manifest`
+- `POST /v1/admin/read/runtime-summary`
 
 Recommended baseline behavior:
 

@@ -11,6 +11,8 @@ import type {
   HeartbeatHostResult,
   HostRegistration,
   ObservedHostState,
+  RuntimeSummaryReadModel,
+  RuntimeSummaryReadModelQuery,
   RegisterHostResult,
   ReportObservedHostStateResult
 } from "./admin-types.ts";
@@ -28,12 +30,45 @@ const assignmentObservedStateSchema = z.enum([
   "draining",
   "failed"
 ]);
+const runtimeSummaryStatusSchema = z.enum(["match", "drift", "not_reported"]);
 
 const hostStaticCapacitySchema = z.object({
   maxHttpWorkerAssignments: z.number().int().nonnegative().optional(),
   maxServiceModuleAssignments: z.number().int().nonnegative().optional(),
   maxConnections: z.number().int().nonnegative().optional(),
   maxInflightRequests: z.number().int().nonnegative().optional()
+});
+
+const runtimeSummaryPipelineViewSchema = z.object({
+  pipelineId: z.string().min(1, "runtimeSummary.pipelines[].pipelineId is required"),
+  matchPrefix: z.string().min(1, "runtimeSummary.pipelines[].matchPrefix is required"),
+  groupId: z.string().min(1).optional(),
+  authRequired: z.boolean(),
+  downstreamOrigin: z.string().url("runtimeSummary.pipelines[].downstreamOrigin must be a valid absolute URL"),
+  downstreamConnectTimeoutMs: z.number().int().nonnegative(),
+  downstreamResponseTimeoutMs: z.number().int().nonnegative(),
+  websocketEnabled: z.boolean(),
+  workerConfigured: z.boolean(),
+  workerEntry: z.string().min(1).optional(),
+  workerTimeoutMs: z.number().int().nonnegative().optional(),
+  deploymentInstanceKey: z.string().min(1).optional(),
+  deploymentConfigKeys: z.array(z.string().min(1)).optional(),
+  deploymentBindingKeys: z.array(z.string().min(1)).optional(),
+  deploymentSecretCount: z.number().int().nonnegative().optional()
+});
+
+const runtimeSummaryViewSchema = z.object({
+  pipelineCount: z.number().int().nonnegative(),
+  pipelines: z.array(runtimeSummaryPipelineViewSchema),
+  activeProtocolPackages: z.array(
+    z.object({
+      packageId: z.string().min(1, "runtimeSummary.activeProtocolPackages[].packageId is required"),
+      digest: z.string().min(1, "runtimeSummary.activeProtocolPackages[].digest is required"),
+      assignmentId: z.string().min(1).optional(),
+      deploymentId: z.string().min(1).optional(),
+      declaredVersion: z.string().min(1).optional()
+    })
+  )
 });
 
 export const hostRegistrationSchema = z.object({
@@ -128,7 +163,10 @@ const serviceModuleProtocolPackageSchema = z.object({
 
 const serviceModuleProtocolPackageRefSchema = z.object({
   packageId: z.string().min(1, "placement.ingressGroupRequirements.requiredProtocolPackages.packageId is required"),
-  digest: z.string().min(1, "placement.ingressGroupRequirements.requiredProtocolPackages.digest is required")
+  digest: z.string().min(1, "placement.ingressGroupRequirements.requiredProtocolPackages.digest is required"),
+  assignmentId: z.string().min(1).optional(),
+  deploymentId: z.string().min(1).optional(),
+  declaredVersion: z.string().min(1).optional()
 });
 
 const serviceModuleAssignmentSchema = z.object({
@@ -334,6 +372,7 @@ export const observedHostStateSchema = z.object({
       placementRevision: z.string().min(1).optional()
     }).optional(),
     resourceHints: numberRecordSchema.optional(),
+    runtimeSummary: runtimeSummaryViewSchema.optional(),
     dynamicFields: unknownRecordSchema.optional()
   }),
   assignmentStatuses: z.array(
@@ -435,6 +474,69 @@ export const artifactManifestQuerySchema = z.object({
   manifestId: z.string().min(1, "manifestId is required")
 });
 
+export const runtimeSummaryCheckSchema = z.object({
+  hostId: z.string().min(1, "hostId is required"),
+  status: runtimeSummaryStatusSchema,
+  reported: z.boolean(),
+  matches: z.boolean(),
+  expectedPipelineIds: z.array(z.string().min(1)),
+  observedPipelineIds: z.array(z.string().min(1)),
+  missingPipelineIds: z.array(z.string().min(1)),
+  unexpectedPipelineIds: z.array(z.string().min(1)),
+  expectedProtocolPackageIds: z.array(z.string().min(1)),
+  observedProtocolPackageIds: z.array(z.string().min(1)),
+  missingProtocolPackageIds: z.array(z.string().min(1)),
+  unexpectedProtocolPackageIds: z.array(z.string().min(1))
+});
+
+export const runtimeSummaryRollupSchema = z.object({
+  totalHosts: z.number().int().nonnegative(),
+  reportedHosts: z.number().int().nonnegative(),
+  matchingHosts: z.number().int().nonnegative(),
+  driftedHosts: z.number().int().nonnegative(),
+  notReportedHosts: z.number().int().nonnegative()
+});
+
+export const runtimeSummaryReadModelRolloutHostStatusSchema = z.object({
+  hostId: z.string().min(1, "hostId is required"),
+  desiredAssignmentId: z.string().min(1).optional(),
+  desiredVersion: z.string().min(1).optional(),
+  observedState: assignmentObservedStateSchema.or(z.literal("missing")).optional(),
+  observedGenerationId: z.string().min(1).optional(),
+  runtimeSummaryReported: z.boolean().optional(),
+  runtimeSummaryStatus: runtimeSummaryStatusSchema.optional(),
+  runtimeSummaryMissingIds: z.array(z.string().min(1)).optional(),
+  runtimeSummaryUnexpectedIds: z.array(z.string().min(1)).optional(),
+  lastError: z.object({
+    code: z.string().min(1, "lastError.code is required"),
+    message: z.string().min(1, "lastError.message is required"),
+    retryable: z.boolean().optional()
+  }).optional()
+});
+
+export const runtimeSummaryReadModelDeploymentRolloutSummarySchema = z.object({
+  deploymentId: z.string().min(1, "deploymentId is required"),
+  desiredHosts: z.number().int().nonnegative(),
+  activeHosts: z.number().int().nonnegative(),
+  readyHosts: z.number().int().nonnegative(),
+  preparingHosts: z.number().int().nonnegative(),
+  drainingHosts: z.number().int().nonnegative(),
+  failedHosts: z.number().int().nonnegative(),
+  pendingHosts: z.number().int().nonnegative(),
+  hosts: z.array(runtimeSummaryReadModelRolloutHostStatusSchema)
+});
+
+export const runtimeSummaryReadModelSchema = z.object({
+  checks: z.array(runtimeSummaryCheckSchema),
+  rollup: runtimeSummaryRollupSchema,
+  rolloutSummary: z.array(runtimeSummaryReadModelDeploymentRolloutSummarySchema)
+});
+
+export const runtimeSummaryReadModelQuerySchema = z.object({
+  hostId: z.string().min(1, "hostId is required").optional(),
+  deploymentId: z.string().min(1, "deploymentId is required").optional()
+}).strict();
+
 function parseWithSchema<T>(schema: z.ZodType<T>, value: unknown, message: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
@@ -493,4 +595,16 @@ export function parseReportObservedHostStateResult(value: unknown): ReportObserv
 
 export function parseArtifactManifestQuery(value: unknown): ArtifactManifestQuery {
   return parseWithSchema(artifactManifestQuerySchema, value, "Invalid ArtifactManifestQuery");
+}
+
+export function parseRuntimeSummaryReadModel(value: unknown): RuntimeSummaryReadModel {
+  return parseWithSchema(runtimeSummaryReadModelSchema, value, "Invalid RuntimeSummaryReadModel");
+}
+
+export function parseRuntimeSummaryReadModelQuery(value: unknown): RuntimeSummaryReadModelQuery {
+  return parseWithSchema(
+    runtimeSummaryReadModelQuerySchema,
+    value,
+    "Invalid RuntimeSummaryReadModelQuery"
+  );
 }

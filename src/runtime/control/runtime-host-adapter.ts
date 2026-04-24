@@ -10,6 +10,7 @@ import type {
 import type { ConfigStore } from "../config/store.ts";
 import type { Logger } from "../observability/logger.ts";
 import type { Metrics, MetricsSnapshot, MetricsSnapshotProvider } from "../observability/metrics.ts";
+import { buildRuntimeSummaryView } from "../runtime-summary.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import type { HostRuntimeAdapter } from "./host-agent.ts";
 import type { ServiceModuleManager } from "./service-module-manager.ts";
@@ -193,6 +194,10 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
   collectObservedHostState(): ObservedHostState {
     const state = this.options.app.runtimeState();
     const metricsSummary = summarizeMetrics(this.options.app.metrics);
+    const runtimeSummary = buildRuntimeSummaryView({
+      config: this.options.configStore.getConfig(),
+      activeProtocolPackages: this.options.serviceModuleManager?.listActiveProtocolPackages?.() ?? []
+    });
     const assignments = this.lastDesired?.assignments ?? [];
     const drainingAssignments = this.options.serviceModuleManager?.listDrainingAssignments?.() ?? [];
     const assignmentStatuses = assignments.map((assignment) => {
@@ -243,6 +248,7 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
           membershipRevision: this.lastDesired?.topology?.membership.revision,
           placementRevision: this.lastDesired?.topology?.placement.revision
         },
+        runtimeSummary,
         dynamicFields: {
           uptimeMs: state.uptimeMs,
           disposed: state.disposed,

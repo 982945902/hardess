@@ -8,7 +8,9 @@ import {
   parseAssignment,
   parseDesiredHostState,
   parseHostRegistration,
-  parseObservedHostState
+  parseObservedHostState,
+  parseRuntimeSummaryReadModel,
+  parseRuntimeSummaryReadModelQuery
 } from "./admin-schema.ts";
 
 describe("admin protocol schemas", () => {
@@ -326,6 +328,32 @@ describe("admin protocol schemas", () => {
         resourceHints: {
           cpu: 0.4
         },
+        runtimeSummary: {
+          pipelineCount: 1,
+          pipelines: [
+            {
+              pipelineId: "assign-http-1:route-a",
+              matchPrefix: "/demo",
+              authRequired: true,
+              downstreamOrigin: "https://upstream.example",
+              downstreamConnectTimeoutMs: 1000,
+              downstreamResponseTimeoutMs: 5000,
+              websocketEnabled: false,
+              workerConfigured: true,
+              workerEntry: "workers/demo-worker.ts",
+              workerTimeoutMs: 50
+            }
+          ],
+          activeProtocolPackages: [
+            {
+              packageId: "chat@1.0",
+              digest: "sha256:chat",
+              assignmentId: "assign-ws-1",
+              deploymentId: "deploy-ws",
+              declaredVersion: "ws-v1"
+            }
+          ]
+        },
         dynamicFields: {
           degraded: false
         }
@@ -368,6 +396,7 @@ describe("admin protocol schemas", () => {
 
     expect(observed.assignmentStatuses[0]?.state).toBe("active");
     expect(observed.dynamicState.appliedTopology?.membershipRevision).toBe("topology:42:membership");
+    expect(observed.dynamicState.runtimeSummary?.pipelineCount).toBe(1);
     expect(manifest.packageManager.kind).toBe("bun");
   });
 
@@ -389,5 +418,74 @@ describe("admin protocol schemas", () => {
     });
 
     expect(manifest.packageManager.kind).toBe("deno");
+  });
+
+  it("parses a runtime summary read model", () => {
+    expect(parseRuntimeSummaryReadModelQuery({})).toEqual({});
+    expect(parseRuntimeSummaryReadModelQuery({ hostId: "host-a" })).toEqual({ hostId: "host-a" });
+    expect(parseRuntimeSummaryReadModelQuery({ deploymentId: "deployment:shared" })).toEqual({
+      deploymentId: "deployment:shared"
+    });
+    expect(parseRuntimeSummaryReadModelQuery({ hostId: "host-a", deploymentId: "deployment:shared" })).toEqual({
+      hostId: "host-a",
+      deploymentId: "deployment:shared"
+    });
+    expect(() => parseRuntimeSummaryReadModelQuery({ groupId: "group-a" })).toThrow(
+      "Invalid RuntimeSummaryReadModelQuery"
+    );
+
+    const readModel = parseRuntimeSummaryReadModel({
+      checks: [
+        {
+          hostId: "host-a",
+          status: "drift",
+          reported: true,
+          matches: false,
+          expectedPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+          observedPipelineIds: ["assign:host-a:deployment:shared:/demo/shared"],
+          missingPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+          unexpectedPipelineIds: ["assign:host-a:deployment:shared:/demo/shared"],
+          expectedProtocolPackageIds: [],
+          observedProtocolPackageIds: [],
+          missingProtocolPackageIds: [],
+          unexpectedProtocolPackageIds: []
+        }
+      ],
+      rollup: {
+        totalHosts: 1,
+        reportedHosts: 1,
+        matchingHosts: 0,
+        driftedHosts: 1,
+        notReportedHosts: 0
+      },
+      rolloutSummary: [
+        {
+          deploymentId: "deployment:shared",
+          desiredHosts: 1,
+          activeHosts: 1,
+          readyHosts: 0,
+          preparingHosts: 0,
+          drainingHosts: 0,
+          failedHosts: 0,
+          pendingHosts: 0,
+          hosts: [
+            {
+              hostId: "host-a",
+              desiredAssignmentId: "assign:host-a:deployment:shared",
+              desiredVersion: "shared/v1",
+              observedState: "active",
+              runtimeSummaryReported: true,
+              runtimeSummaryStatus: "drift",
+              runtimeSummaryMissingIds: ["assign:host-a:deployment:shared:route:shared"],
+              runtimeSummaryUnexpectedIds: ["assign:host-a:deployment:shared:/demo/shared"]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(readModel.rollup.driftedHosts).toBe(1);
+    expect(readModel.checks[0]?.status).toBe("drift");
+    expect(readModel.rolloutSummary[0]?.hosts[0]?.runtimeSummaryStatus).toBe("drift");
   });
 });

@@ -149,9 +149,14 @@ export class ServiceModuleManager {
     return Array.from(this.activeByAssignmentId.values())
       .map((active) => ({
         packageId: active.packageId,
-        digest: active.digest
+        digest: active.digest,
+        assignmentId: active.assignmentId,
+        deploymentId: active.deploymentId,
+        declaredVersion: active.declaredVersion
       }))
-      .sort((left, right) => left.packageId.localeCompare(right.packageId));
+      .sort((left, right) =>
+        left.packageId.localeCompare(right.packageId) || left.assignmentId.localeCompare(right.assignmentId)
+      );
   }
 
   private async prepareAssignments(input: {

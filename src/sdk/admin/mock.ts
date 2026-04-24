@@ -1,4 +1,6 @@
 import {
+  parseRuntimeSummaryReadModel,
+  parseRuntimeSummaryReadModelQuery,
   parseArtifactManifest,
   parseArtifactManifestQuery,
   parseDesiredHostState,
@@ -9,8 +11,10 @@ import {
   type ArtifactManifest,
   type DesiredHostState,
   type HostRegistration,
-  type ObservedHostState
+  type ObservedHostState,
+  type RuntimeSummaryReadModel
 } from "../../shared/index.ts";
+import { buildRuntimeSummaryReadModel } from "./planning.ts";
 import {
   ADMIN_TRANSPORT_OPERATIONS,
   type AdminTransport,
@@ -50,6 +54,8 @@ export class MockAdminTransport implements AdminTransport {
         return this.handleReportObservedHostState(payload);
       case ADMIN_TRANSPORT_OPERATIONS.FETCH_ARTIFACT_MANIFEST:
         return this.handleFetchArtifactManifest(payload);
+      case ADMIN_TRANSPORT_OPERATIONS.GET_RUNTIME_SUMMARY_READ_MODEL:
+        return this.handleGetRuntimeSummaryReadModel(payload);
       default:
         throw new Error(`Unsupported admin operation: ${operation satisfies never}`);
     }
@@ -144,6 +150,19 @@ export class MockAdminTransport implements AdminTransport {
       throw new Error(`Artifact manifest not found: ${query.manifestId}`);
     }
     return manifest;
+  }
+
+  private handleGetRuntimeSummaryReadModel(payload: unknown): RuntimeSummaryReadModel {
+    const query = parseRuntimeSummaryReadModelQuery(payload);
+    const desiredHostStates = Array.from(this.desiredHostStates.values());
+    const observedHostStates = Array.from(this.observedHostStates.values());
+    return parseRuntimeSummaryReadModel(
+      buildRuntimeSummaryReadModel(
+        desiredHostStates,
+        observedHostStates,
+        query
+      )
+    );
   }
 
   private ensureDesiredHostState(hostId: string): DesiredHostState {

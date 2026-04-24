@@ -233,6 +233,8 @@ The mock admin serves:
 - `GET /artifacts/package.json`
 - `GET /artifacts/bun.lock`
 - `GET /__admin/mock/state`
+- `GET /__admin/mock/runtime-summary`
+- `POST /v1/admin/read/runtime-summary`
 - `POST /__admin/mock/rollouts/shared-deployment`
 
 Current fixed control-plane shape:
@@ -270,6 +272,15 @@ Current fixed control-plane shape:
   previous owner after the replacement host reports `ready` or `active`
 - rollout progress is derived from `ObservedHostState.assignmentStatuses`, so the mock state page can show "desired but not yet active" hosts during convergence
 - scale-down progress is also visible there, including the "no longer desired but still draining" phase on the removed host
+- if runtime reports `ObservedHostState.dynamicState.runtimeSummary`, the mock state page also lifts that into a top-level `runtimeSummaries[]` view so operators can inspect the currently applied pipelines / protocol packages without digging through each host's raw observed payload; protocol package entries produced by runtime include assignment/deployment metadata when available
+- `GET /__admin/mock/runtime-summary` exposes the read model directly for local inspection, while `POST /v1/admin/read/runtime-summary` exposes the same contract through the admin API shape that `HardessAdminClient` can consume; the admin API accepts optional `{ "hostId": "...", "deploymentId": "..." }` scoping, and the filters can be combined
+- the same mock state page now also emits `runtimeSummaryChecks[]`, which compares each host's desired pipelines / protocol packages against the reported runtime summary and highlights `missing*` / `unexpected*` entries directly
+- for quick scanning, the page also emits `runtimeSummaryRollup` with total / reported / matching / drifted / not-reported host counts
+- `runtimeSummaryChecks[].status` and `rolloutSummary.hosts[].runtimeSummaryStatus` now use the same semantics:
+  `match` means runtime reported and all expected ids matched,
+  `drift` means runtime reported but `missing*` or `unexpected*` ids exist,
+  `not_reported` means no runtime summary was reported for a host that still has expected runtime ids
+- the per-deployment `rolloutSummary.hosts[]` entries now also carry `runtimeSummaryReported` plus that `runtimeSummaryStatus`, so rollout debugging can distinguish assignment-state convergence from runtime-apply drift
 
 This is intentionally still small. The point is to make the `v1` boundary concrete:
 

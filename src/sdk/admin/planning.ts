@@ -7,7 +7,12 @@ import type {
   MembershipHostState,
   MembershipSnapshot,
   PlacementIngressGroupRequirement,
-  ObservedHostState
+  ObservedHostState,
+  RuntimeSummaryCheck,
+  RuntimeSummaryReadModel,
+  RuntimeSummaryReadModelQuery,
+  RuntimeSummaryRollup,
+  RuntimeSummaryStatus
 } from "../../shared/index.ts";
 import type { PlacementSnapshot } from "../../shared/index.ts";
 import {
@@ -89,6 +94,10 @@ export interface DeploymentRolloutHostStatus {
   desiredVersion?: string;
   observedState?: AssignmentObservedState | "missing";
   observedGenerationId?: string;
+  runtimeSummaryReported?: boolean;
+  runtimeSummaryStatus?: "match" | "drift" | "not_reported";
+  runtimeSummaryMissingIds?: string[];
+  runtimeSummaryUnexpectedIds?: string[];
   lastError?: {
     code: string;
     message: string;
@@ -107,6 +116,7 @@ export interface DeploymentRolloutSummary {
   pendingHosts: number;
   hosts: DeploymentRolloutHostStatus[];
 }
+
 
 export function buildHttpWorkerArtifactManifest(plan: HttpWorkerDeploymentPlan): ArtifactManifest {
   const packageManager =
@@ -357,6 +367,202 @@ export function buildDeploymentRolloutSummary(
       hosts
     };
   });
+}
+
+export function attachRuntimeSummaryToDeploymentRolloutSummary(
+  summaries: DeploymentRolloutSummary[],
+  desiredHostStates: DesiredHostState[],
+  observedHostStates: ObservedHostState[]
+): DeploymentRolloutSummary[] {
+  const desiredByHostId = new Map(desiredHostStates.map((desired) => [desired.hostId, desired] as const));
+  const observedByHostId = new Map(observedHostStates.map((observed) => [observed.hostId, observed] as const));
+
+  return summaries.map((summary) => ({
+    ...summary,
+    hosts: summary.hosts.map((host) =>
+      attachRuntimeSummaryToRolloutHost(
+        host,
+        summary.deploymentId,
+        desiredByHostId.get(host.hostId),
+        observedByHostId.get(host.hostId)
+      )
+    )
+  }));
+}
+
+export function buildRuntimeSummaryChecks(
+  desiredHostStates: DesiredHostState[],
+  observedHostStates: ObservedHostState[],
+  query: Pick<RuntimeSummaryReadModelQuery, "deploymentId"> = {}
+): RuntimeSummaryCheck[] {
+  const desiredByHostId = new Map(desiredHostStates.map((desired) => [desired.hostId, desired] as const));
+  const observedByHostId = new Map(observedHostStates.map((observed) => [observed.hostId, observed] as const));
+  const hostIds = Array.from(
+    new Set([...desiredHostStates.map((desired) => desired.hostId), ...observedHostStates.map((observed) => observed.hostId)])
+  ).sort((left, right) => left.localeCompare(right));
+
+  return hostIds.map((hostId) => {
+    const desired = desiredByHostId.get(hostId);
+    const observed = observedByHostId.get(hostId);
+    const runtimeSummary = observed?.dynamicState.runtimeSummary ?? observed?.dynamicState.dynamicFields?.runtimeSummary;
+    const expectedPipelineIds = listExpectedPipelineIds(desired);
+    const observedPipelineIds = listObservedPipelineIdsForReadModel(runtimeSummary, query);
+    const expectedProtocolPackageIds = listExpectedProtocolPackageIds(desired);
+    const observedProtocolPackageIds = listObservedProtocolPackageIdsForReadModel(
+      runtimeSummary,
+      expectedProtocolPackageIds,
+      query
+    );
+    const missingPipelineIds = computeMissingValues(expectedPipelineIds, observedPipelineIds);
+    const unexpectedPipelineIds = computeMissingValues(observedPipelineIds, expectedPipelineIds);
+    const missingProtocolPackageIds = computeMissingValues(
+      expectedProtocolPackageIds,
+      observedProtocolPackageIds
+    );
+    const unexpectedProtocolPackageIds = computeMissingValues(
+      observedProtocolPackageIds,
+      expectedProtocolPackageIds
+    );
+    const status = resolveRuntimeSummaryStatus({
+      reported: runtimeSummary !== undefined,
+      missingCount: missingPipelineIds.length + missingProtocolPackageIds.length,
+      unexpectedCount: unexpectedPipelineIds.length + unexpectedProtocolPackageIds.length
+    });
+
+    return {
+      hostId,
+      status,
+      reported: runtimeSummary !== undefined,
+      matches: status === "match",
+      expectedPipelineIds,
+      observedPipelineIds,
+      missingPipelineIds,
+      unexpectedPipelineIds,
+      expectedProtocolPackageIds,
+      observedProtocolPackageIds,
+      missingProtocolPackageIds,
+      unexpectedProtocolPackageIds
+    };
+  });
+}
+
+export function buildRuntimeSummaryRollup(checks: RuntimeSummaryCheck[]): RuntimeSummaryRollup {
+  return {
+    totalHosts: checks.length,
+    reportedHosts: checks.filter((check) => check.reported).length,
+    matchingHosts: checks.filter((check) => check.matches).length,
+    driftedHosts: checks.filter((check) => check.status === "drift").length,
+    notReportedHosts: checks.filter((check) => check.status === "not_reported").length
+  };
+}
+
+export function buildRuntimeSummaryReadModel(
+  desiredHostStates: DesiredHostState[],
+  observedHostStates: ObservedHostState[],
+  query: RuntimeSummaryReadModelQuery = {}
+): RuntimeSummaryReadModel {
+  const scopedDesiredHostStates = filterDesiredHostStatesForRuntimeSummaryQuery(desiredHostStates, query);
+  const scopedObservedHostStates = filterObservedHostStatesForRuntimeSummaryQuery(observedHostStates, query);
+  const checks = buildRuntimeSummaryChecks(scopedDesiredHostStates, scopedObservedHostStates, query);
+  return {
+    checks,
+    rollup: buildRuntimeSummaryRollup(checks),
+    rolloutSummary: attachRuntimeSummaryToDeploymentRolloutSummary(
+      buildDeploymentRolloutSummary(scopedDesiredHostStates, scopedObservedHostStates),
+      scopedDesiredHostStates,
+      scopedObservedHostStates
+    )
+  };
+}
+
+function filterDesiredHostStatesForRuntimeSummaryQuery(
+  desiredHostStates: DesiredHostState[],
+  query: RuntimeSummaryReadModelQuery
+): DesiredHostState[] {
+  return desiredHostStates.flatMap((desired) => {
+    if (query.hostId !== undefined && desired.hostId !== query.hostId) {
+      return [];
+    }
+    if (query.deploymentId === undefined) {
+      return [desired];
+    }
+
+    const assignments = desired.assignments.filter(
+      (assignment) => assignment.deploymentId === query.deploymentId
+    );
+    if (assignments.length === 0 && query.hostId === undefined) {
+      return [];
+    }
+
+    const routeRefs = new Set(assignments.flatMap((assignment) => listAssignmentRouteRefs(assignment)));
+    const sharedHttpForwardConfig = desired.sharedHttpForwardConfig
+      ? {
+          routes: desired.sharedHttpForwardConfig.routes.filter((route) => routeRefs.has(route.routeId))
+        }
+      : undefined;
+
+    return [
+      {
+        ...desired,
+        assignments,
+        ...(sharedHttpForwardConfig !== undefined
+          ? {
+              sharedHttpForwardConfig
+            }
+          : {})
+      }
+    ];
+  });
+}
+
+function filterObservedHostStatesForRuntimeSummaryQuery(
+  observedHostStates: ObservedHostState[],
+  query: RuntimeSummaryReadModelQuery
+): ObservedHostState[] {
+  return observedHostStates.flatMap((observed) => {
+    if (query.hostId !== undefined && observed.hostId !== query.hostId) {
+      return [];
+    }
+    if (query.deploymentId === undefined) {
+      return [observed];
+    }
+    const deploymentId = query.deploymentId;
+
+    const assignmentStatuses = observed.assignmentStatuses.filter(
+      (status) => status.deploymentId === deploymentId
+    );
+    const runtimeSummary = observed.dynamicState.runtimeSummary ?? observed.dynamicState.dynamicFields?.runtimeSummary;
+    const hasObservedPipeline = listObservedPipelineIds(runtimeSummary).some((pipelineId) =>
+      isRuntimePipelineIdForDeployment(pipelineId, deploymentId)
+    );
+    const hasObservedProtocolPackage = listObservedProtocolPackageIdsForDeployment(
+      runtimeSummary,
+      deploymentId
+    ).packageIds.length > 0;
+
+    if (
+      assignmentStatuses.length === 0 &&
+      !hasObservedPipeline &&
+      !hasObservedProtocolPackage &&
+      query.hostId === undefined
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        ...observed,
+        assignmentStatuses
+      }
+    ];
+  });
+}
+
+function listAssignmentRouteRefs(assignment: Assignment): string[] {
+  return [
+    ...(assignment.httpWorker?.routeRefs ?? []),
+    ...(assignment.serveApp?.routeRefs ?? [])
+  ];
 }
 
 export function normalizeReplicaCount(value: number): number {
@@ -703,6 +909,299 @@ function normalizeNonNegativeCount(value: number | undefined, fallback: number):
   }
 
   return Math.max(0, Math.trunc(value));
+}
+
+function attachRuntimeSummaryToRolloutHost(
+  host: DeploymentRolloutHostStatus,
+  deploymentId: string,
+  desired: DesiredHostState | undefined,
+  observed: ObservedHostState | undefined
+): DeploymentRolloutHostStatus {
+  const expectedIds = listExpectedDeploymentRuntimeIds(desired, deploymentId);
+  const runtimeSummary = observed?.dynamicState.runtimeSummary ?? observed?.dynamicState.dynamicFields?.runtimeSummary;
+
+  if (runtimeSummary === undefined) {
+    return expectedIds.length > 0
+      ? {
+          ...host,
+          runtimeSummaryReported: false,
+          runtimeSummaryStatus: "not_reported",
+          runtimeSummaryMissingIds: expectedIds
+        }
+      : { ...host };
+  }
+
+  const observedIds = listObservedDeploymentRuntimeIds(runtimeSummary, deploymentId, expectedIds);
+  const missingIds = computeMissingValues(expectedIds, observedIds);
+  const unexpectedIds = computeMissingValues(observedIds, expectedIds);
+  const runtimeSummaryStatus = resolveRuntimeSummaryStatus({
+    reported: true,
+    missingCount: missingIds.length,
+    unexpectedCount: unexpectedIds.length
+  });
+
+  return {
+    ...host,
+    runtimeSummaryReported: true,
+    runtimeSummaryStatus,
+    ...(missingIds.length > 0
+      ? {
+          runtimeSummaryMissingIds: missingIds
+        }
+      : {}),
+    ...(unexpectedIds.length > 0
+      ? {
+          runtimeSummaryUnexpectedIds: unexpectedIds
+        }
+      : {})
+  };
+}
+
+function listExpectedDeploymentRuntimeIds(
+  desired: DesiredHostState | undefined,
+  deploymentId: string
+): string[] {
+  if (!desired) {
+    return [];
+  }
+
+  const routeIds = new Set((desired.sharedHttpForwardConfig?.routes ?? []).map((route) => route.routeId));
+  const httpRuntimeIds = desired.assignments
+    .filter(
+      (assignment) =>
+        assignment.deploymentId === deploymentId && assignment.deploymentKind !== "service_module"
+    )
+    .flatMap((assignment) => {
+      const executable = assignment.httpWorker ?? assignment.serveApp;
+      return (executable?.routeRefs ?? [])
+        .filter((routeId) => routeIds.has(routeId))
+        .map((routeId) => `${assignment.assignmentId}:${routeId}`);
+    });
+  if (httpRuntimeIds.length > 0) {
+    return httpRuntimeIds.sort((left, right) => left.localeCompare(right));
+  }
+
+  return desired.assignments
+    .flatMap((assignment) =>
+      assignment.deploymentId === deploymentId &&
+      assignment.deploymentKind === "service_module" &&
+      assignment.serviceModule
+        ? [assignment.serviceModule.protocolPackage.packageId]
+        : []
+    )
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function listExpectedPipelineIds(desired: DesiredHostState | undefined): string[] {
+  if (!desired) {
+    return [];
+  }
+
+  const routeIds = new Set((desired.sharedHttpForwardConfig?.routes ?? []).map((route) => route.routeId));
+  const pipelineIds = desired.assignments.flatMap((assignment) => {
+    if (assignment.deploymentKind === "service_module") {
+      return [];
+    }
+    const executable = assignment.httpWorker ?? assignment.serveApp;
+    return (executable?.routeRefs ?? [])
+      .filter((routeId) => routeIds.has(routeId))
+      .map((routeId) => `${assignment.assignmentId}:${routeId}`);
+  });
+  return Array.from(new Set(pipelineIds)).sort((left, right) => left.localeCompare(right));
+}
+
+function listExpectedProtocolPackageIds(desired: DesiredHostState | undefined): string[] {
+  if (!desired) {
+    return [];
+  }
+
+  return desired.assignments
+    .flatMap((assignment) =>
+      assignment.deploymentKind === "service_module" && assignment.serviceModule
+        ? [assignment.serviceModule.protocolPackage.packageId]
+        : []
+    )
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function listObservedPipelineIdsForReadModel(
+  runtimeSummary: unknown,
+  query: Pick<RuntimeSummaryReadModelQuery, "deploymentId">
+): string[] {
+  const pipelineIds = listObservedPipelineIds(runtimeSummary);
+  if (query.deploymentId === undefined) {
+    return pipelineIds;
+  }
+  const deploymentId = query.deploymentId;
+  return pipelineIds.filter((pipelineId) =>
+    isRuntimePipelineIdForDeployment(pipelineId, deploymentId)
+  );
+}
+
+function listObservedProtocolPackageIdsForReadModel(
+  runtimeSummary: unknown,
+  expectedProtocolPackageIds: string[],
+  query: Pick<RuntimeSummaryReadModelQuery, "deploymentId">
+): string[] {
+  const protocolPackageIds = listObservedProtocolPackageIds(runtimeSummary);
+  if (query.deploymentId === undefined) {
+    return protocolPackageIds;
+  }
+
+  const scoped = listObservedProtocolPackageIdsForDeployment(runtimeSummary, query.deploymentId);
+  if (scoped.hasDeploymentMetadata) {
+    return scoped.packageIds;
+  }
+
+  const expectedSet = new Set(expectedProtocolPackageIds);
+  return protocolPackageIds.filter((packageId) => expectedSet.has(packageId));
+}
+
+function isRuntimePipelineIdForDeployment(pipelineId: string, deploymentId: string): boolean {
+  return pipelineId.includes(`:${deploymentId}:`);
+}
+
+function listObservedDeploymentRuntimeIds(
+  runtimeSummary: unknown,
+  deploymentId: string,
+  expectedIds: string[]
+): string[] {
+  if (!runtimeSummary || typeof runtimeSummary !== "object") {
+    return [];
+  }
+
+  if (expectedIds.some((value) => value.startsWith("assign:"))) {
+    const pipelines = (runtimeSummary as { pipelines?: unknown }).pipelines;
+    if (!Array.isArray(pipelines)) {
+      return [];
+    }
+    return pipelines
+      .flatMap((pipeline) => {
+        if (!pipeline || typeof pipeline !== "object") {
+          return [];
+        }
+        const pipelineId = (pipeline as { pipelineId?: unknown }).pipelineId;
+        return typeof pipelineId === "string" && pipelineId.includes(`:${deploymentId}:`)
+          ? [pipelineId]
+          : [];
+      })
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  const activeProtocolPackages = (runtimeSummary as { activeProtocolPackages?: unknown }).activeProtocolPackages;
+  if (!Array.isArray(activeProtocolPackages)) {
+    return [];
+  }
+  const scoped = listObservedProtocolPackageIdsForDeployment(runtimeSummary, deploymentId);
+  if (scoped.hasDeploymentMetadata) {
+    return scoped.packageIds;
+  }
+  if (expectedIds.length === 0) {
+    return [];
+  }
+
+  return listObservedProtocolPackageIds(runtimeSummary);
+}
+
+function listObservedProtocolPackageIdsForDeployment(
+  runtimeSummary: unknown,
+  deploymentId: string
+): { packageIds: string[]; hasDeploymentMetadata: boolean } {
+  if (!runtimeSummary || typeof runtimeSummary !== "object") {
+    return {
+      packageIds: [],
+      hasDeploymentMetadata: false
+    };
+  }
+
+  const activeProtocolPackages = (runtimeSummary as { activeProtocolPackages?: unknown }).activeProtocolPackages;
+  if (!Array.isArray(activeProtocolPackages)) {
+    return {
+      packageIds: [],
+      hasDeploymentMetadata: false
+    };
+  }
+
+  let hasDeploymentMetadata = false;
+  const packageIds = activeProtocolPackages.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+    const entryDeploymentId = (entry as { deploymentId?: unknown }).deploymentId;
+    if (typeof entryDeploymentId === "string") {
+      hasDeploymentMetadata = true;
+      if (entryDeploymentId !== deploymentId) {
+        return [];
+      }
+    } else {
+      return [];
+    }
+    const packageId = (entry as { packageId?: unknown }).packageId;
+    return typeof packageId === "string" ? [packageId] : [];
+  });
+
+  return {
+    packageIds: Array.from(new Set(packageIds)).sort((left, right) => left.localeCompare(right)),
+    hasDeploymentMetadata
+  };
+}
+
+function listObservedPipelineIds(runtimeSummary: unknown): string[] {
+  if (!runtimeSummary || typeof runtimeSummary !== "object") {
+    return [];
+  }
+
+  const pipelines = (runtimeSummary as { pipelines?: unknown }).pipelines;
+  if (!Array.isArray(pipelines)) {
+    return [];
+  }
+
+  return pipelines
+    .flatMap((pipeline) => {
+      if (!pipeline || typeof pipeline !== "object") {
+        return [];
+      }
+      const pipelineId = (pipeline as { pipelineId?: unknown }).pipelineId;
+      return typeof pipelineId === "string" ? [pipelineId] : [];
+    })
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function listObservedProtocolPackageIds(runtimeSummary: unknown): string[] {
+  if (!runtimeSummary || typeof runtimeSummary !== "object") {
+    return [];
+  }
+
+  const activeProtocolPackages = (runtimeSummary as { activeProtocolPackages?: unknown }).activeProtocolPackages;
+  if (!Array.isArray(activeProtocolPackages)) {
+    return [];
+  }
+
+  return activeProtocolPackages
+    .flatMap((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return [];
+      }
+      const packageId = (entry as { packageId?: unknown }).packageId;
+      return typeof packageId === "string" ? [packageId] : [];
+    })
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function computeMissingValues(expected: string[], observed: string[]): string[] {
+  const observedSet = new Set(observed);
+  return expected.filter((value) => !observedSet.has(value));
+}
+
+function resolveRuntimeSummaryStatus(input: {
+  reported: boolean;
+  missingCount: number;
+  unexpectedCount: number;
+}): RuntimeSummaryStatus {
+  if (!input.reported) {
+    return input.missingCount === 0 && input.unexpectedCount === 0 ? "match" : "not_reported";
+  }
+  return input.missingCount === 0 && input.unexpectedCount === 0 ? "match" : "drift";
 }
 
 function buildRouteForHost(

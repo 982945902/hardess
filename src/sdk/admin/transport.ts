@@ -3,7 +3,8 @@ export const ADMIN_TRANSPORT_OPERATIONS = {
   HEARTBEAT_HOST: "heartbeatHost",
   GET_DESIRED_HOST_STATE: "getDesiredHostState",
   REPORT_OBSERVED_HOST_STATE: "reportObservedHostState",
-  FETCH_ARTIFACT_MANIFEST: "fetchArtifactManifest"
+  FETCH_ARTIFACT_MANIFEST: "fetchArtifactManifest",
+  GET_RUNTIME_SUMMARY_READ_MODEL: "getRuntimeSummaryReadModel"
 } as const;
 
 export type AdminTransportOperation =
