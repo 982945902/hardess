@@ -8,6 +8,7 @@ import { createDemoAdminApp } from "./admin-mock.ts";
 function createRegistrationRequest(
   hostId: string,
   options: {
+    groupId?: string;
     staticLabels?: Record<string, string>;
     staticCapabilities?: string[];
     staticCapacity?: Record<string, number>;
@@ -20,7 +21,7 @@ function createRegistrationRequest(
     },
     body: JSON.stringify({
       hostId,
-      groupId: "group-personnel",
+      groupId: options.groupId ?? "group-personnel",
       startedAt: Date.now(),
       runtime: {
         kind: "hardess-v1",
@@ -58,6 +59,55 @@ function createDesiredIfRevisionRequest(hostId: string, ifRevision: string): Req
     body: JSON.stringify({
       hostId,
       ifRevision
+    })
+  });
+}
+
+function createCuratorDesiredRequest(
+  input: {
+    hardessGroupId: string;
+    workspaceCode: string;
+    serveName: string;
+    deploymentStatus?: string;
+    sourceUri?: string;
+  }
+): Request {
+  return new Request("http://127.0.0.1:9100/v1/admin/control/desired", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      hardessGroupId: input.hardessGroupId,
+      workspaceCode: input.workspaceCode,
+      desired: {
+        bindings: [
+          {
+            serveName: input.serveName,
+            deploymentId: `deployment:${input.workspaceCode}:${input.serveName}`,
+            routeKey: input.serveName,
+            enabled: true
+          }
+        ],
+        serves: [
+          {
+            name: input.serveName,
+            version: "1.0.0",
+            runtime: "node",
+            entryFile: `serves/${input.serveName}/src/main.ts`,
+            deployment: {
+              status: input.deploymentStatus ?? "running",
+              port: 3101,
+              healthUrl: "http://127.0.0.1:3101/health"
+            },
+            hardessArtifact: {
+              sourceUri: input.sourceUri ?? "http://127.0.0.1:9100/artifacts/demo-serve-app.ts",
+              entry: "apps/demo-serve-app.ts",
+              packageManagerKind: "bun"
+            }
+          }
+        ]
+      }
     })
   });
 }
@@ -117,6 +167,53 @@ function createObservedRequest(
 }
 
 describe("createDemoAdminApp", () => {
+  it("projects Curator control desired payloads into host serve assignments", async () => {
+    const app = await createDemoAdminApp({
+      artifactBaseUrl: "http://127.0.0.1:9100",
+      upstreamBaseUrl: "http://127.0.0.1:9000"
+    });
+
+    await app.fetch(createRegistrationRequest("host-curator-a", {
+      groupId: "curator-group-a",
+      staticCapabilities: ["http_worker"],
+      staticCapacity: {}
+    }));
+
+    const controlResponse = await app.fetch(createCuratorDesiredRequest({
+      hardessGroupId: "curator-group-a",
+      workspaceCode: "tenant-a",
+      serveName: "personnel-serve"
+    }));
+    const control = await controlResponse.json();
+    expect(control.accepted).toBe(true);
+    expect(control.deploymentCount).toBe(1);
+    expect(control.desiredHosts).toEqual(["host-curator-a"]);
+
+    const desiredResponse = await app.fetch(createDesiredRequest("host-curator-a"));
+    const desired = await desiredResponse.json();
+    expect(desired.changed).toBe(true);
+    expect(
+      desired.desired.assignments.map((assignment: { deploymentId: string }) => assignment.deploymentId)
+    ).toEqual(["deployment:tenant-a:personnel-serve"]);
+    expect(desired.desired.assignments[0].deploymentKind).toBe("serve");
+    expect(desired.desired.assignments[0].groupId).toBe("curator-group-a");
+    expect(desired.desired.assignments[0].serveApp.name).toBe("personnel-serve");
+    expect(desired.desired.sharedHttpForwardConfig.routes[0].match.pathPrefix).toBe(
+      "/demo/curator/tenant-a/personnel-serve"
+    );
+
+    await app.fetch(createCuratorDesiredRequest({
+      hardessGroupId: "curator-group-a",
+      workspaceCode: "tenant-a",
+      serveName: "personnel-serve",
+      deploymentStatus: "stopped"
+    }));
+
+    const stoppedResponse = await app.fetch(createDesiredRequest("host-curator-a"));
+    const stopped = await stoppedResponse.json();
+    expect(stopped.desired.assignments).toEqual([]);
+  });
+
   it("projects runtime summaries from observed host state into the mock state page", async () => {
     const app = await createDemoAdminApp({
       artifactBaseUrl: "http://127.0.0.1:9100",

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -121,6 +121,47 @@ describe("ArtifactStore", () => {
 
     expect(result.localEntry.endsWith("workers/demo-worker.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain('new Response("ok")');
+  });
+
+  it("stages a directory-backed serve artifact into the local cache", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hardess-artifacts-dir-"));
+    cleanupPaths.push(dir);
+
+    const sourceDir = join(dir, "serve");
+    await mkdir(join(sourceDir, "src"), { recursive: true });
+    await writeFile(
+      join(sourceDir, "src/main.ts"),
+      `import { message } from "./message"; export default { fetch() { return new Response(message); } };`,
+      "utf8"
+    );
+    await writeFile(join(sourceDir, "src/message.ts"), `export const message = "from-dir";`, "utf8");
+
+    const store = new ArtifactStore({
+      rootDir: join(dir, "cache")
+    });
+    const assignment: Assignment = {
+      ...createAssignment(sourceDir),
+      deploymentKind: "serve",
+      serveApp: {
+        name: "personnel-serve",
+        entry: "src/main.ts",
+        routeRefs: ["route-a"]
+      },
+      httpWorker: undefined
+    };
+
+    const result = await store.stageHttpWorker(assignment, {
+      ...createManifest(`file://${sourceDir}/`),
+      artifactKind: "serve",
+      source: {
+        uri: `file://${sourceDir}/`
+      },
+      entry: "src/main.ts"
+    });
+
+    expect(result.localEntry.endsWith("src/main.ts")).toBe(true);
+    expect(await readFile(result.localEntry, "utf8")).toContain("./message");
+    expect(await readFile(join(result.localEntry, "../message.ts"), "utf8")).toContain("from-dir");
   });
 
   it("stages a file-backed service module artifact into the local cache", async () => {

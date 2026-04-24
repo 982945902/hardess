@@ -47,6 +47,7 @@ export interface HttpWorkerDeploymentPlan {
   assignmentMode?: HttpWorkerAssignmentMode;
   sourceUri: string;
   sourceDigest?: string;
+  upstreamBaseUrl?: string;
   workerName: string;
   workerEntry: string;
   routeId: string;
@@ -1215,7 +1216,7 @@ function buildRouteForHost(
       pathPrefix: buildRoutePathPrefixForHost(hostId, deployment)
     },
     upstream: {
-      baseUrl: upstreamBaseUrl
+      baseUrl: deployment.upstreamBaseUrl ?? upstreamBaseUrl
     }
   };
 }

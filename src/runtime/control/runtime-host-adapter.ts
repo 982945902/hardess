@@ -333,8 +333,14 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
 
       try {
         const routeRefs = httpExecutable.routeRefs ?? [];
-        const artifactManifest = artifacts.get(assignment.artifact.manifestId);
-        const prepared = await this.artifactStore.stageHttpWorker(assignment, artifactManifest);
+        const isExternalServe = assignment.deploymentKind === "serve"
+          && deploymentConfig?.config?.curator
+          && typeof deploymentConfig.config.curator === "object"
+          && (deploymentConfig.config.curator as { externalServe?: unknown }).externalServe === true;
+        const artifactManifest = isExternalServe ? undefined : artifacts.get(assignment.artifact.manifestId);
+        const prepared = isExternalServe
+          ? null
+          : await this.artifactStore.stageHttpWorker(assignment, artifactManifest);
         for (const routeRef of routeRefs) {
           const route = routesById.get(routeRef);
           if (!route) {
@@ -374,15 +380,19 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
               responseTimeoutMs: this.options.defaultResponseTimeoutMs ?? 5_000,
               websocket: route.upstream.websocketEnabled
             },
-            worker: {
-              entry: prepared.localEntry,
-              timeoutMs: this.options.defaultWorkerTimeoutMs ?? 1_000,
-              ...(deploymentConfig !== undefined
-                ? {
-                    deployment: deploymentConfig
+            ...(prepared
+              ? {
+                  worker: {
+                    entry: prepared.localEntry,
+                    timeoutMs: this.options.defaultWorkerTimeoutMs ?? 1_000,
+                    ...(deploymentConfig !== undefined
+                      ? {
+                          deployment: deploymentConfig
+                        }
+                      : {})
                   }
-                : {})
-            }
+                }
+              : {})
           });
         }
 

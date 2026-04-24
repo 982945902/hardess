@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ArtifactManifest, ArtifactPackageManager, Assignment } from "../../shared/index.ts";
 import type { Logger } from "../observability/logger.ts";
 import { NoopMetrics, type Metrics } from "../observability/metrics.ts";
@@ -10,7 +11,7 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 type PrepareRunner = (command: string, args: string[], options: { cwd: string }) => Promise<void>;
 
 interface PreparedArtifactInputMetadata {
-  kind: "worker" | "projectFile";
+  kind: "worker" | "workerDirectory" | "projectFile";
   logicalName?: string;
   sourceRef: string;
   targetPath: string;
@@ -82,6 +83,11 @@ export class ArtifactStore {
     }
 
     for (const input of stagePlan.inputs) {
+      if (input.kind === "workerDirectory") {
+        await rm(input.targetPath, { recursive: true, force: true });
+        await cp(resolveLocalSourcePath(input.sourceRef), input.targetPath, { recursive: true });
+        continue;
+      }
       const source = await this.readSource(input.sourceRef);
       if (input.kind === "worker") {
         verifyDigest(source, digest);
@@ -157,6 +163,11 @@ export class ArtifactStore {
     }
 
     for (const input of stagePlan.inputs) {
+      if (input.kind === "workerDirectory") {
+        await rm(input.targetPath, { recursive: true, force: true });
+        await cp(resolveLocalSourcePath(input.sourceRef), input.targetPath, { recursive: true });
+        continue;
+      }
       const source = await this.readSource(input.sourceRef);
       if (input.kind === "worker") {
         verifyDigest(source, digest);
@@ -214,23 +225,35 @@ export class ArtifactStore {
     packageManager: ArtifactPackageManager;
     inputs: Array<PreparedArtifactInputMetadata>;
   }> {
-    const inputs: PreparedArtifactInputMetadata[] = [
-      {
-        kind: "worker",
-        sourceRef: input.sourceUri,
-        targetPath: input.localEntry,
-        fingerprint: await computeSourceFingerprint(input.sourceUri)
-      }
-    ];
+    const sourceIsDirectory = await isDirectorySourceRef(input.sourceUri);
+    const inputs: PreparedArtifactInputMetadata[] = sourceIsDirectory
+      ? [
+          {
+            kind: "workerDirectory",
+            sourceRef: input.sourceUri,
+            targetPath: input.artifactDir,
+            fingerprint: await computeSourceFingerprint(input.sourceUri)
+          }
+        ]
+      : [
+          {
+            kind: "worker",
+            sourceRef: input.sourceUri,
+            targetPath: input.localEntry,
+            fingerprint: await computeSourceFingerprint(input.sourceUri)
+          }
+        ];
 
-    for (const projectFile of listProjectFiles(input.packageManager, input.artifactDir, input.sourceUri)) {
-      inputs.push({
-        kind: "projectFile",
-        logicalName: projectFile.logicalName,
-        sourceRef: projectFile.sourceRef,
-        targetPath: projectFile.targetPath,
-        fingerprint: await computeSourceFingerprint(projectFile.sourceRef)
-      });
+    if (!sourceIsDirectory) {
+      for (const projectFile of listProjectFiles(input.packageManager, input.artifactDir, input.sourceUri)) {
+        inputs.push({
+          kind: "projectFile",
+          logicalName: projectFile.logicalName,
+          sourceRef: projectFile.sourceRef,
+          targetPath: projectFile.targetPath,
+          fingerprint: await computeSourceFingerprint(projectFile.sourceRef)
+        });
+      }
     }
 
     return {
@@ -591,14 +614,29 @@ async function computeSourceFingerprint(sourceRef: string): Promise<string | und
     return undefined;
   }
 
-  const sourceStat = sourceRef.startsWith("file://")
-    ? await stat(new URL(sourceRef))
-    : await stat(resolve(sourceRef));
+  const sourceStat = await stat(resolveLocalSourcePath(sourceRef));
   return `${sourceStat.size}:${sourceStat.mtimeMs}`;
 }
 
 function isRemoteSourceRef(sourceRef: string): boolean {
   return sourceRef.startsWith("http://") || sourceRef.startsWith("https://");
+}
+
+async function isDirectorySourceRef(sourceRef: string): Promise<boolean> {
+  if (isRemoteSourceRef(sourceRef)) {
+    return false;
+  }
+  try {
+    return (await stat(resolveLocalSourcePath(sourceRef))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function resolveLocalSourcePath(sourceRef: string): string {
+  return sourceRef.startsWith("file://")
+    ? fileURLToPath(sourceRef)
+    : resolve(sourceRef);
 }
 
 function sanitizePathSegment(value: string): string {

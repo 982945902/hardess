@@ -75,6 +75,50 @@ interface DemoRolloutState {
   revisionToken: number;
 }
 
+interface CuratorControlDesiredPayload {
+  hardessGroupId: string;
+  workspaceCode: string;
+  desired: {
+    triggerServe?: string;
+    bindings?: CuratorServeBinding[];
+    serves?: CuratorServe[];
+  };
+}
+
+interface CuratorServeBinding {
+  serveName: string;
+  deploymentId?: string;
+  routeKey?: string;
+  enabled?: boolean;
+}
+
+interface CuratorServe {
+  name: string;
+  version?: string;
+  runtime?: string;
+  entryFile?: string;
+  annotations?: string[];
+  deployment?: {
+    status?: string;
+    port?: number;
+    healthUrl?: string;
+    startedAt?: string;
+    deployDir?: string;
+  } | null;
+  sourceHash?: string;
+  publishedHash?: string;
+  hardessArtifact?: {
+    sourceUri: string;
+    entry: string;
+    sourceDigest?: string;
+    packageManagerKind?: "bun" | "deno";
+    packageJsonUri?: string;
+    bunLockUri?: string;
+    denoJsonUri?: string;
+    denoLockUri?: string;
+  };
+}
+
 export interface DemoAdminAppOptions {
   upstreamBaseUrl?: string;
   routePrefix?: string;
@@ -109,6 +153,7 @@ export async function createDemoAdminApp(
     sharedDeploymentReplicas: normalizeReplicaCount(options.sharedDeploymentReplicas ?? 1),
     revisionToken: 1
   };
+  const curatorDesiredByGroup = new Map<string, CuratorControlDesiredPayload>();
 
   return {
     async fetch(request: Request): Promise<Response> {
@@ -117,7 +162,10 @@ export async function createDemoAdminApp(
       const upstreamBaseUrl = options.upstreamBaseUrl ?? "http://127.0.0.1:9000";
       const routePrefix = normalizeRoutePrefix(options.routePrefix ?? "/demo");
       const resolvePlan = () => {
-        const httpDeployments = buildDemoHttpDeployments(routePrefix, rolloutState.sharedDeploymentReplicas);
+        const httpDeployments = [
+          ...buildDemoHttpDeployments(routePrefix, rolloutState.sharedDeploymentReplicas),
+          ...buildCuratorServeDeployments(curatorDesiredByGroup, origin, routePrefix)
+        ];
         const serviceModuleDeployments = buildDemoServiceModuleDeployments();
         const manifests = [
           ...httpDeployments.map((deployment) =>
@@ -190,6 +238,35 @@ export async function createDemoAdminApp(
             accepted: true,
             sharedDeploymentReplicas: rolloutState.sharedDeploymentReplicas,
             revisionToken: rolloutState.revisionToken
+          });
+        }
+        case "/v1/admin/control/desired": {
+          const controlDesired = parseCuratorControlDesiredPayload(payload);
+          curatorDesiredByGroup.set(controlDesired.hardessGroupId, controlDesired);
+          rolloutState.revisionToken += 1;
+          ({ httpDeployments, serviceModuleDeployments, manifests, manifestsById } = resolvePlan());
+          const desiredHostStates = buildDesiredHostStates({
+            transport,
+            upstreamBaseUrl,
+            httpDeployments,
+            serviceModuleDeployments,
+            manifestsById,
+            revisionToken: rolloutState.revisionToken
+          });
+          reseedAllDesiredHostStates(transport, manifests, desiredHostStates);
+          return jsonResponse({
+            accepted: true,
+            hardessGroupId: controlDesired.hardessGroupId,
+            workspaceCode: controlDesired.workspaceCode,
+            revisionToken: rolloutState.revisionToken,
+            deploymentCount: buildCuratorServeDeployments(
+              new Map([[controlDesired.hardessGroupId, controlDesired]]),
+              origin,
+              routePrefix
+            ).length,
+            desiredHosts: desiredHostStates
+              .filter((desired) => desired.assignments.some((assignment) => assignment.groupId === controlDesired.hardessGroupId))
+              .map((desired) => desired.hostId)
           });
         }
         case "/v1/admin/hosts/register": {
@@ -411,24 +488,131 @@ function buildDemoServiceModuleDeployments(): DemoServiceModuleDeploymentPlan[] 
   ];
 }
 
+function buildCuratorServeDeployments(
+  desiredByGroup: Map<string, CuratorControlDesiredPayload>,
+  origin: string,
+  routePrefix: string
+): HttpWorkerDeploymentPlan[] {
+  const deployments: HttpWorkerDeploymentPlan[] = [];
+
+  for (const desired of desiredByGroup.values()) {
+    const servesByName = new Map(
+      (desired.desired.serves ?? []).map((serve) => [serve.name, serve] as const)
+    );
+
+    for (const binding of desired.desired.bindings ?? []) {
+      if (binding.enabled === false) {
+        continue;
+      }
+      const serve = servesByName.get(binding.serveName);
+      if (!serve || serve.deployment?.status !== "running") {
+        continue;
+      }
+      deployments.push(buildCuratorServeDeployment({
+        binding,
+        serve,
+        hardessGroupId: desired.hardessGroupId,
+        workspaceCode: desired.workspaceCode,
+        origin,
+        routePrefix
+      }));
+    }
+  }
+
+  return deployments;
+}
+
+function buildCuratorServeDeployment(input: {
+  binding: CuratorServeBinding;
+  serve: CuratorServe;
+  hardessGroupId: string;
+  workspaceCode: string;
+  origin: string;
+  routePrefix: string;
+}): HttpWorkerDeploymentPlan {
+  const routeKey = sanitizeRouteSegment(input.binding.routeKey ?? input.serve.name);
+  const deploymentId = input.binding.deploymentId?.trim()
+    || `curator:${input.workspaceCode}:${input.serve.name}`;
+  const artifact = input.serve.hardessArtifact;
+  const sourceUri = artifact?.sourceUri ?? new URL("/artifacts/demo-serve-app.ts", input.origin).toString();
+  const workerEntry = artifact?.entry ?? "apps/demo-serve-app.ts";
+  const upstreamBaseUrl = typeof input.serve.deployment?.port === "number"
+    ? `http://127.0.0.1:${input.serve.deployment.port}`
+    : input.serve.deployment?.healthUrl
+      ? new URL("/", input.serve.deployment.healthUrl).toString().replace(/\/$/, "")
+      : undefined;
+  const declaredVersion = String(
+    input.serve.publishedHash
+    ?? input.serve.sourceHash
+    ?? input.serve.deployment?.startedAt
+    ?? input.serve.version
+    ?? "curator-serve/v1"
+  );
+
+  return {
+    deploymentId,
+    deploymentKind: "serve",
+    groupId: input.hardessGroupId,
+    declaredArtifactId: `curator:${input.workspaceCode}:${input.serve.name}`,
+    declaredVersion,
+    manifestId: `manifest:curator:${input.workspaceCode}:${input.serve.name}:${sanitizeManifestToken(declaredVersion)}`,
+    replicas: Number.MAX_SAFE_INTEGER,
+    sourceUri,
+    sourceDigest: artifact?.sourceDigest,
+    upstreamBaseUrl,
+    workerName: input.serve.name,
+    workerEntry,
+    routeId: `route:curator:${input.workspaceCode}:${routeKey}`,
+    routePathPrefix: `${input.routePrefix}/curator/${sanitizeRouteSegment(input.workspaceCode)}/${routeKey}`,
+    assignmentMode: "all-hosts",
+    packageManagerKind: artifact?.packageManagerKind ?? "bun",
+    packageJson: artifact?.packageJsonUri,
+    bunLock: artifact?.bunLockUri,
+    denoJson: artifact?.denoJsonUri,
+    denoLock: artifact?.denoLockUri,
+    deployment: {
+      config: {
+        curator: {
+          externalServe: true,
+          workspaceCode: input.workspaceCode,
+          serveName: input.serve.name,
+          triggerRouteKey: input.binding.routeKey ?? null,
+          healthUrl: input.serve.deployment?.healthUrl ?? null,
+          sourceRuntime: input.serve.runtime ?? null
+        }
+      },
+      bindings: {
+        curatorServePort: input.serve.deployment?.port ?? null
+      }
+    },
+    metadataAnnotations: {
+      curator: "true",
+      workspaceCode: input.workspaceCode,
+      serveName: input.serve.name
+    }
+  };
+}
+
 function buildHttpArtifactManifest(
   origin: string,
   artifactFiles: DemoArtifactFiles,
   deployment: HttpWorkerDeploymentPlan,
   sharedDeploymentReplicas: number
 ): ArtifactManifest {
-  const workerArtifact =
+  const fallbackWorkerArtifact =
     deployment.deploymentId === "deployment:demo-http-shared"
       ? artifactFiles.sharedWorker
       : deployment.deploymentId === "deployment:demo-http-host"
         ? artifactFiles.hostWorker
         : artifactFiles.serveApp;
-  const sourcePath =
+  const fallbackSourcePath =
     deployment.deploymentId === "deployment:demo-http-shared"
       ? "/artifacts/demo-http-worker.ts"
       : deployment.deploymentId === "deployment:demo-http-host"
         ? "/artifacts/demo-host-worker.ts"
         : "/artifacts/demo-serve-app.ts";
+  const sourceUri = deployment.sourceUri || new URL(fallbackSourcePath, origin).toString();
+  const sourceDigest = deployment.sourceDigest ?? fallbackWorkerArtifact.digest;
 
   return buildHttpWorkerArtifactManifest({
     ...deployment,
@@ -436,14 +620,17 @@ function buildHttpArtifactManifest(
       deployment.deploymentId === "deployment:demo-http-shared"
         ? sharedDeploymentReplicas
         : Number.MAX_SAFE_INTEGER,
-    sourceUri: new URL(sourcePath, origin).toString(),
-    sourceDigest: workerArtifact.digest,
-    packageManagerKind: "bun",
-    packageJson: new URL("/artifacts/package.json", origin).toString(),
-    bunLock: new URL("/artifacts/bun.lock", origin).toString(),
-    frozenLock: true,
+    sourceUri,
+    sourceDigest,
+    packageManagerKind: deployment.packageManagerKind ?? "bun",
+    packageJson: deployment.packageJson ?? new URL("/artifacts/package.json", origin).toString(),
+    bunfigToml: deployment.bunfigToml,
+    bunLock: deployment.bunLock ?? new URL("/artifacts/bun.lock", origin).toString(),
+    denoJson: deployment.denoJson,
+    denoLock: deployment.denoLock,
+    frozenLock: deployment.frozenLock ?? true,
     metadataAnnotations: {
-      demo: "true",
+      ...(deployment.metadataAnnotations ?? { demo: "true" }),
       deploymentId: deployment.deploymentId
     }
   });
@@ -927,6 +1114,100 @@ function normalizeRoutePrefix(value: string): string {
     return trimmed.endsWith("/") && trimmed !== "/" ? trimmed.slice(0, -1) : trimmed;
   }
   return `/${trimmed}`;
+}
+
+function parseCuratorControlDesiredPayload(value: unknown): CuratorControlDesiredPayload {
+  if (!value || typeof value !== "object") {
+    throw new Error("Invalid Curator control desired payload");
+  }
+  const raw = value as Record<string, unknown>;
+  const hardessGroupId = String(raw.hardessGroupId ?? "").trim();
+  const workspaceCode = String(raw.workspaceCode ?? "").trim();
+  if (!hardessGroupId || !workspaceCode || !raw.desired || typeof raw.desired !== "object") {
+    throw new Error("Invalid Curator control desired payload");
+  }
+  const desired = raw.desired as Record<string, unknown>;
+  return {
+    hardessGroupId,
+    workspaceCode,
+    desired: {
+      triggerServe: typeof desired.triggerServe === "string" ? desired.triggerServe : undefined,
+      bindings: Array.isArray(desired.bindings)
+        ? desired.bindings.map(parseCuratorServeBinding)
+        : [],
+      serves: Array.isArray(desired.serves)
+        ? desired.serves.map(parseCuratorServe)
+        : []
+    }
+  };
+}
+
+function parseCuratorServeBinding(value: unknown): CuratorServeBinding {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    serveName: String(raw.serveName ?? "").trim(),
+    deploymentId: typeof raw.deploymentId === "string" && raw.deploymentId.trim()
+      ? raw.deploymentId.trim()
+      : undefined,
+    routeKey: typeof raw.routeKey === "string" && raw.routeKey.trim()
+      ? raw.routeKey.trim()
+      : undefined,
+    enabled: raw.enabled !== false
+  };
+}
+
+function parseCuratorServe(value: unknown): CuratorServe {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const deployment = raw.deployment && typeof raw.deployment === "object"
+    ? raw.deployment as CuratorServe["deployment"]
+    : null;
+  const hardessArtifact = raw.hardessArtifact && typeof raw.hardessArtifact === "object"
+    ? parseCuratorServeArtifact(raw.hardessArtifact as Record<string, unknown>)
+    : undefined;
+  return {
+    name: String(raw.name ?? "").trim(),
+    version: typeof raw.version === "string" ? raw.version : undefined,
+    runtime: typeof raw.runtime === "string" ? raw.runtime : undefined,
+    entryFile: typeof raw.entryFile === "string" ? raw.entryFile : undefined,
+    annotations: Array.isArray(raw.annotations)
+      ? raw.annotations.filter((item): item is string => typeof item === "string")
+      : [],
+    deployment,
+    sourceHash: typeof raw.sourceHash === "string" ? raw.sourceHash : undefined,
+    publishedHash: typeof raw.publishedHash === "string" ? raw.publishedHash : undefined,
+    hardessArtifact
+  };
+}
+
+function parseCuratorServeArtifact(raw: Record<string, unknown>): CuratorServe["hardessArtifact"] {
+  const sourceUri = String(raw.sourceUri ?? "").trim();
+  const entry = String(raw.entry ?? "").trim();
+  if (!sourceUri || !entry) {
+    return undefined;
+  }
+  const packageManagerKind = raw.packageManagerKind === "deno" ? "deno" : "bun";
+  return {
+    sourceUri,
+    entry,
+    sourceDigest: typeof raw.sourceDigest === "string" ? raw.sourceDigest : undefined,
+    packageManagerKind,
+    packageJsonUri: typeof raw.packageJsonUri === "string" ? raw.packageJsonUri : undefined,
+    bunLockUri: typeof raw.bunLockUri === "string" ? raw.bunLockUri : undefined,
+    denoJsonUri: typeof raw.denoJsonUri === "string" ? raw.denoJsonUri : undefined,
+    denoLockUri: typeof raw.denoLockUri === "string" ? raw.denoLockUri : undefined
+  };
+}
+
+function sanitizeRouteSegment(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "default";
+  }
+  return trimmed.replace(/^\/+|\/+$/g, "").replace(/[^a-zA-Z0-9._/-]+/g, "-") || "default";
+}
+
+function sanitizeManifestToken(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80) || "v1";
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

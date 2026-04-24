@@ -339,6 +339,101 @@ describe("RuntimeHostAdapter", () => {
     );
   });
 
+  it("builds pure upstream pipelines for Curator external serve assignments", async () => {
+    const applyConfig = mock(async (config) => config);
+    const stageHttpWorker = mock(async () => ({ localEntry: "/tmp/staged/personnel-serve.ts" }));
+    const adapter = new RuntimeHostAdapter({
+      app: {
+        logger: {
+          info: mock(() => {}),
+          warn: mock(() => {}),
+          error: mock(() => {})
+        },
+        runtimeState: () => ({
+          startedAt: 100,
+          uptimeMs: 500,
+          shuttingDown: false,
+          disposed: false,
+          ready: true,
+          inFlightHttpRequests: 0
+        })
+      },
+      configStore: {
+        getConfig: () => ({ pipelines: [] }),
+        reload: async () => ({ pipelines: [] }),
+        applyConfig,
+        watch: () => {},
+        dispose: () => {},
+        subscribe: () => () => {}
+      },
+      artifactStore: { stageHttpWorker } as never,
+      hostId: "host-a",
+      runtimeVersion: "1.0.0"
+    });
+
+    await adapter.applyDesiredHostState({
+      hostId: "host-a",
+      revision: "rev-curator-serve",
+      generatedAt: Date.now(),
+      assignments: [
+        {
+          assignmentId: "assign-curator-serve",
+          hostId: "host-a",
+          deploymentId: "deployment:tenant-a:personnel-serve",
+          deploymentKind: "serve",
+          groupId: "curator-group-a",
+          declaredVersion: "serve-v1",
+          artifact: {
+            manifestId: "manifest-curator-serve",
+            sourceUri: "file:///tmp/personnel-serve/"
+          },
+          serveApp: {
+            name: "personnel-serve",
+            entry: "src/main.ts",
+            routeRefs: ["route-curator-serve"],
+            deployment: {
+              config: {
+                curator: {
+                  externalServe: true
+                }
+              }
+            }
+          }
+        }
+      ],
+      sharedHttpForwardConfig: {
+        routes: [
+          {
+            routeId: "route-curator-serve",
+            match: { pathPrefix: "/demo/curator/tenant-a/personnel-serve" },
+            upstream: { baseUrl: "http://127.0.0.1:3101" }
+          }
+        ]
+      }
+    });
+
+    expect(stageHttpWorker).not.toHaveBeenCalled();
+    expect(applyConfig).toHaveBeenCalledWith(
+      {
+        pipelines: [
+          {
+            id: "assign-curator-serve:route-curator-serve",
+            matchPrefix: "/demo/curator/tenant-a/personnel-serve",
+            groupId: "curator-group-a",
+            auth: { required: true },
+            downstream: {
+              origin: "http://127.0.0.1:3101",
+              connectTimeoutMs: 1000,
+              responseTimeoutMs: 5000,
+              websocket: undefined
+            }
+          }
+        ]
+      },
+      { source: "admin:rev-curator-serve" }
+    );
+  });
+
   it("applies generated http config and activates service_module assignments through the manager", async () => {
     const logger = {
       info: mock(() => {}),
