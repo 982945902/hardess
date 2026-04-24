@@ -1093,7 +1093,13 @@ describe("createRuntimeApp", () => {
   it("exposes admin health, readiness, and metrics endpoints", async () => {
     const app = await createRuntimeApp({
       configModulePath: "./config/hardess.config.ts",
-      metrics: new InMemoryMetrics()
+      metrics: new InMemoryMetrics(),
+      listActiveProtocolPackages: () => [
+        {
+          packageId: "chat@1.0",
+          digest: "sha256:chat"
+        }
+      ]
     });
     appDisposers.push(() => app.dispose());
 
@@ -1137,6 +1143,14 @@ describe("createRuntimeApp", () => {
         }
       }
     );
+    const runtimeSummary = await app.fetch(
+      new Request("http://localhost/__admin/runtime/summary"),
+      {
+        upgrade() {
+          return false;
+        }
+      }
+    );
 
     expect(health?.status).toBe(200);
     expect((await health?.json())?.ok).toBe(true);
@@ -1152,6 +1166,30 @@ describe("createRuntimeApp", () => {
     expect(prometheus?.headers.get("content-type")).toContain("text/plain");
     expect(clusterPeers?.status).toBe(200);
     expect((await clusterPeers?.json())?.peers).toEqual([]);
+    expect(runtimeSummary?.status).toBe(200);
+    expect((await runtimeSummary?.json())?.summary).toEqual({
+      pipelineCount: 1,
+      pipelines: [
+        {
+          pipelineId: "demo-http",
+          matchPrefix: "/demo",
+          authRequired: true,
+          downstreamOrigin: "http://127.0.0.1:9000",
+          downstreamConnectTimeoutMs: 1000,
+          downstreamResponseTimeoutMs: 5000,
+          websocketEnabled: false,
+          workerConfigured: true,
+          workerEntry: "workers/demo-worker.ts",
+          workerTimeoutMs: 50
+        }
+      ],
+      activeProtocolPackages: [
+        {
+          packageId: "chat@1.0",
+          digest: "sha256:chat"
+        }
+      ]
+    });
   });
 
   it("reports not ready and rejects traffic during shutdown", async () => {

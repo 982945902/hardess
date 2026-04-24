@@ -4,13 +4,19 @@ import {
   buildMembershipSnapshot,
   buildPlacementSnapshot,
   buildDeploymentRolloutSummary,
+  attachRuntimeSummaryToDeploymentRolloutSummary,
+  buildRuntimeSummaryChecks,
+  buildRuntimeSummaryReadModel,
+  buildRuntimeSummaryRollup,
   buildHttpWorkerArtifactManifest,
   planHttpWorkerDeploymentOwners,
   projectHttpWorkerDesiredState
 } from "./planning.ts";
 import {
   buildServiceModuleProtocolPackageId,
-  computeServiceModuleProtocolPackageDigest
+  computeServiceModuleProtocolPackageDigest,
+  type DesiredHostState,
+  type ObservedHostState
 } from "../../shared/index.ts";
 
 describe("admin planning helpers", () => {
@@ -234,6 +240,542 @@ describe("admin planning helpers", () => {
         desiredHosts: 2,
         activeHosts: 1,
         pendingHosts: 1
+      })
+    ]);
+  });
+
+  it("attaches runtime summary status onto rollout hosts", () => {
+    const desiredHostStates: DesiredHostState[] = [
+      {
+        hostId: "host-a",
+        revision: "rev-a",
+        generatedAt: 1,
+        sharedHttpForwardConfig: {
+          routes: [
+            {
+              routeId: "route:shared",
+              match: {
+                pathPrefix: "/demo/shared"
+              },
+              upstream: {
+                baseUrl: "http://127.0.0.1:9000"
+              }
+            }
+          ]
+        },
+        assignments: [
+          {
+            assignmentId: "assign:host-a:deployment:shared",
+            hostId: "host-a",
+            deploymentId: "deployment:shared",
+            deploymentKind: "http_worker",
+            declaredVersion: "shared/v1",
+            artifact: {
+              manifestId: "manifest:shared",
+              sourceUri: "https://admin.example/shared.ts"
+            },
+            httpWorker: {
+              name: "shared-worker",
+              entry: "workers/shared.ts",
+              routeRefs: ["route:shared"]
+            }
+          }
+        ]
+      }
+    ];
+    const observedHostStates: ObservedHostState[] = [
+      {
+        hostId: "host-a",
+        observedAt: 1,
+        ready: true,
+        draining: false,
+        staticLabels: {},
+        staticCapabilities: [],
+        staticCapacity: {},
+        dynamicState: {
+          currentAssignmentCount: 1,
+          runtimeSummary: {
+            pipelineCount: 1,
+            pipelines: [
+              {
+                pipelineId: "assign:host-a:deployment:shared:route:shared",
+                matchPrefix: "/demo/shared",
+                authRequired: true,
+                downstreamOrigin: "http://127.0.0.1:9000",
+                downstreamConnectTimeoutMs: 1000,
+                downstreamResponseTimeoutMs: 5000,
+                websocketEnabled: false,
+                workerConfigured: true,
+                workerEntry: "workers/shared.ts",
+                workerTimeoutMs: 50
+              }
+            ],
+            activeProtocolPackages: []
+          }
+        },
+        assignmentStatuses: [
+          {
+            assignmentId: "assign:host-a:deployment:shared",
+            deploymentId: "deployment:shared",
+            declaredVersion: "shared/v1",
+            state: "active"
+          }
+        ]
+      }
+    ];
+    const rollout = attachRuntimeSummaryToDeploymentRolloutSummary([
+      {
+        deploymentId: "deployment:shared",
+        desiredHosts: 1,
+        activeHosts: 1,
+        readyHosts: 0,
+        preparingHosts: 0,
+        drainingHosts: 0,
+        failedHosts: 0,
+        pendingHosts: 0,
+        hosts: [
+          {
+            hostId: "host-a",
+            desiredAssignmentId: "assign:host-a:deployment:shared",
+            desiredVersion: "shared/v1",
+            observedState: "active"
+          }
+        ]
+      }
+    ], desiredHostStates, observedHostStates);
+    const checks = buildRuntimeSummaryChecks(desiredHostStates, observedHostStates);
+    const rollup = buildRuntimeSummaryRollup(checks);
+    const readModel = buildRuntimeSummaryReadModel(desiredHostStates, observedHostStates);
+
+    expect(rollout[0]?.hosts).toEqual([
+      expect.objectContaining({
+        hostId: "host-a",
+        runtimeSummaryReported: true,
+        runtimeSummaryStatus: "match"
+      })
+    ]);
+    expect(checks).toEqual([
+      {
+        hostId: "host-a",
+        status: "match",
+        reported: true,
+        matches: true,
+        expectedPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+        observedPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+        missingPipelineIds: [],
+        unexpectedPipelineIds: [],
+        expectedProtocolPackageIds: [],
+        observedProtocolPackageIds: [],
+        missingProtocolPackageIds: [],
+        unexpectedProtocolPackageIds: []
+      }
+    ]);
+    expect(rollup).toEqual({
+      totalHosts: 1,
+      reportedHosts: 1,
+      matchingHosts: 1,
+      driftedHosts: 0,
+      notReportedHosts: 0
+    });
+    expect(readModel).toEqual({
+      checks,
+      rollup,
+      rolloutSummary: rollout
+    });
+
+    const idleChecks = buildRuntimeSummaryChecks([
+      {
+        hostId: "host-idle",
+        revision: "rev-idle",
+        generatedAt: 1,
+        assignments: []
+      }
+    ], [
+      {
+        hostId: "host-idle",
+        observedAt: 1,
+        ready: true,
+        draining: false,
+        staticLabels: {},
+        staticCapabilities: [],
+        staticCapacity: {},
+        dynamicState: {
+          currentAssignmentCount: 0
+        },
+        assignmentStatuses: []
+      }
+    ]);
+    expect(idleChecks[0]).toMatchObject({
+      hostId: "host-idle",
+      status: "match",
+      reported: false,
+      matches: true
+    });
+  });
+
+  it("filters runtime summary read models by deployment", () => {
+    const desiredHostStates: DesiredHostState[] = [
+      {
+        hostId: "host-a",
+        revision: "rev-a",
+        generatedAt: 1,
+        sharedHttpForwardConfig: {
+          routes: [
+            {
+              routeId: "route:shared",
+              match: {
+                pathPrefix: "/demo/shared"
+              },
+              upstream: {
+                baseUrl: "http://127.0.0.1:9000"
+              }
+            },
+            {
+              routeId: "route:other",
+              match: {
+                pathPrefix: "/demo/other"
+              },
+              upstream: {
+                baseUrl: "http://127.0.0.1:9000"
+              }
+            }
+          ]
+        },
+        assignments: [
+          {
+            assignmentId: "assign:host-a:deployment:shared",
+            hostId: "host-a",
+            deploymentId: "deployment:shared",
+            deploymentKind: "http_worker",
+            declaredVersion: "shared/v1",
+            artifact: {
+              manifestId: "manifest:shared",
+              sourceUri: "https://admin.example/shared.ts"
+            },
+            httpWorker: {
+              name: "shared-worker",
+              entry: "workers/shared.ts",
+              routeRefs: ["route:shared"]
+            }
+          },
+          {
+            assignmentId: "assign:host-a:deployment:other",
+            hostId: "host-a",
+            deploymentId: "deployment:other",
+            deploymentKind: "http_worker",
+            declaredVersion: "other/v1",
+            artifact: {
+              manifestId: "manifest:other",
+              sourceUri: "https://admin.example/other.ts"
+            },
+            httpWorker: {
+              name: "other-worker",
+              entry: "workers/other.ts",
+              routeRefs: ["route:other"]
+            }
+          }
+        ]
+      },
+      {
+        hostId: "host-b",
+        revision: "rev-b",
+        generatedAt: 1,
+        sharedHttpForwardConfig: {
+          routes: [
+            {
+              routeId: "route:other",
+              match: {
+                pathPrefix: "/demo/other"
+              },
+              upstream: {
+                baseUrl: "http://127.0.0.1:9000"
+              }
+            }
+          ]
+        },
+        assignments: [
+          {
+            assignmentId: "assign:host-b:deployment:other",
+            hostId: "host-b",
+            deploymentId: "deployment:other",
+            deploymentKind: "http_worker",
+            declaredVersion: "other/v1",
+            artifact: {
+              manifestId: "manifest:other",
+              sourceUri: "https://admin.example/other.ts"
+            },
+            httpWorker: {
+              name: "other-worker",
+              entry: "workers/other.ts",
+              routeRefs: ["route:other"]
+            }
+          }
+        ]
+      }
+    ];
+    const observedHostStates: ObservedHostState[] = [
+      {
+        hostId: "host-a",
+        observedAt: 1,
+        ready: true,
+        draining: false,
+        staticLabels: {},
+        staticCapabilities: [],
+        staticCapacity: {},
+        dynamicState: {
+          currentAssignmentCount: 2,
+          runtimeSummary: {
+            pipelineCount: 2,
+            pipelines: [
+              {
+                pipelineId: "assign:host-a:deployment:shared:route:shared",
+                matchPrefix: "/demo/shared",
+                authRequired: true,
+                downstreamOrigin: "http://127.0.0.1:9000",
+                downstreamConnectTimeoutMs: 1000,
+                downstreamResponseTimeoutMs: 5000,
+                websocketEnabled: false,
+                workerConfigured: true,
+                workerEntry: "workers/shared.ts",
+                workerTimeoutMs: 50
+              },
+              {
+                pipelineId: "assign:host-a:deployment:other:route:other",
+                matchPrefix: "/demo/other",
+                authRequired: true,
+                downstreamOrigin: "http://127.0.0.1:9000",
+                downstreamConnectTimeoutMs: 1000,
+                downstreamResponseTimeoutMs: 5000,
+                websocketEnabled: false,
+                workerConfigured: true,
+                workerEntry: "workers/other.ts",
+                workerTimeoutMs: 50
+              }
+            ],
+            activeProtocolPackages: []
+          }
+        },
+        assignmentStatuses: [
+          {
+            assignmentId: "assign:host-a:deployment:shared",
+            deploymentId: "deployment:shared",
+            declaredVersion: "shared/v1",
+            state: "active"
+          },
+          {
+            assignmentId: "assign:host-a:deployment:other",
+            deploymentId: "deployment:other",
+            declaredVersion: "other/v1",
+            state: "active"
+          }
+        ]
+      },
+      {
+        hostId: "host-b",
+        observedAt: 1,
+        ready: true,
+        draining: false,
+        staticLabels: {},
+        staticCapabilities: [],
+        staticCapacity: {},
+        dynamicState: {
+          currentAssignmentCount: 1,
+          runtimeSummary: {
+            pipelineCount: 1,
+            pipelines: [
+              {
+                pipelineId: "assign:host-b:deployment:other:route:other",
+                matchPrefix: "/demo/other",
+                authRequired: true,
+                downstreamOrigin: "http://127.0.0.1:9000",
+                downstreamConnectTimeoutMs: 1000,
+                downstreamResponseTimeoutMs: 5000,
+                websocketEnabled: false,
+                workerConfigured: true,
+                workerEntry: "workers/other.ts",
+                workerTimeoutMs: 50
+              }
+            ],
+            activeProtocolPackages: []
+          }
+        },
+        assignmentStatuses: [
+          {
+            assignmentId: "assign:host-b:deployment:other",
+            deploymentId: "deployment:other",
+            declaredVersion: "other/v1",
+            state: "active"
+          }
+        ]
+      }
+    ];
+
+    const readModel = buildRuntimeSummaryReadModel(desiredHostStates, observedHostStates, {
+      deploymentId: "deployment:shared"
+    });
+
+    expect(readModel.checks).toEqual([
+      expect.objectContaining({
+        hostId: "host-a",
+        expectedPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+        observedPipelineIds: ["assign:host-a:deployment:shared:route:shared"],
+        status: "match"
+      })
+    ]);
+    expect(readModel.rollup).toEqual({
+      totalHosts: 1,
+      reportedHosts: 1,
+      matchingHosts: 1,
+      driftedHosts: 0,
+      notReportedHosts: 0
+    });
+    expect(readModel.rolloutSummary.map((summary) => summary.deploymentId)).toEqual([
+      "deployment:shared"
+    ]);
+    expect(readModel.rolloutSummary[0]?.hosts).toEqual([
+      expect.objectContaining({
+        hostId: "host-a",
+        runtimeSummaryStatus: "match"
+      })
+    ]);
+  });
+
+  it("filters service module protocol package summaries by deployment metadata", () => {
+    const chatPackage = {
+      packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+      protocol: "chat",
+      version: "1.0",
+      actions: ["send"],
+      digest: computeServiceModuleProtocolPackageDigest({
+        packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+        protocol: "chat",
+        version: "1.0",
+        actions: ["send"]
+      })
+    };
+    const notifyPackage = {
+      packageId: buildServiceModuleProtocolPackageId("notify", "1.0"),
+      protocol: "notify",
+      version: "1.0",
+      actions: ["send"],
+      digest: computeServiceModuleProtocolPackageDigest({
+        packageId: buildServiceModuleProtocolPackageId("notify", "1.0"),
+        protocol: "notify",
+        version: "1.0",
+        actions: ["send"]
+      })
+    };
+    const desiredHostStates: DesiredHostState[] = [
+      {
+        hostId: "host-a",
+        revision: "rev-a",
+        generatedAt: 1,
+        assignments: [
+          {
+            assignmentId: "assign:host-a:deployment:chat",
+            hostId: "host-a",
+            deploymentId: "deployment:chat",
+            deploymentKind: "service_module",
+            declaredVersion: "chat/v1",
+            artifact: {
+              manifestId: "manifest:chat",
+              sourceUri: "https://admin.example/chat.ts"
+            },
+            serviceModule: {
+              name: "chat-module",
+              entry: "modules/chat.ts",
+              protocolPackage: chatPackage
+            }
+          },
+          {
+            assignmentId: "assign:host-a:deployment:notify",
+            hostId: "host-a",
+            deploymentId: "deployment:notify",
+            deploymentKind: "service_module",
+            declaredVersion: "notify/v1",
+            artifact: {
+              manifestId: "manifest:notify",
+              sourceUri: "https://admin.example/notify.ts"
+            },
+            serviceModule: {
+              name: "notify-module",
+              entry: "modules/notify.ts",
+              protocolPackage: notifyPackage
+            }
+          }
+        ]
+      }
+    ];
+    const observedHostStates: ObservedHostState[] = [
+      {
+        hostId: "host-a",
+        observedAt: 1,
+        ready: true,
+        draining: false,
+        staticLabels: {},
+        staticCapabilities: [],
+        staticCapacity: {},
+        dynamicState: {
+          currentAssignmentCount: 2,
+          runtimeSummary: {
+            pipelineCount: 0,
+            pipelines: [],
+            activeProtocolPackages: [
+              {
+                packageId: chatPackage.packageId,
+                digest: chatPackage.digest,
+                assignmentId: "assign:host-a:deployment:chat",
+                deploymentId: "deployment:chat",
+                declaredVersion: "chat/v1"
+              },
+              {
+                packageId: notifyPackage.packageId,
+                digest: notifyPackage.digest,
+                assignmentId: "assign:host-a:deployment:notify",
+                deploymentId: "deployment:notify",
+                declaredVersion: "notify/v1"
+              }
+            ]
+          }
+        },
+        assignmentStatuses: [
+          {
+            assignmentId: "assign:host-a:deployment:chat",
+            deploymentId: "deployment:chat",
+            declaredVersion: "chat/v1",
+            state: "active"
+          },
+          {
+            assignmentId: "assign:host-a:deployment:notify",
+            deploymentId: "deployment:notify",
+            declaredVersion: "notify/v1",
+            state: "active"
+          }
+        ]
+      }
+    ];
+
+    const readModel = buildRuntimeSummaryReadModel(desiredHostStates, observedHostStates, {
+      deploymentId: "deployment:chat"
+    });
+
+    expect(readModel.checks).toEqual([
+      expect.objectContaining({
+        hostId: "host-a",
+        expectedProtocolPackageIds: [chatPackage.packageId],
+        observedProtocolPackageIds: [chatPackage.packageId],
+        missingProtocolPackageIds: [],
+        unexpectedProtocolPackageIds: [],
+        status: "match"
+      })
+    ]);
+    expect(readModel.rolloutSummary.map((summary) => summary.deploymentId)).toEqual([
+      "deployment:chat"
+    ]);
+    expect(readModel.rolloutSummary[0]?.hosts).toEqual([
+      expect.objectContaining({
+        hostId: "host-a",
+        runtimeSummaryStatus: "match"
       })
     ]);
   });

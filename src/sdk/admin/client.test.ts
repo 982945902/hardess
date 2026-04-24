@@ -176,10 +176,15 @@ describe("HardessAdminClient with MockAdminTransport", () => {
     const manifest = await client.fetchArtifactManifest({
       manifestId: "manifest-http-1"
     });
+    const runtimeSummaryReadModel = await client.getRuntimeSummaryReadModel({ hostId: "host-a" });
 
     expect(heartbeat.accepted).toBe(true);
     expect(report.accepted).toBe(true);
     expect(transport.getObservedHostState("host-a")?.ready).toBe(true);
     expect(manifest.entry).toBe("workers/demo-worker.ts");
+    expect(runtimeSummaryReadModel.rollup.totalHosts).toBe(1);
+    expect(runtimeSummaryReadModel.rollup.reportedHosts).toBe(0);
+    expect(runtimeSummaryReadModel.rollup.matchingHosts).toBe(1);
+    expect(runtimeSummaryReadModel.rollup.notReportedHosts).toBe(0);
   });
 });

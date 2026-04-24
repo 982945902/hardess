@@ -5,7 +5,8 @@ const DEFAULT_HTTP_PATHS: Record<AdminTransportOperation, string> = {
   heartbeatHost: "/v1/admin/hosts/heartbeat",
   getDesiredHostState: "/v1/admin/hosts/desired",
   reportObservedHostState: "/v1/admin/hosts/observed",
-  fetchArtifactManifest: "/v1/admin/artifacts/manifest"
+  fetchArtifactManifest: "/v1/admin/artifacts/manifest",
+  getRuntimeSummaryReadModel: "/v1/admin/read/runtime-summary"
 };
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;

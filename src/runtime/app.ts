@@ -24,6 +24,7 @@ import { demoServerModule } from "./protocol/demo-module.ts";
 import { ServerProtocolRegistry } from "./protocol/registry.ts";
 import { Dispatcher } from "./routing/dispatcher.ts";
 import { InMemoryPeerLocator } from "./routing/peer-locator.ts";
+import { buildRuntimeSummaryView } from "./runtime-summary.ts";
 import { invalidateWorkers } from "./workers/loader.ts";
 import type { ServiceModuleProtocolPackageRef } from "../shared/index.ts";
 
@@ -599,6 +600,17 @@ export async function createRuntimeApp(options: RuntimeAppOptions = {}) {
           nodeId,
           transport: options.cluster?.transport ?? "http",
           peers: clusterNetwork.listPeers()
+        });
+      }
+
+      if (url.pathname === "/__admin/runtime/summary") {
+        return json({
+          ok: true,
+          runtime: runtimeState(),
+          summary: buildRuntimeSummaryView({
+            config: configStore.getConfig(),
+            activeProtocolPackages: options.listActiveProtocolPackages?.() ?? []
+          })
         });
       }
 

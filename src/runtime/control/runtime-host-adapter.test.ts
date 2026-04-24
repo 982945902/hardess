@@ -3,7 +3,7 @@ import {
   buildServiceModuleProtocolPackageId,
   computeServiceModuleProtocolPackageDigest
 } from "../../shared/index.ts";
-import type { DesiredHostState } from "../../shared/index.ts";
+import type { DesiredHostState, HardessConfig } from "../../shared/index.ts";
 import { InMemoryMetrics } from "../observability/metrics.ts";
 import { RuntimeHostAdapter } from "./runtime-host-adapter.ts";
 import { RuntimeTopologyStore } from "./topology-store.ts";
@@ -154,6 +154,11 @@ describe("RuntimeHostAdapter", () => {
       timingCounts: {
         "artifact.prepare_ms": 1
       }
+    });
+    expect(observed.dynamicState.runtimeSummary).toEqual({
+      pipelineCount: 0,
+      pipelines: [],
+      activeProtocolPackages: []
     });
     expect(topologyStore.getTopology()?.membership.revision).toBe("topology:1:membership");
     expect(observed.assignmentStatuses[0]).toMatchObject({
@@ -340,7 +345,11 @@ describe("RuntimeHostAdapter", () => {
       warn: mock(() => {}),
       error: mock(() => {})
     };
-    const applyConfig = mock(async (config) => config);
+    let currentConfig: HardessConfig = { pipelines: [] };
+    const applyConfig = mock(async (config) => {
+      currentConfig = config;
+      return config;
+    });
     const adapter = new RuntimeHostAdapter({
       app: {
         logger,
@@ -354,8 +363,8 @@ describe("RuntimeHostAdapter", () => {
         })
       },
       configStore: {
-        getConfig: () => ({ pipelines: [] }),
-        reload: async () => ({ pipelines: [] }),
+        getConfig: () => currentConfig,
+        reload: async () => currentConfig,
         applyConfig,
         watch: () => {},
         dispose: () => {},
@@ -385,7 +394,20 @@ describe("RuntimeHostAdapter", () => {
           }
         },
         listDrainingAssignments: () => [],
-        listActiveProtocolPackages: () => []
+        listActiveProtocolPackages: () => [
+          {
+            packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+            digest: computeServiceModuleProtocolPackageDigest({
+              packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+              protocol: "chat",
+              version: "1.0",
+              actions: ["send"]
+            }),
+            assignmentId: "assign-ws-1",
+            deploymentId: "deploy-ws",
+            declaredVersion: "ws-v1"
+          }
+        ]
       } as never,
       hostId: "host-a",
       runtimeVersion: "1.0.0"
@@ -526,6 +548,37 @@ describe("RuntimeHostAdapter", () => {
         })
       ])
     );
+    expect(observed.dynamicState.runtimeSummary).toEqual({
+      pipelineCount: 1,
+      pipelines: [
+        {
+          pipelineId: "assign-http-1:route-a",
+          matchPrefix: "/demo",
+          authRequired: true,
+          downstreamOrigin: "http://upstream.internal",
+          downstreamConnectTimeoutMs: 1000,
+          downstreamResponseTimeoutMs: 5000,
+          websocketEnabled: true,
+          workerConfigured: true,
+          workerEntry: "/tmp/staged/demo-worker.ts",
+          workerTimeoutMs: 1000
+        }
+      ],
+      activeProtocolPackages: [
+        {
+          packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+          digest: computeServiceModuleProtocolPackageDigest({
+            packageId: buildServiceModuleProtocolPackageId("chat", "1.0"),
+            protocol: "chat",
+            version: "1.0",
+            actions: ["send"]
+          }),
+          assignmentId: "assign-ws-1",
+          deploymentId: "deploy-ws",
+          declaredVersion: "ws-v1"
+        }
+      ]
+    });
   });
 
   it("includes draining service_module assignments in observed state after removal", async () => {

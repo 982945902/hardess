@@ -80,6 +80,8 @@ function createObservedRequest(
     ready?: boolean;
     draining?: boolean;
     schedulable?: boolean;
+    runtimeSummary?: Record<string, unknown>;
+    dynamicFields?: Record<string, unknown>;
   } = {}
 ): Request {
   return new Request("http://127.0.0.1:9100/v1/admin/hosts/observed", {
@@ -97,7 +99,17 @@ function createObservedRequest(
       staticCapacity: {},
       dynamicState: {
         currentAssignmentCount: assignmentStatuses.length,
-        schedulable: options.schedulable ?? true
+        schedulable: options.schedulable ?? true,
+        ...(options.runtimeSummary
+          ? {
+              runtimeSummary: options.runtimeSummary
+            }
+          : {}),
+        ...(options.dynamicFields
+          ? {
+              dynamicFields: options.dynamicFields
+            }
+          : {})
       },
       assignmentStatuses
     })
@@ -105,6 +117,187 @@ function createObservedRequest(
 }
 
 describe("createDemoAdminApp", () => {
+  it("projects runtime summaries from observed host state into the mock state page", async () => {
+    const app = await createDemoAdminApp({
+      artifactBaseUrl: "http://127.0.0.1:9100",
+      upstreamBaseUrl: "http://127.0.0.1:9000",
+      sharedDeploymentReplicas: 1
+    });
+
+    await app.fetch(createRegistrationRequest("host-demo-a"));
+    await app.fetch(
+      createObservedRequest(
+        "host-demo-a",
+        [
+          {
+            assignmentId: "assign:host-demo-a:deployment:demo-http-shared",
+            deploymentId: "deployment:demo-http-shared",
+            declaredVersion: "demo-http-shared/v1",
+            generationId: "gen-a-1",
+            state: "active"
+          }
+        ],
+        {
+          runtimeSummary: {
+            pipelineCount: 1,
+            pipelines: [
+              {
+                pipelineId: "assign:host-demo-a:deployment:demo-http-shared:/demo/shared",
+                matchPrefix: "/demo/shared",
+                authRequired: true,
+                downstreamOrigin: "http://127.0.0.1:9000",
+                downstreamConnectTimeoutMs: 1000,
+                downstreamResponseTimeoutMs: 5000,
+                websocketEnabled: false,
+                workerConfigured: true,
+                workerEntry: "workers/demo-worker.ts",
+                workerTimeoutMs: 50
+              }
+            ],
+            activeProtocolPackages: [
+              {
+                packageId: "chat@1.0",
+                digest: "sha256:chat"
+              }
+            ]
+          }
+        }
+      )
+    );
+
+    const stateResponse = await app.fetch(
+      new Request("http://127.0.0.1:9100/__admin/mock/state")
+    );
+    const state = await stateResponse.json();
+    const runtimeSummaryResponse = await app.fetch(
+      new Request("http://127.0.0.1:9100/__admin/mock/runtime-summary")
+    );
+    const runtimeSummaryReadModel = await runtimeSummaryResponse.json();
+    const adminReadResponse = await app.fetch(
+      new Request("http://127.0.0.1:9100/v1/admin/read/runtime-summary", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          hostId: "host-demo-a",
+          deploymentId: "deployment:demo-http-shared"
+        })
+      })
+    );
+    const adminReadRuntimeSummary = await adminReadResponse.json();
+
+    expect(state.runtimeSummaries).toEqual([
+      {
+        hostId: "host-demo-a",
+        runtimeSummary: {
+          pipelineCount: 1,
+          pipelines: [
+            {
+              pipelineId: "assign:host-demo-a:deployment:demo-http-shared:/demo/shared",
+              matchPrefix: "/demo/shared",
+              authRequired: true,
+              downstreamOrigin: "http://127.0.0.1:9000",
+              downstreamConnectTimeoutMs: 1000,
+              downstreamResponseTimeoutMs: 5000,
+              websocketEnabled: false,
+              workerConfigured: true,
+              workerEntry: "workers/demo-worker.ts",
+              workerTimeoutMs: 50
+            }
+          ],
+          activeProtocolPackages: [
+            {
+              packageId: "chat@1.0",
+              digest: "sha256:chat"
+            }
+          ]
+        }
+      }
+    ]);
+    expect(state.runtimeSummaryChecks).toEqual([
+      {
+        hostId: "host-demo-a",
+        status: "drift",
+        reported: true,
+        matches: false,
+        expectedPipelineIds: [
+          "assign:host-demo-a:deployment:demo-http-host:route:demo-http-host:host-demo-a",
+          "assign:host-demo-a:deployment:demo-http-shared:route:demo-http-shared",
+          "assign:host-demo-a:deployment:demo-personnel-serve:route:demo-personnel-serve"
+        ],
+        observedPipelineIds: [
+          "assign:host-demo-a:deployment:demo-http-shared:/demo/shared"
+        ],
+        missingPipelineIds: [
+          "assign:host-demo-a:deployment:demo-http-host:route:demo-http-host:host-demo-a",
+          "assign:host-demo-a:deployment:demo-http-shared:route:demo-http-shared",
+          "assign:host-demo-a:deployment:demo-personnel-serve:route:demo-personnel-serve"
+        ],
+        unexpectedPipelineIds: [
+          "assign:host-demo-a:deployment:demo-http-shared:/demo/shared"
+        ],
+        expectedProtocolPackageIds: ["demo-chat@1.0"],
+        observedProtocolPackageIds: ["chat@1.0"],
+        missingProtocolPackageIds: ["demo-chat@1.0"],
+        unexpectedProtocolPackageIds: ["chat@1.0"]
+      }
+    ]);
+    expect(state.runtimeSummaryRollup).toEqual({
+      totalHosts: 1,
+      reportedHosts: 1,
+      matchingHosts: 0,
+      driftedHosts: 1,
+      notReportedHosts: 0
+    });
+    expect(runtimeSummaryReadModel.rollup).toEqual(state.runtimeSummaryRollup);
+    expect(runtimeSummaryReadModel.checks).toEqual(state.runtimeSummaryChecks);
+    expect(runtimeSummaryReadModel.rolloutSummary).toEqual(state.rolloutSummary);
+    expect(adminReadRuntimeSummary.checks).toEqual([
+      {
+        hostId: "host-demo-a",
+        status: "drift",
+        reported: true,
+        matches: false,
+        expectedPipelineIds: ["assign:host-demo-a:deployment:demo-http-shared:route:demo-http-shared"],
+        observedPipelineIds: ["assign:host-demo-a:deployment:demo-http-shared:/demo/shared"],
+        missingPipelineIds: ["assign:host-demo-a:deployment:demo-http-shared:route:demo-http-shared"],
+        unexpectedPipelineIds: ["assign:host-demo-a:deployment:demo-http-shared:/demo/shared"],
+        expectedProtocolPackageIds: [],
+        observedProtocolPackageIds: [],
+        missingProtocolPackageIds: [],
+        unexpectedProtocolPackageIds: []
+      }
+    ]);
+    expect(adminReadRuntimeSummary.rollup).toEqual({
+      totalHosts: 1,
+      reportedHosts: 1,
+      matchingHosts: 0,
+      driftedHosts: 1,
+      notReportedHosts: 0
+    });
+    expect(adminReadRuntimeSummary.rolloutSummary.map(
+      (summary: { deploymentId: string }) => summary.deploymentId
+    )).toEqual(["deployment:demo-http-shared"]);
+    expect(
+      state.rolloutSummary.find(
+        (summary: { deploymentId: string }) => summary.deploymentId === "deployment:demo-http-shared"
+      )?.hosts
+    ).toEqual([
+      expect.objectContaining({
+        hostId: "host-demo-a",
+        runtimeSummaryReported: true,
+        runtimeSummaryStatus: "drift",
+        runtimeSummaryMissingIds: [
+          "assign:host-demo-a:deployment:demo-http-shared:route:demo-http-shared"
+        ],
+        runtimeSummaryUnexpectedIds: [
+          "assign:host-demo-a:deployment:demo-http-shared:/demo/shared"
+        ]
+      })
+    ]);
+  });
+
   it("serves replicas-based selective assignments plus host-specific projections", async () => {
     const app = await createDemoAdminApp({
       artifactBaseUrl: "http://127.0.0.1:9100",

@@ -3,6 +3,9 @@ export type DeploymentKind = "http_worker" | "service_module" | "serve";
 export interface ServiceModuleProtocolPackageRef {
   packageId: string;
   digest: string;
+  assignmentId?: string;
+  deploymentId?: string;
+  declaredVersion?: string;
 }
 
 export interface ServiceModuleProtocolPackage {
@@ -11,6 +14,30 @@ export interface ServiceModuleProtocolPackage {
   version: string;
   actions: string[];
   digest: string;
+}
+
+export interface RuntimeSummaryPipelineView {
+  pipelineId: string;
+  matchPrefix: string;
+  groupId?: string;
+  authRequired: boolean;
+  downstreamOrigin: string;
+  downstreamConnectTimeoutMs: number;
+  downstreamResponseTimeoutMs: number;
+  websocketEnabled: boolean;
+  workerConfigured: boolean;
+  workerEntry?: string;
+  workerTimeoutMs?: number;
+  deploymentInstanceKey?: string;
+  deploymentConfigKeys?: string[];
+  deploymentBindingKeys?: string[];
+  deploymentSecretCount?: number;
+}
+
+export interface RuntimeSummaryView {
+  pipelineCount: number;
+  pipelines: RuntimeSummaryPipelineView[];
+  activeProtocolPackages: ServiceModuleProtocolPackageRef[];
 }
 
 export interface HostStaticCapacity {
@@ -193,6 +220,71 @@ export type AssignmentObservedState =
   | "draining"
   | "failed";
 
+export type RuntimeSummaryStatus = "match" | "drift" | "not_reported";
+
+export interface RuntimeSummaryCheck {
+  hostId: string;
+  status: RuntimeSummaryStatus;
+  reported: boolean;
+  matches: boolean;
+  expectedPipelineIds: string[];
+  observedPipelineIds: string[];
+  missingPipelineIds: string[];
+  unexpectedPipelineIds: string[];
+  expectedProtocolPackageIds: string[];
+  observedProtocolPackageIds: string[];
+  missingProtocolPackageIds: string[];
+  unexpectedProtocolPackageIds: string[];
+}
+
+export interface RuntimeSummaryRollup {
+  totalHosts: number;
+  reportedHosts: number;
+  matchingHosts: number;
+  driftedHosts: number;
+  notReportedHosts: number;
+}
+
+export interface RuntimeSummaryReadModelRolloutHostStatus {
+  hostId: string;
+  desiredAssignmentId?: string;
+  desiredVersion?: string;
+  observedState?: AssignmentObservedState | "missing";
+  observedGenerationId?: string;
+  runtimeSummaryReported?: boolean;
+  runtimeSummaryStatus?: RuntimeSummaryStatus;
+  runtimeSummaryMissingIds?: string[];
+  runtimeSummaryUnexpectedIds?: string[];
+  lastError?: {
+    code: string;
+    message: string;
+    retryable?: boolean;
+  };
+}
+
+export interface RuntimeSummaryReadModelDeploymentRolloutSummary {
+  deploymentId: string;
+  desiredHosts: number;
+  activeHosts: number;
+  readyHosts: number;
+  preparingHosts: number;
+  drainingHosts: number;
+  failedHosts: number;
+  pendingHosts: number;
+  hosts: RuntimeSummaryReadModelRolloutHostStatus[];
+}
+
+export interface RuntimeSummaryReadModel {
+  checks: RuntimeSummaryCheck[];
+  rollup: RuntimeSummaryRollup;
+  rolloutSummary: RuntimeSummaryReadModelDeploymentRolloutSummary[];
+}
+
+export interface RuntimeSummaryReadModelQuery {
+  hostId?: string;
+  deploymentId?: string;
+}
+
 export interface ObservedHostState {
   hostId: string;
   observedAt: number;
@@ -211,6 +303,7 @@ export interface ObservedHostState {
       placementRevision?: string;
     };
     resourceHints?: Record<string, number>;
+    runtimeSummary?: RuntimeSummaryView;
     dynamicFields?: Record<string, unknown>;
   };
   assignmentStatuses: Array<{

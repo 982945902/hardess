@@ -223,6 +223,10 @@ Detailed per-variable examples and the full verification env reference live in [
 - `GET /__admin/metrics/prometheus`: Prometheus scrape endpoint
 - when admin host-agent mode is enabled, runtime also reports a compact metrics summary in `ObservedHostState.dynamicState.dynamicFields.metrics` so control-plane heartbeat/report traffic can carry counters and timing counts without shipping raw timing arrays
 - `GET /__admin/cluster/peers`: static cluster peer view for the current node
+- `GET /__admin/runtime/summary`: compact runtime summary for currently applied pipelines and active service-module protocol packages
+- when admin host-agent mode is enabled, runtime also reports the same compact runtime summary in `ObservedHostState.dynamicState.runtimeSummary`, so control-plane reconciliation can inspect effective pipelines/protocol packages without scraping a separate admin endpoint
+- active service-module protocol package summaries include `assignmentId`, `deploymentId`, and `declaredVersion` when produced by the runtime service-module manager, so deployment-scoped read-model checks can attribute protocol readiness to the right assignment
+- admin read API consumers can query `POST /v1/admin/read/runtime-summary` with optional `hostId` and `deploymentId` filters to narrow drift checks to one host, one deployment, or their intersection
 
 Recommended minimum checks:
 

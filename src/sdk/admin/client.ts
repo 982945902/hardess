@@ -7,6 +7,8 @@ import {
   parseHeartbeatHostResult,
   parseHostRegistration,
   parseObservedHostState,
+  parseRuntimeSummaryReadModel,
+  parseRuntimeSummaryReadModelQuery,
   parseRegisterHostResult,
   parseReportObservedHostStateResult,
   type ArtifactManifest,
@@ -17,6 +19,8 @@ import {
   type HeartbeatHostResult,
   type HostRegistration,
   type ObservedHostState,
+  type RuntimeSummaryReadModel,
+  type RuntimeSummaryReadModelQuery,
   type RegisterHostResult,
   type ReportObservedHostStateResult
 } from "../../shared/index.ts";
@@ -59,5 +63,16 @@ export class HardessAdminClient {
       payload
     );
     return parseArtifactManifest(response);
+  }
+
+  async getRuntimeSummaryReadModel(
+    input: RuntimeSummaryReadModelQuery = {}
+  ): Promise<RuntimeSummaryReadModel> {
+    const payload = parseRuntimeSummaryReadModelQuery(input);
+    const response = await this.transport.request(
+      ADMIN_TRANSPORT_OPERATIONS.GET_RUNTIME_SUMMARY_READ_MODEL,
+      payload
+    );
+    return parseRuntimeSummaryReadModel(response);
   }
 }
