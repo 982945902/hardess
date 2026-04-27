@@ -76,6 +76,9 @@ export class WebSocketTransport {
   }
 
   connect(url: string, hooks: TransportHooks = {}): void {
+    const previousSocket = this.socket;
+    this.socket = undefined;
+    previousSocket?.close();
     this.url = url;
     this.hooks = hooks;
     this.manuallyClosed = false;
@@ -91,6 +94,7 @@ export class WebSocketTransport {
     this.manuallyClosed = true;
     this.clearReconnectTimer();
     this.socket?.close();
+    this.socket = undefined;
   }
 
   private openSocket(): void {
@@ -98,12 +102,21 @@ export class WebSocketTransport {
       return;
     }
 
-    this.socket = this.webSocketFactory(this.url);
-    this.socket.addEventListener("open", () => {
+    const socket = this.webSocketFactory(this.url);
+    this.socket = socket;
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) {
+        return;
+      }
       this.reconnectDelayMs = this.initialDelayMs;
       this.hooks.onOpen?.();
     });
-    this.socket.addEventListener("close", (event) => {
+    socket.addEventListener("close", (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
+
+      this.socket = undefined;
       const info = {
         code: event?.code,
         reason: event?.reason,
@@ -114,10 +127,16 @@ export class WebSocketTransport {
         this.scheduleReconnect();
       }
     });
-    this.socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
       this.hooks.onMessage?.(typeof event?.data === "string" ? event.data : String(event?.data ?? ""));
     });
-    this.socket.addEventListener("error", (event) => {
+    socket.addEventListener("error", (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
       this.hooks.onError?.({
         message: event?.message
       });
@@ -127,6 +146,10 @@ export class WebSocketTransport {
   private scheduleReconnect(): void {
     this.clearReconnectTimer();
     this.reconnectTimer = this.setTimeoutFn(() => {
+      this.reconnectTimer = undefined;
+      if (this.manuallyClosed || this.socket || !this.url) {
+        return;
+      }
       this.openSocket();
       this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, this.maxDelayMs);
     }, this.reconnectDelayMs);

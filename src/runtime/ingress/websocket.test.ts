@@ -1120,6 +1120,7 @@ describe("createWebSocketHandlers", () => {
 
     expect(lastEnvelope(alice)?.action).toBe("err");
     expect((lastEnvelope(alice)?.payload as { code?: string } | undefined)?.code).toBe("RATE_LIMIT_EXCEEDED");
+    expect((lastEnvelope(alice)?.payload as { refMsgId?: string } | undefined)?.refMsgId).toBe("ping-2");
     expect(alice.closed?.code).toBe(4429);
     handlers.dispose();
   });
@@ -1634,5 +1635,271 @@ describe("createWebSocketHandlers", () => {
     expect(bob.closed?.code).toBe(1001);
     expect(bob.closed?.reason).toBe("server shutting down");
     handlers.dispose();
+  });
+
+  it("dispose closes active sockets and clears locator state", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    const alice = createSocket("conn-alice");
+    handlers.open(alice);
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: Date.now(),
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    expect(peerLocator.countConnections()).toBe(1);
+    handlers.dispose();
+    expect(alice.closed?.code).toBe(1001);
+    expect(alice.closed?.reason).toBe("runtime disposed");
+    expect(peerLocator.countConnections()).toBe(0);
+  });
+
+  it("expires pending handleAck mappings to avoid long-lived ack state leaks", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+    let fakeNow = Date.now();
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      now: () => fakeNow,
+      pendingHandleAckTtlMs: 20
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    handlers.open(alice);
+    handlers.open(bob);
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-auth-alice",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: fakeNow,
+        payload: {
+          provider: "bearer",
+          payload: "demo:alice"
+        }
+      })
+    );
+
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "m-auth-bob",
+        kind: "system",
+        src: { peerId: "anonymous", connId: "pending" },
+        protocol: "sys",
+        version: "1.0",
+        action: "auth",
+        ts: fakeNow,
+        payload: {
+          provider: "bearer",
+          payload: "demo:bob"
+        }
+      })
+    );
+
+    await handlers.message(
+      alice,
+      serializeEnvelope({
+        msgId: "m-biz-expiring-ack",
+        kind: "biz",
+        src: { peerId: "alice", connId: "conn-alice" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: fakeNow,
+        payload: {
+          toPeerId: "bob",
+          content: "hello"
+        }
+      })
+    );
+
+    fakeNow += 21;
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "m-handle-too-late",
+        kind: "system",
+        src: { peerId: "bob", connId: "conn-bob" },
+        protocol: "sys",
+        version: "1.0",
+        action: "handleAck",
+        ts: fakeNow,
+        payload: {
+          ackFor: "m-biz-expiring-ack"
+        }
+      })
+    );
+
+    const bobErr = lastEnvelope(bob);
+    expect(bobErr?.action).toBe("err");
+    expect((bobErr?.payload as { code?: string } | undefined)?.code).toBe("ROUTE_NO_RECIPIENT");
+    handlers.dispose();
+  });
+
+  it("caps pending handleAck mappings to bound memory under sustained unacked fanout", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    registry.register(demoServerModule);
+
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger(),
+      pendingHandleAckMaxEntries: 2
+    });
+
+    const alice = createSocket("conn-alice");
+    const bob = createSocket("conn-bob");
+    handlers.open(alice);
+    handlers.open(bob);
+
+    for (const [socket, peerId] of [
+      [alice, "alice"] as const,
+      [bob, "bob"] as const
+    ]) {
+      await handlers.message(
+        socket,
+        serializeEnvelope({
+          msgId: `m-auth-${peerId}`,
+          kind: "system",
+          src: { peerId: "anonymous", connId: "pending" },
+          protocol: "sys",
+          version: "1.0",
+          action: "auth",
+          ts: Date.now(),
+          payload: {
+            provider: "bearer",
+            payload: `demo:${peerId}`
+          }
+        })
+      );
+    }
+
+    for (const msgId of ["m-biz-1", "m-biz-2", "m-biz-3"]) {
+      await handlers.message(
+        alice,
+        serializeEnvelope({
+          msgId,
+          kind: "biz",
+          src: { peerId: "alice", connId: "conn-alice" },
+          protocol: "demo",
+          version: "1.0",
+          action: "send",
+          ts: Date.now(),
+          payload: {
+            toPeerId: "bob",
+            content: msgId
+          }
+        })
+      );
+    }
+
+    await handlers.message(
+      bob,
+      serializeEnvelope({
+        msgId: "m-handle-evicted",
+        kind: "system",
+        src: { peerId: "bob", connId: "conn-bob" },
+        protocol: "sys",
+        version: "1.0",
+        action: "handleAck",
+        ts: Date.now(),
+        payload: {
+          ackFor: "m-biz-1"
+        }
+      })
+    );
+
+    const bobErr = lastEnvelope(bob);
+    expect(bobErr?.action).toBe("err");
+    expect((bobErr?.payload as { code?: string } | undefined)?.code).toBe("ROUTE_NO_RECIPIENT");
+    handlers.dispose();
+  });
+
+  it("rejects new connections and cluster deliveries after dispose", async () => {
+    const authService = new RuntimeAuthService([new DemoBearerAuthProvider()]);
+    const peerLocator = new InMemoryPeerLocator();
+    const dispatcher = new Dispatcher(peerLocator);
+    const registry = new ServerProtocolRegistry();
+    const handlers = createWebSocketHandlers({
+      nodeId: "local",
+      authService,
+      peerLocator,
+      dispatcher,
+      registry,
+      logger: new ConsoleLogger()
+    });
+
+    handlers.dispose();
+
+    const lateSocket = createSocket("conn-late");
+    handlers.open(lateSocket);
+    expect(lateSocket.closed?.code).toBe(1001);
+    expect(lateSocket.closed?.reason).toBe("server disposed");
+
+    const delivered = await handlers.deliverCluster({
+      sender: { nodeId: "remote", connId: "conn-remote", peerId: "remote" },
+      envelope: {
+        msgId: "disposed-cluster-1",
+        kind: "biz",
+        src: { peerId: "remote", connId: "conn-remote" },
+        protocol: "demo",
+        version: "1.0",
+        action: "send",
+        ts: Date.now(),
+        payload: {
+          toPeerId: "nobody",
+          content: "ignored"
+        }
+      },
+      ack: "recv",
+      targets: [{ nodeId: "local", connId: "conn-late", peerId: "late" }]
+    });
+
+    expect(delivered).toEqual([]);
   });
 });
