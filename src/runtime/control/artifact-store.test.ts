@@ -15,6 +15,10 @@ import { ArtifactStore } from "./artifact-store.ts";
 
 const cleanupPaths: string[] = [];
 
+function toPosixPath(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
 afterEach(async () => {
   while (cleanupPaths.length > 0) {
     const path = cleanupPaths.pop();
@@ -141,7 +145,7 @@ describe("ArtifactStore", () => {
       createManifest(`file://${sourcePath}`)
     );
 
-    expect(result.localEntry.endsWith("workers/demo-worker.ts")).toBe(true);
+    expect(toPosixPath(result.localEntry).endsWith("workers/demo-worker.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain('new Response("ok")');
   });
 
@@ -181,7 +185,7 @@ describe("ArtifactStore", () => {
       entry: "src/main.ts"
     });
 
-    expect(result.localEntry.endsWith("src/main.ts")).toBe(true);
+    expect(toPosixPath(result.localEntry).endsWith("src/main.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain("./message");
     expect(await readFile(join(result.localEntry, "../message.ts"), "utf8")).toContain("from-dir");
   });
@@ -224,7 +228,7 @@ describe("ArtifactStore", () => {
       entry: "src/main.ts"
     });
 
-    expect(result.localEntry.endsWith("src/main.ts")).toBe(true);
+    expect(toPosixPath(result.localEntry).endsWith("src/main.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain("./message");
     expect(await readFile(join(result.localEntry, "../message.ts"), "utf8")).toContain("from-archive");
   });
@@ -249,7 +253,7 @@ describe("ArtifactStore", () => {
       createServiceModuleManifest(`file://${sourcePath}`)
     );
 
-    expect(result.localEntry.endsWith("services/chat.ts")).toBe(true);
+    expect(toPosixPath(result.localEntry).endsWith("services/chat.ts")).toBe(true);
     expect(await readFile(result.localEntry, "utf8")).toContain('protocol: "chat"');
   });
 
@@ -302,7 +306,7 @@ describe("ArtifactStore", () => {
     expect(await readFile(join(dir, "cache", "manifest-http-1", "bun.lock"), "utf8")).toContain(
       '"lockfileVersion":1'
     );
-    expect(result.localEntry.endsWith("workers/demo-worker.ts")).toBe(true);
+    expect(toPosixPath(result.localEntry).endsWith("workers/demo-worker.ts")).toBe(true);
     expect(prepareRunner).toHaveBeenCalledTimes(1);
     expect(prepareRunner).toHaveBeenCalledWith(
       "bun",

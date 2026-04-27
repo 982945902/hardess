@@ -1,4 +1,6 @@
-import { ERROR_CODES, HardessError, type ClientProtocolModule } from "../../shared/index.ts";
+import { ERROR_CODES } from "../../shared/codes.ts";
+import { HardessError } from "../../shared/errors.ts";
+import type { ClientProtocolModule } from "../../shared/types.ts";
 
 function keyOf(protocol: string, version: string): string {
   return `${protocol}:${version}`;

@@ -329,12 +329,42 @@ const desiredTopologySchema = z.object({
   placement: placementSnapshotSchema
 });
 
+const runtimeAuthTrustPublicKeySchema = z.object({
+  kid: z.string().min(1, "runtimeAuthTrust.tokenIssuers[].publicKeys[].kid is required"),
+  alg: z.enum(["RS256", "ES256"]),
+  pem: z.string().min(1, "runtimeAuthTrust.tokenIssuers[].publicKeys[].pem is required")
+});
+
+const runtimeAuthTokenIssuerTrustSchema = z.object({
+  issuer: z.string().min(1, "runtimeAuthTrust.tokenIssuers[].issuer is required"),
+  audiences: z.array(z.string().min(1)).min(1, "runtimeAuthTrust.tokenIssuers[].audiences must not be empty"),
+  jwksUrl: z.string().url("runtimeAuthTrust.tokenIssuers[].jwksUrl must be a valid absolute URL").optional(),
+  publicKeys: z.array(runtimeAuthTrustPublicKeySchema).optional(),
+  algorithms: z.array(z.enum(["RS256", "ES256"])).optional(),
+  requiredClaims: z.array(z.string().min(1)).optional(),
+  clockSkewSec: z.number().int().nonnegative().optional(),
+  maxTokenTtlSec: z.number().int().positive().optional()
+}).superRefine((value, ctx) => {
+  if (!value.jwksUrl && (!value.publicKeys || value.publicKeys.length === 0)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "runtimeAuthTrust.tokenIssuers[] requires jwksUrl or publicKeys",
+      path: ["jwksUrl"]
+    });
+  }
+});
+
+const runtimeAuthTrustSchema = z.object({
+  tokenIssuers: z.array(runtimeAuthTokenIssuerTrustSchema)
+});
+
 export const desiredHostStateSchema = z.object({
   hostId: z.string().min(1, "hostId is required"),
   revision: z.string().min(1, "revision is required"),
   generatedAt: z.number().finite().nonnegative(),
   assignments: z.array(assignmentSchema),
   topology: desiredTopologySchema.optional(),
+  runtimeAuthTrust: runtimeAuthTrustSchema.optional(),
   sharedHttpForwardConfig: z.object({
     routes: z.array(
       z.object({

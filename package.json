@@ -14,11 +14,16 @@
       "import": "./dist-sdk/curator.js",
       "require": "./dist-sdk/curator.cjs"
     },
+    "./runtime": {
+      "types": "./dist-sdk/runtime.d.ts",
+      "import": "./dist-sdk/runtime.js",
+      "require": "./dist-sdk/runtime.cjs"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
     "dev": "bun run src/runtime/server.ts",
-    "build:sdk": "tsup src/sdk/curator.ts --format esm,cjs --dts --clean --out-dir dist-sdk",
+    "build:sdk": "tsup src/sdk/curator.ts src/sdk/runtime.ts --format esm,cjs --dts --clean --out-dir dist-sdk",
     "check": "tsc --noEmit",
     "test": "bun test src/runtime src/sdk src/shared src/load",
     "test:runtime": "bun test src/runtime src/shared",

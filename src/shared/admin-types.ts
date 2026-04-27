@@ -192,12 +192,34 @@ export interface DesiredTopology {
   placement: PlacementSnapshot;
 }
 
+export interface RuntimeAuthTrustPublicKey {
+  kid: string;
+  alg: "RS256" | "ES256";
+  pem: string;
+}
+
+export interface RuntimeAuthTokenIssuerTrust {
+  issuer: string;
+  audiences: string[];
+  jwksUrl?: string;
+  publicKeys?: RuntimeAuthTrustPublicKey[];
+  algorithms?: Array<"RS256" | "ES256">;
+  requiredClaims?: string[];
+  clockSkewSec?: number;
+  maxTokenTtlSec?: number;
+}
+
+export interface RuntimeAuthTrust {
+  tokenIssuers: RuntimeAuthTokenIssuerTrust[];
+}
+
 export interface DesiredHostState {
   hostId: string;
   revision: string;
   generatedAt: number;
   assignments: Assignment[];
   topology?: DesiredTopology;
+  runtimeAuthTrust?: RuntimeAuthTrust;
   sharedHttpForwardConfig?: {
     routes: Array<{
       routeId: string;

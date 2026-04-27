@@ -1,12 +1,10 @@
 import { createEnvelope, parseEnvelope, serializeEnvelope } from "../../shared/envelope.ts";
+import { CLIENT_ERROR_CODES } from "../../shared/codes.ts";
 import {
-  CLIENT_ERROR_CODES,
   createClientSdkError,
   createRemoteSdkError,
-  type ClientAwaitableDeliveryStage,
-  type ClientDeliveryEvent,
-  type ClientDeliveryTimeoutPolicy,
-  type ClientSendTracker,
+} from "../../shared/errors.ts";
+import {
   parseSysAuthOkPayload,
   parseSysErrPayload,
   parseSysHandleAckEventPayload,
@@ -14,11 +12,17 @@ import {
   parseSysPongPayload,
   parseSysRecvAckPayload,
   parseSysRoutePayload,
-  type ClientProtocolErrorInfo,
-  type ClientProtocolModule,
-  type ClientSystemHandlers,
-  type Envelope
-} from "../../shared/index.ts";
+} from "../../shared/schema.ts";
+import type {
+  ClientAwaitableDeliveryStage,
+  ClientDeliveryEvent,
+  ClientDeliveryTimeoutPolicy,
+  ClientSendTracker,
+  ClientProtocolErrorInfo,
+  ClientProtocolModule,
+  ClientSystemHandlers,
+  Envelope
+} from "../../shared/types.ts";
 import { ClientProtocolRegistry } from "../protocol/registry.ts";
 import { WebSocketTransport, type TransportOptions } from "../transport/ws.ts";
 

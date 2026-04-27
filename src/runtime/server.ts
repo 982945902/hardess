@@ -207,6 +207,7 @@ try {
             configStore: app.configStore,
             artifactStore,
             serviceModuleManager,
+            authTrustApplier: app.authService,
             topologyStore: app.topologyStore,
             hostId: runtimeConfig.admin.hostId,
             groupId: runtimeConfig.admin.groupId,

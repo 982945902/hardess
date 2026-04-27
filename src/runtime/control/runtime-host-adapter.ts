@@ -5,7 +5,8 @@ import type {
   HardessConfig,
   HostStaticCapacity,
   PipelineConfig,
-  ObservedHostState
+  ObservedHostState,
+  RuntimeAuthTrust
 } from "../../shared/index.ts";
 import type { ConfigStore } from "../config/store.ts";
 import type { Logger } from "../observability/logger.ts";
@@ -54,6 +55,9 @@ export interface RuntimeHostAdapterOptions {
   observedDynamicFields?: Record<string, unknown>;
   topologyStore?: RuntimeTopologyStore;
   serviceModuleManager?: ServiceModuleManager;
+  authTrustApplier?: {
+    applyRuntimeAuthTrust(trust?: RuntimeAuthTrust): Promise<void> | void;
+  };
 }
 
 export class RuntimeHostAdapter implements HostRuntimeAdapter {
@@ -165,6 +169,7 @@ export class RuntimeHostAdapter implements HostRuntimeAdapter {
         previousAssignmentStates: this.assignmentStates
       });
     }
+    await this.options.authTrustApplier?.applyRuntimeAuthTrust(desired.runtimeAuthTrust);
     await this.options.configStore.applyConfig(config, {
       source: `admin:${desired.revision}`
     });
