@@ -52,6 +52,11 @@ interface ConnectionState {
   closed: boolean;
 }
 
+interface PendingHandleAckEntry {
+  senderRef: ConnRef;
+  expiresAt: number;
+}
+
 type IntervalHandle = ReturnType<typeof globalThis.setInterval> | number;
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout> | number;
 type SetIntervalLike = (callback: () => void, delay: number) => IntervalHandle;
@@ -86,6 +91,8 @@ export interface WebSocketRuntimeDeps {
     backpressureRetryMs?: number;
   };
   shutdownGraceMs?: number;
+  pendingHandleAckTtlMs?: number;
+  pendingHandleAckMaxEntries?: number;
   now?: () => number;
   setIntervalFn?: SetIntervalLike;
   clearIntervalFn?: ClearIntervalLike;
@@ -108,7 +115,7 @@ function messageToString(raw: string | ArrayBuffer | Uint8Array): string {
 
 export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const connections = new Map<string, ConnectionState>();
-  const pendingHandleAckByMsgId = new Map<string, ConnRef>();
+  const pendingHandleAckByMsgId = new Map<string, PendingHandleAckEntry>();
   const recentClusterDeliveryByMsgId = new Map<string, number>();
   const now = deps.now ?? (() => Date.now());
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 25_000;
@@ -121,6 +128,8 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const outboundMaxSocketBufferBytes = deps.outbound?.maxSocketBufferBytes ?? 512 * 1024;
   const outboundBackpressureRetryMs = deps.outbound?.backpressureRetryMs ?? 10;
   const shutdownGraceMs = deps.shutdownGraceMs ?? 3_000;
+  const pendingHandleAckTtlMs = Math.max(deps.pendingHandleAckTtlMs ?? staleAfterMs * 2, 1);
+  const pendingHandleAckMaxEntries = Math.max(deps.pendingHandleAckMaxEntries ?? 10_000, 1);
   const recentClusterDeliveryTtlMs = Math.max(staleAfterMs, 60_000);
   const setIntervalFn = deps.setIntervalFn ?? setInterval;
   const clearIntervalFn = deps.clearIntervalFn ?? clearInterval;
@@ -128,6 +137,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   const clearTimeoutFn = deps.clearTimeoutFn ?? clearTimeout;
   const queueMicrotaskFn = deps.queueMicrotaskFn ?? queueMicrotask;
   let shuttingDown = false;
+  let disposed = false;
   let shutdownTimer: TimeoutHandle | undefined;
 
   function closeCodeForError(error: HardessError): number | undefined {
@@ -333,7 +343,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   }
 
   function beginShutdown(): void {
-    if (shuttingDown) {
+    if (shuttingDown || disposed) {
       return;
     }
 
@@ -409,11 +419,12 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
 
   async function tickHeartbeat(): Promise<void> {
     const currentTime = now();
+    prunePendingHandleAcks(currentTime);
 
     for (const connection of connections.values()) {
       if (currentTime - connection.lastSeenAt > staleAfterMs) {
         metrics.increment("ws.heartbeat_timeout");
-        connection.socket.close(4408, "heartbeat timeout");
+        closeConnection(connection, 4408, "heartbeat timeout");
         continue;
       }
 
@@ -564,7 +575,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
     }
 
     if (ack !== "none") {
-      pendingHandleAckByMsgId.set(envelope.msgId, senderRef);
+      setPendingHandleAck(envelope.msgId, senderRef, now() + pendingHandleAckTtlMs);
     }
 
     enqueueOutbound(
@@ -595,6 +606,33 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         recentClusterDeliveryByMsgId.delete(msgId);
       }
     }
+  }
+
+  function prunePendingHandleAcks(currentTime: number): void {
+    for (const [msgId, entry] of pendingHandleAckByMsgId.entries()) {
+      if (entry.expiresAt <= currentTime) {
+        pendingHandleAckByMsgId.delete(msgId);
+      }
+    }
+  }
+
+  function setPendingHandleAck(msgId: string, senderRef: ConnRef, expiresAt: number): void {
+    if (!pendingHandleAckByMsgId.has(msgId) && pendingHandleAckByMsgId.size >= pendingHandleAckMaxEntries) {
+      const oldestMsgId = pendingHandleAckByMsgId.keys().next().value;
+      if (oldestMsgId !== undefined) {
+        pendingHandleAckByMsgId.delete(oldestMsgId);
+        metrics.increment("ws.handle_ack_pending_evicted");
+        deps.logger.warn("pending handleAck mapping evicted due to cap", {
+          evictedMsgId: oldestMsgId,
+          cap: pendingHandleAckMaxEntries
+        });
+      }
+    }
+
+    pendingHandleAckByMsgId.set(msgId, {
+      senderRef,
+      expiresAt
+    });
   }
 
   async function handleSystemMessage(connection: ConnectionState, envelope: Envelope<unknown>): Promise<void> {
@@ -662,14 +700,16 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         ensureAuthenticated(connection.auth);
         const payload = parseSysHandleAckPayload(envelope.payload);
 
-        const senderRef = pendingHandleAckByMsgId.get(payload.ackFor);
-        if (!senderRef) {
+        const senderEntry = pendingHandleAckByMsgId.get(payload.ackFor);
+        if (!senderEntry || senderEntry.expiresAt <= now()) {
+          pendingHandleAckByMsgId.delete(payload.ackFor);
           throw new HardessError(ERROR_CODES.ROUTE_NO_RECIPIENT, "No sender found for handleAck", {
             refMsgId: payload.ackFor
           });
         }
 
         pendingHandleAckByMsgId.delete(payload.ackFor);
+        const senderRef = senderEntry.senderRef;
 
         if (senderRef.nodeId !== deps.nodeId) {
           if (!deps.clusterNetwork) {
@@ -776,6 +816,12 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
   return {
     beginShutdown,
     open(socket: ConnectionState["socket"]) {
+      if (disposed) {
+        metrics.increment("ws.disposed_rejected");
+        socket.close(1001, "server disposed");
+        return;
+      }
+
       if (shuttingDown) {
         metrics.increment("ws.shutdown_rejected");
         socket.close(1001, "server shutting down");
@@ -812,6 +858,8 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         return;
       }
 
+      const rawMessage = messageToString(raw);
+      const envelope = parseEnvelope(rawMessage);
       const currentTime = now();
       connection.lastSeenAt = currentTime;
       connection.messageTimestamps = connection.messageTimestamps.filter(
@@ -822,7 +870,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         metrics.increment("ws.rate_limit_exceeded");
         socket.send(
           serializeEnvelope(
-            createSysErrEnvelope(error, socket.data.connId)
+            createSysErrEnvelope(error, socket.data.connId, envelope?.traceId, envelope?.msgId)
           )
         );
         closeConnection(connection, closeCodeForError(error), error.code);
@@ -831,7 +879,6 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       connection.messageTimestamps.push(currentTime);
       metrics.increment("ws.message_in");
 
-      const envelope = parseEnvelope(messageToString(raw));
       if (!envelope) {
         const error = new HardessError(ERROR_CODES.PROTO_INVALID_PAYLOAD, "Invalid websocket envelope");
         metrics.increment("ws.invalid_envelope");
@@ -883,7 +930,10 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       deps.peerLocator.unregister(socket.data.connId);
       connections.delete(socket.data.connId);
       for (const [msgId, senderRef] of pendingHandleAckByMsgId.entries()) {
-        if (senderRef.nodeId === deps.nodeId && senderRef.connId === socket.data.connId) {
+        if (
+          senderRef.senderRef.nodeId === deps.nodeId &&
+          senderRef.senderRef.connId === socket.data.connId
+        ) {
           pendingHandleAckByMsgId.delete(msgId);
         }
       }
@@ -896,6 +946,11 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       ack: AckMode;
       targets: ConnRef[];
     }): Promise<ConnRef[]> {
+      if (disposed) {
+        metrics.increment("ws.disposed_rejected");
+        return [];
+      }
+
       if (shuttingDown && payload.envelope.kind === "biz") {
         metrics.increment("ws.shutdown_rejected");
         deps.logger.info("cluster websocket delivery skipped during shutdown", {
@@ -908,6 +963,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       }
 
       const currentTime = now();
+      prunePendingHandleAcks(currentTime);
       pruneRecentClusterDeliveries(currentTime);
       const duplicateUntil = recentClusterDeliveryByMsgId.get(payload.envelope.msgId);
       if (duplicateUntil && duplicateUntil > currentTime) {
@@ -928,7 +984,7 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
         }
 
         if (payload.ack !== "none") {
-          pendingHandleAckByMsgId.set(payload.envelope.msgId, payload.sender);
+          setPendingHandleAck(payload.envelope.msgId, payload.sender, currentTime + pendingHandleAckTtlMs);
         }
 
         enqueueOutbound(
@@ -967,11 +1023,22 @@ export function createWebSocketHandlers(deps: WebSocketRuntimeDeps) {
       return true;
     },
     dispose() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
       clearIntervalFn(heartbeatTimer);
       if (shutdownTimer !== undefined) {
         clearTimeoutFn(shutdownTimer);
         shutdownTimer = undefined;
       }
+      for (const connection of connections.values()) {
+        closeConnection(connection, 1001, "runtime disposed");
+        deps.peerLocator.unregister(connection.socket.data.connId);
+      }
+      connections.clear();
+      pendingHandleAckByMsgId.clear();
+      recentClusterDeliveryByMsgId.clear();
     }
   };
 }

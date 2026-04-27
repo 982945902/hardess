@@ -4,6 +4,7 @@ import { WebSocketTransport, type WebSocketLike, type WebSocketLikeEvent } from 
 class FakeSocket implements WebSocketLike {
   private listeners = new Map<string, Array<(event?: WebSocketLikeEvent) => void>>();
   sent: string[] = [];
+  closedCount = 0;
 
   addEventListener(
     type: "open" | "close" | "message" | "error",
@@ -19,6 +20,7 @@ class FakeSocket implements WebSocketLike {
   }
 
   close(): void {
+    this.closedCount += 1;
     this.emit("close");
   }
 
@@ -99,6 +101,84 @@ describe("WebSocketTransport", () => {
     });
 
     expect(timers).toHaveLength(0);
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("closes previous socket when connect is called again", () => {
+    const sockets: FakeSocket[] = [];
+    const transport = new WebSocketTransport({
+      webSocketFactory() {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      }
+    });
+
+    transport.connect("ws://localhost/one");
+    transport.connect("ws://localhost/two");
+
+    expect(sockets).toHaveLength(2);
+    expect(sockets[0]?.closedCount).toBe(1);
+    expect(sockets[1]?.closedCount).toBe(0);
+  });
+
+  it("ignores stale socket close events after switching connections", () => {
+    const sockets: FakeSocket[] = [];
+    const timers: Array<() => void> = [];
+    const transport = new WebSocketTransport({
+      reconnect: {
+        enabled: true,
+        initialDelayMs: 10,
+        maxDelayMs: 20
+      },
+      webSocketFactory() {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      setTimeoutFn(handler) {
+        timers.push(handler as () => void);
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn() {}
+    });
+
+    transport.connect("ws://localhost/one");
+    transport.connect("ws://localhost/two");
+
+    sockets[0]?.emit("close");
+    expect(timers).toHaveLength(0);
+  });
+
+  it("does not reconnect if a queued reconnect callback runs after manual close", () => {
+    const sockets: FakeSocket[] = [];
+    const timers: Array<() => void> = [];
+    const transport = new WebSocketTransport({
+      reconnect: {
+        enabled: true,
+        initialDelayMs: 10,
+        maxDelayMs: 20
+      },
+      webSocketFactory() {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      setTimeoutFn(handler) {
+        timers.push(handler as () => void);
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn() {}
+    });
+
+    transport.connect("ws://localhost/ws");
+    sockets[0]?.emit("open");
+    sockets[0]?.emit("close");
+    expect(timers).toHaveLength(1);
+
+    transport.close();
+    timers[0]?.();
+
     expect(sockets).toHaveLength(1);
   });
 });
